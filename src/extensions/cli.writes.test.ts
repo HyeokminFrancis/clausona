@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { acquireDirLock } from "../core/dir-lock.js";
 import { stripAnsi } from "../lib/cli-style.js";
 import { leakedWindows } from "../test-leaks.js";
+import { SPAWN_TIMEOUT_MS, SPAWNING_TEST_TIMEOUT_MS } from "../test-timeouts.js";
 import { type WriteEnv, writeEnvFor } from "./apply.js";
 import {
   CHANGE_JSON_KEYS,
@@ -39,7 +40,7 @@ const GIT_ENV: NodeJS.ProcessEnv = {
 const hasGit = spawnSync("git", ["--version"], { env: GIT_ENV }).status === 0;
 
 function git(cwd: string, args: string[]): void {
-  const result = spawnSync("git", args, { cwd, env: GIT_ENV, encoding: "utf8" });
+  const result = spawnSync("git", args, { cwd, env: GIT_ENV, encoding: "utf8", timeout: SPAWN_TIMEOUT_MS });
   if (result.status !== 0) throw new Error(`git ${args[0]} failed: ${result.stderr}`);
 }
 
@@ -75,6 +76,8 @@ function seed() {
   h.claude("work", ".claude-work", { projects: { [app]: {} }, mcpServers: { figma: { command: "figma" } } });
   h.skill(".claude/skills", "eli5");
   h.skill(".claude/skills", "old-one");
+  // work loads the primary's skills through the link clausona makes for every account.
+  h.link(".claude/skills", ".claude-work/skills");
   h.skill("repos/app/.claude/skills", "eli5");
   h.skill("repos/app/.claude/skills", "deploy-check");
   h.skill("repos/web/.claude/skills", "web-only");
@@ -121,6 +124,7 @@ function cli(h: TestHome, cwd: string, more: Pick<WriteEnv, "lockWaitMs"> = {}) 
           now: NOW,
           columns: options.columns ?? 200,
           managedSettings: h.path("managed-settings.json"),
+          mcpjsonStop: h.home,
           interactive: options.interactive ?? false,
           ...(options.confirm ? { confirm: options.confirm } : {}),
           writeEnv,
@@ -160,7 +164,9 @@ const RULE_M =
   "This changes files, and there is no terminal to confirm on. Add --yes to go ahead, or --dry-run to see the plan.";
 
 describe("skills off", () => {
-  it("prints the plan with --dry-run, and writes nothing, not even ~/.clausona", async () => {
+  it("prints the plan with --dry-run, and writes nothing, not even ~/.clausona", {
+    timeout: SPAWNING_TEST_TIMEOUT_MS,
+  }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     const local = path.join(app, ".claude", "settings.local.json");
@@ -174,7 +180,9 @@ describe("skills off", () => {
     expect(existsSync(h.path(".clausona"))).toBe(false);
   });
 
-  it("prints the plan as JSON with --dry-run --json, its keys in order and no fingerprint", async () => {
+  it("prints the plan as JSON with --dry-run --json, its keys in order and no fingerprint", {
+    timeout: SPAWNING_TEST_TIMEOUT_MS,
+  }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     const out = await run("skills", ["off", "eli5", "--tool", "claude", "--dry-run", "--json"]);
@@ -204,13 +212,55 @@ describe("skills off", () => {
       note: null,
       tracked: false,
       rows: ["skill:claude:global:-:eli5"],
+      deletes: [],
+      breaks: [],
+      runs: null,
     });
     expect(out).not.toContain("expect");
     expect(out).not.toContain("hash");
     expect(existsSync(h.path(".clausona"))).toBe(false);
   });
 
-  it("refuses to change files without a terminal unless --yes, as bad usage", async () => {
+  it.skipIf(!hasGit)(
+    "plans Claude Code's ignore line too when it makes a repo's first settings.local.json, and undo leaves it in",
+    async () => {
+      const { h, app } = seed();
+      git(app, ["init", "-q"]);
+      const { run } = cli(h, app);
+      const ignore = h.path(".config", "git", "ignore");
+      const dry = stripAnsi(await run("skills", ["off", "eli5", "--tool", "claude", "--dry-run"]));
+      expect(dry).toMatch(/\.config.git.ignore +adds \*\*\/\.claude\/settings\.local\.json +as Claude Code does$/m);
+      const plan = JSON.parse(await run("skills", ["off", "eli5", "--tool", "claude", "--dry-run", "--json"]));
+      expect(plan.changes.map((c: { file: string; change: string }) => [c.file, c.change])).toEqual([
+        [path.join(app, ".claude", "settings.local.json"), "create"],
+        [ignore, "create"],
+      ]);
+      await run("skills", ["off", "eli5", "--tool", "claude", "--yes"]);
+      expect(read(ignore)).toBe("**/.claude/settings.local.json\n");
+      // The file is there now: a second change edits it, and adds nothing to the ignore file.
+      const again = JSON.parse(await run("skills", ["off", "deploy-check", "--dry-run", "--json"]));
+      expect(again.changes.map((c: { file: string }) => c.file)).toEqual([
+        path.join(app, ".claude", "settings.local.json"),
+      ]);
+      // Claude Code never takes the line out, and a settings.local.json made since may rely on it:
+      // undo leaves it, and says so where it lists what it puts back.
+      const keeps = /\.config.git.ignore +keeps \*\*\/\.claude\/settings\.local\.json, as Claude Code does$/m;
+      expect(stripAnsi(await run("skills", ["undo", "--dry-run"]))).toMatch(keeps);
+      const preview = JSON.parse(await run("skills", ["undo", "--dry-run", "--json"]));
+      expect(preview.files).toEqual([{ path: path.join(app, ".claude", "settings.local.json"), action: "remove" }]);
+      expect(preview.kept).toEqual([{ path: ignore, line: "**/.claude/settings.local.json" }]);
+      const undone = stripAnsi(await run("skills", ["undo", "--yes"]));
+      expect(undone).toMatch(/settings\.local\.json +removed$/m);
+      expect(undone).toMatch(keeps);
+      expect(read(ignore)).toBe("**/.claude/settings.local.json\n");
+      expect(existsSync(path.join(app, ".claude", "settings.local.json"))).toBe(false);
+    },
+    SPAWNING_TEST_TIMEOUT_MS,
+  );
+
+  it("refuses to change files without a terminal unless --yes, as bad usage", {
+    timeout: SPAWNING_TEST_TIMEOUT_MS,
+  }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     const error = await failure(run("skills", ["off", "eli5", "--tool", "claude"]));
@@ -221,7 +271,7 @@ describe("skills off", () => {
     expect(existsSync(h.path(".clausona"))).toBe(false);
   });
 
-  it("applies with --yes, naming the backup and the undo", async () => {
+  it("applies with --yes, naming the backup and the undo", { timeout: SPAWNING_TEST_TIMEOUT_MS }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     const text = stripAnsi(await run("skills", ["off", "eli5", "--tool", "claude", "--yes"]));
@@ -231,7 +281,9 @@ describe("skills off", () => {
     expect(json(path.join(app, ".claude", "settings.local.json")).skillOverrides).toEqual({ eli5: "off" });
   });
 
-  it("says what it did as JSON with --yes --json, with the operation", async () => {
+  it("says what it did as JSON with --yes --json, with the operation", {
+    timeout: SPAWNING_TEST_TIMEOUT_MS,
+  }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     const out = JSON.parse(await run("skills", ["off", "eli5", "--tool", "claude", "-y", "--json"]));
@@ -241,7 +293,7 @@ describe("skills off", () => {
     expect(out.operation.backup).toBe(path.join(h.path(".clausona", "backups", "extensions"), out.operation.id));
   });
 
-  it("asks on a terminal, and does nothing when the answer is no", async () => {
+  it("asks on a terminal, and does nothing when the answer is no", { timeout: SPAWNING_TEST_TIMEOUT_MS }, async () => {
     const { h, app } = seed();
     const { run, printed } = cli(h, app);
     const local = path.join(app, ".claude", "settings.local.json");
@@ -265,7 +317,9 @@ describe("skills off", () => {
     expect(json(local).skillOverrides).toEqual({ eli5: "off" });
   });
 
-  it("takes --yes or --dry-run with --json, even on a terminal, rather than mix text and JSON", async () => {
+  it("takes --yes or --dry-run with --json, even on a terminal, rather than mix text and JSON", {
+    timeout: SPAWNING_TEST_TIMEOUT_MS,
+  }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     const asked: string[] = [];
@@ -287,7 +341,9 @@ describe("skills off", () => {
     expect(existsSync(path.join(app, ".claude", "settings.local.json"))).toBe(true);
   });
 
-  it("cuts a long path from its middle to fit, and keeps what changes whole", async () => {
+  it("cuts a long path from its middle to fit, and keeps what changes whole", {
+    timeout: SPAWNING_TEST_TIMEOUT_MS,
+  }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     const sep = path.sep;
@@ -299,7 +355,7 @@ describe("skills off", () => {
     }
   });
 
-  it("says nothing is to do when it is off already, and exits 0", async () => {
+  it("says nothing is to do when it is off already, and exits 0", { timeout: SPAWNING_TEST_TIMEOUT_MS }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     await run("skills", ["off", "eli5", "--tool", "claude", "--yes"]);
@@ -366,6 +422,71 @@ describe("skills off", () => {
   });
 });
 
+describe("on, for what a setting elsewhere keeps off", () => {
+  it("refuses a server the lists keep from starting, naming the list and its file, in text and JSON", async () => {
+    const { h, app } = seed();
+    h.write(".claude/settings.json", { deniedMcpServers: [{ serverName: "figma" }] });
+    const { run } = cli(h, app);
+    const error = await failure(run("mcp", ["on", "figma", "--yes"]));
+    expect(error).toMatchObject({ code: 1, kind: "refused" });
+    expect(error.message).toContain(
+      `figma  deniedMcpServers in ${tilde(h.path(".claude", "settings.json"), h.home)} keeps it from starting. Change it there.`,
+    );
+    const body = JSON.parse((await failure(run("mcp", ["on", "figma", "--yes", "--json"]))).stdout ?? "");
+    expect(body.refused[0]).toMatchObject({ name: "figma", code: "mcp-denied" });
+    // The dry run lists it and exits 0; managed-mcp.json shuts every other server out by name.
+    h.write("managed-settings.json", {});
+    h.write("managed-mcp.json", { mcpServers: {} });
+    const plan = JSON.parse(await run("mcp", ["on", "pg-dev", "--dry-run", "--json"]));
+    expect(plan.refused).toEqual([
+      expect.objectContaining({
+        name: "pg-dev",
+        code: "managed-mcp",
+        reason: `${tilde(h.path("managed-mcp.json"), h.home)} lets only its own servers start. Only your organization can change that file.`,
+      }),
+    ]);
+    expect(existsSync(h.path(".clausona"))).toBe(false);
+  });
+
+  it("refuses a built-in skill while disableBundledSkills holds, naming where it is set", async () => {
+    const { h, app } = seed();
+    h.write(".claude/settings.json", { disableBundledSkills: true, skillOverrides: { "claude-api": "off" } });
+    const { run } = cli(h, app);
+    const error = await failure(run("skills", ["on", "claude-api", "--yes", "--json"]));
+    const body = JSON.parse(error.stdout ?? "");
+    expect(body.refused).toEqual([
+      expect.objectContaining({
+        name: "claude-api",
+        code: "bundled-off",
+        reason: `disableBundledSkills in ${tilde(h.path(".claude", "settings.json"), h.home)} turns off the skills that come with Claude Code. Change it there.`,
+      }),
+    ]);
+    expect(json(h.path(".claude", "settings.json")).skillOverrides).toEqual({ "claude-api": "off" });
+  });
+});
+
+describe("on --everywhere, with an account's own off left here", () => {
+  it("puts back what clausona kept and says in the dry run what still keeps it off here", {
+    timeout: SPAWNING_TEST_TIMEOUT_MS,
+  }, async () => {
+    const { h, app } = seed();
+    const { run } = cli(h, app);
+    // figma off here in both accounts, then off everywhere: clausona keeps each entry.
+    await run("mcp", ["off", "figma", "--yes"]);
+    await run("mcp", ["off", "figma", "--everywhere", "--yes"]);
+    const text = stripAnsi(await run("mcp", ["on", "figma", "--everywhere", "--dry-run"]));
+    expect(text).toContain("mcpServers.figma put back");
+    expect(text).toContain(
+      `Still off in this project for default (disabledMcpServers in ${tilde(h.path(".claude.json"), h.home)}). Turn it on here too.`,
+    );
+    expect(text).toContain(
+      `Still off in this project for work (disabledMcpServers in ${tilde(h.path(".claude-work", ".claude.json"), h.home)}). Turn it on here too.`,
+    );
+    const plan = JSON.parse(await run("mcp", ["on", "figma", "--everywhere", "--dry-run", "--json"]));
+    expect(plan.notes).toHaveLength(2);
+  });
+});
+
 describe("skills rm", () => {
   it("refuses a Cloud skill, saying what to do instead, in text and JSON", async () => {
     const { h, app } = seed();
@@ -404,7 +525,7 @@ describe("skills rm", () => {
     expect(existsSync(h.path(".clausona"))).toBe(false);
   });
 
-  it.skipIf(!hasGit)("refuses a skill git tracks unless --tracked", async () => {
+  it.skipIf(!hasGit)("refuses a skill git tracks unless --tracked", { timeout: SPAWNING_TEST_TIMEOUT_MS }, async () => {
     const { h, app } = seed();
     git(app, ["init", "-q"]);
     git(app, ["add", path.join(".claude", "skills", "deploy-check", "SKILL.md")]);
@@ -432,10 +553,72 @@ describe("skills rm", () => {
     expect(existsSync(h.path(".claude", "skills", "notes"))).toBe(false);
     expect(existsSync(h.path("shared", "notes", "SKILL.md"))).toBe(true);
   });
+
+  it("says which links a folder it deletes leaves broken, in the text and as breaks in JSON", async () => {
+    const { h, app } = seed();
+    // gstack cloned into the project, a link next to it for each skill it holds.
+    h.skill("repos/app/.claude/skills", "gstack");
+    for (const name of ["canary", "careful"]) {
+      h.skill("repos/app/.claude/skills/gstack", name);
+      h.link(`repos/app/.claude/skills/gstack/${name}`, `repos/app/.claude/skills/${name}`);
+    }
+    const { run } = cli(h, app);
+    const dry = stripAnsi(await run("skills", ["rm", "gstack", "--dry-run"]));
+    expect(dry).toMatch(/gstack +breaks 2 links: canary, careful \(add them to delete them too\)$/m);
+    expect(dry).toContain("Dry run: nothing changed. Run it again with --yes to apply.");
+    const plan = JSON.parse(await run("skills", ["rm", "gstack", "--dry-run", "--json"]));
+    const listed = JSON.parse(await run("skills", ["ls", "--scope", "project", "--json"]));
+    const idOf = (name: string) => listed.items.find((i: { name: string }) => i.name === name).id;
+    expect(plan.changes).toMatchObject([
+      {
+        change: "delete",
+        note: "breaks 2 links: canary, careful (add them to delete them too)",
+        breaks: [idOf("canary"), idOf("careful")],
+      },
+    ]);
+    // With the links in the same rm, nothing is left broken: the folder's line says nothing.
+    const ids = ["gstack", "canary", "careful"].flatMap((name) => ["--id", idOf(name)]);
+    const together = JSON.parse(await run("skills", ["rm", ...ids, "--dry-run", "--json"]));
+    expect(together.changes.map((c: { note: string | null; breaks: string[] }) => [c.note, c.breaks])).toEqual([
+      [null, []],
+      ["link only, target kept", []],
+      ["link only, target kept", []],
+    ]);
+  });
+
+  it("says which Codex skills a folder it deletes holds, deletes them with it, and undo puts all back", async () => {
+    const { h, app } = seed();
+    // Codex finds skills in folders below a skill: pack holds inner, which holds deeper.
+    h.skill(".agents/skills", "pack");
+    h.skill(".agents/skills/pack", "inner");
+    h.skill(".agents/skills/pack/inner", "deeper");
+    const skillFiles = ["pack", "pack/inner", "pack/inner/deeper"].map((dir) =>
+      h.path(".agents", "skills", ...dir.split("/"), "SKILL.md"),
+    );
+    const { run } = cli(h, app);
+    const dry = stripAnsi(await run("skills", ["rm", "pack", "--tool", "codex", "--dry-run"]));
+    expect(dry).toMatch(/skills.pack +also deletes 2 skills inside: deeper, inner$/m);
+    const listed = JSON.parse(await run("skills", ["ls", "--scope", "global", "--tool", "codex", "--json"]));
+    const idOf = (name: string) => listed.items.find((i: { name: string }) => i.name === name).id;
+    const plan = JSON.parse(await run("skills", ["rm", "pack", "--tool", "codex", "--dry-run", "--json"]));
+    expect(plan.changes).toMatchObject([
+      { change: "delete", rows: [idOf("pack")], deletes: [idOf("deeper"), idOf("inner")], breaks: [] },
+    ]);
+    // Both marked: inner goes with pack, in one move, and the change is made whole.
+    const ids = ["--id", idOf("pack"), "--id", idOf("inner")];
+    const both = JSON.parse(await run("skills", ["rm", ...ids, "--yes", "--json"]));
+    expect(both).toMatchObject({ applied: true, question: "Delete 2 skills?" });
+    expect(both.changes).toMatchObject([{ rows: [idOf("pack"), idOf("inner")], deletes: [idOf("deeper")] }]);
+    for (const file of skillFiles) expect(existsSync(file), file).toBe(false);
+    await run("skills", ["undo", "--yes"]);
+    for (const file of skillFiles) expect(existsSync(file), file).toBe(true);
+  });
 });
 
 describe("skills visibility", () => {
-  it("sets the level here, and takes one of the four levels as the last word", async () => {
+  it("sets the level here, and takes one of the four levels as the last word", {
+    timeout: SPAWNING_TEST_TIMEOUT_MS,
+  }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     const text = stripAnsi(await run("skills", ["visibility", "eli5", "name-only", "--yes"]));
@@ -462,7 +645,9 @@ describe("skills visibility", () => {
 });
 
 describe("skills visibility, a Claude skill's alone", () => {
-  it("plans the Claude copy of a name both tools load, and takes no --tool", async () => {
+  it("plans the Claude copy of a name both tools load, and takes no --tool", {
+    timeout: SPAWNING_TEST_TIMEOUT_MS,
+  }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     // Claude's and Codex's eli5 both load here: off calls it ambiguous, visibility does not.
@@ -540,6 +725,52 @@ describe("mcp off and rm", () => {
     await run("mcp", ["rm", "--id", kept.id, "--yes"]);
     expect(json(h.path(".claude.json")).mcpServers.figma).toEqual({ command: "figma" });
     expect(readdirSync(keptDir)).toEqual([]);
+  });
+});
+
+describe("mcp on", () => {
+  it("shows what a pending .mcp.json server runs before it approves it, whole and with secrets hidden", async () => {
+    const { h, app } = seed();
+    h.write("repos/app/.mcp.json", {
+      mcpServers: { "docs-search": { command: "npx", args: ["docs-mcp", "--api-key", KEY] } },
+    });
+    const { run } = cli(h, app);
+    const runs = "runs npx docs-mcp --api-key <hidden>";
+    const dry = stripAnsi(await run("mcp", ["on", "docs-search", "--dry-run"]));
+    expect(dry).toContain("Turn on docs-search in this project?");
+    expect(dry).toMatch(/settings\.local\.json +enabledMcpjsonServers \+ docs-search\n {8}runs npx docs-mcp/);
+    // On a narrow terminal the path gives way, and what it runs is never cut.
+    const narrow = stripAnsi(await run("mcp", ["on", "docs-search", "--dry-run"], { columns: 40 }));
+    expect(narrow.split("\n")).toContain(`        ${runs}`);
+    const plan = JSON.parse(await run("mcp", ["on", "docs-search", "--dry-run", "--json"]));
+    expect(plan.changes.map((c: { what: string; runs: string | null }) => [c.what, c.runs])).toEqual([
+      ["enabledMcpjsonServers + docs-search", "npx docs-mcp --api-key <hidden>"],
+    ]);
+    // Off writes no approval, and says nothing of what it runs.
+    const off = JSON.parse(await run("mcp", ["off", "docs-search", "--dry-run", "--json"]));
+    expect(off.changes.map((c: { runs: string | null }) => c.runs)).toEqual([null]);
+  });
+
+  it("refuses a .mcp.json server not here, and writes no settings file in its folder", async () => {
+    // labs is no project, labs/lab is one: seen from app, labs' lab loads in labs/lab alone.
+    const { h, app } = seed();
+    const lab = h.project("labs/lab");
+    h.claude("default", ".claude", { projects: { [app]: {}, [lab]: {} } });
+    h.write("labs/.mcp.json", { mcpServers: { lab: { command: "lab-mcp" } } });
+    const { run } = cli(h, app);
+    const reason = `It loads in the projects in ${tilde(h.path("labs"), h.home)}, each with its own approvals. Run it in one of them, or pass --project <path>.`;
+    for (const verb of ["on", "off"]) {
+      const error = await failure(run("mcp", [verb, "lab", "--yes"]));
+      expect(error.code).toBe(1);
+      expect(stripAnsi(error.message)).toContain(`lab  ${reason}`);
+      const body = JSON.parse((await failure(run("mcp", [verb, "lab", "--yes", "--json"]))).stdout ?? "");
+      expect(body.refused).toEqual([{ id: expect.any(String), name: "lab", code: "not-here", reason }]);
+    }
+    expect(existsSync(h.path("labs", ".claude"))).toBe(false);
+    expect(existsSync(h.path(".config", "git", "ignore"))).toBe(false);
+    // From the project below it, on approves it there.
+    await cli(h, lab).run("mcp", ["on", "lab", "--yes"]);
+    expect(json(path.join(lab, ".claude", "settings.local.json"))).toEqual({ enabledMcpjsonServers: ["lab"] });
   });
 });
 
@@ -650,7 +881,7 @@ describe("hooks off and on", () => {
 });
 
 describe("undo", () => {
-  it("puts back the last change, then has nothing left to undo", async () => {
+  it("puts back the last change, then has nothing left to undo", { timeout: SPAWNING_TEST_TIMEOUT_MS }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     const local = path.join(app, ".claude", "settings.local.json");
@@ -704,7 +935,7 @@ describe("undo", () => {
     expect(read(h.path(".claude", "settings.json"))).toContain("notify-a");
   });
 
-  it("leaves a file that changed since alone, and says so", async () => {
+  it("leaves a file that changed since alone, and says so", { timeout: SPAWNING_TEST_TIMEOUT_MS }, async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);
     const local = path.join(app, ".claude", "settings.local.json");

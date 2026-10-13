@@ -43,6 +43,11 @@ beforeEach(() => {
   vi.stubEnv("CODEX_SQLITE_HOME", "");
 });
 
+// Repair asks whether Codex runs in the profile, and the real check reads every codex process
+// on the machine, the user's own among them. Nothing here is about a running Codex; the check
+// has tests of its own (codex-allowlist.integration.test.ts, running-codex.test.ts).
+vi.mock("../core/running-codex.js", () => ({ codexProcessesFor: async () => [] }));
+
 const temps: string[] = [];
 afterEach(() => {
   vi.restoreAllMocks();

@@ -6,11 +6,13 @@ import {
   chosenAccount,
   codexMcpEntry,
   codexSkillEntry,
+  codexSkillPath,
   type ExtensionsCommand,
   hasOpened,
   layerMap,
   mcpDisabled,
   NEXT_VISIBILITY,
+  NO_PROJECT_KEYS,
   ONE_ACCOUNT_KEYS,
   ownValue,
   type Reach,
@@ -22,6 +24,7 @@ import {
   toggleVerb,
   type Verb,
 } from "./actions.js";
+import { notHere } from "./describe.js";
 import { valueHash } from "./hash.js";
 import { folderKey } from "./inventory.js";
 import type { Extension, HookPlace, Inventory, SkillVisibility } from "./model.js";
@@ -30,7 +33,18 @@ import { accountStates, projectName, shortProfile, stateHere, tilde, viewFrom } 
 import { isWithin, pathKey, samePath } from "./read.js";
 import { homeScope, isAccountServer, rowKey, SCOPE_LABEL, type ScopeRow } from "./scopes.js";
 import { type StashMeta, stashFileName, stashIdFor } from "./stash.js";
-import { claudeSkillOverride, codexTrusted, isManagedSetting, isMcpjsonServer, pluginState, stateOf } from "./state.js";
+import {
+  allHooksOff,
+  claudeFlag,
+  claudeSkillOverride,
+  codexTrusted,
+  isManagedSetting,
+  isMcpjsonServer,
+  MANAGED_MCP_KEY,
+  mcpBlocked,
+  pluginState,
+  stateOf,
+} from "./state.js";
 import type { JsonEdit, JsonPath } from "./writers/json.js";
 import type { SkillSelector, TomlEdit } from "./writers/toml.js";
 
@@ -39,7 +53,8 @@ import type { SkillSelector, TomlEdit } from "./writers/toml.js";
  * as asked, and what cannot change and why. Pure - it reads the inventory and nothing else -
  * and exactly what the confirm dialog and `--dry-run` show; apply.ts carries it out. It names
  * keys and server names, never a value of a server's or a hook's entry: those it only checks
- * by fingerprint.
+ * by fingerprint. The one exception is what a `.mcp.json` server it approves runs, redacted as
+ * the details show it.
  */
 
 export type PlanLine = {
@@ -55,6 +70,18 @@ export type PlanLine = {
   tracked: boolean;
   /** Row keys. */
   rows: string[];
+  /**
+   * A folder deleted: the row keys of the other skills inside it, not in the action, that go with
+   * it - Codex finds skills in folders below a skill's own.
+   */
+  deletes?: string[];
+  /** A folder deleted: the row keys of the skill links into it, not in the action, that it leaves broken. */
+  breaks?: string[];
+  /**
+   * A `.mcp.json` server this line approves: what it runs, its command or URL as the inventory's
+   * summary has it, secrets hidden (redact.ts). The one value of a server's entry a plan holds.
+   */
+  runs?: string;
 };
 
 export type Expect =
@@ -81,7 +108,20 @@ export type FileChange =
       lines: PlanLine[];
     }
   | { kind: "toml"; file: string; edits: TomlEdit[]; expect: Expect[]; create: boolean; lines: PlanLine[] }
-  | { kind: "remove"; file: string; what: "folder" | "file" | "link"; expect: Expect[]; lines: PlanLine[] };
+  | {
+      kind: "remove";
+      file: string;
+      what: "folder" | "file" | "link";
+      expect: Expect[];
+      lines: PlanLine[];
+      /**
+       * A skill's folder or a command's file: the skills folder it was read from, which a move
+       * across file systems keeps it out of meanwhile (writers/fs.ts moveTo).
+       */
+      root?: string;
+    }
+  /** A line added to a text file, git's global ignore file, unless a line of it is that already. */
+  | { kind: "text"; file: string; add: string; create: boolean; lines: PlanLine[] };
 
 export type Plan = {
   command: ExtensionsCommand;
@@ -110,7 +150,19 @@ export type PlanContext = {
   tracked: ReadonlySet<string>;
   /** Where stash files go: inv.places.stashDir in the app. */
   stashDir: string;
+  /** What planChecked found of git's global ignore file, for a project's first settings.local.json. */
+  ignore?: IgnoreFacts;
 };
+
+/** The line Claude Code adds to git's global ignore file when it makes a settings.local.json. */
+export const LOCAL_SETTINGS_IGNORE = "**/.claude/settings.local.json";
+
+/**
+ * planChecked's findings for the settings.local.json files a plan makes in projects: the global
+ * ignore file git reads, whether it is there, and the pathKeys of the new files that git would
+ * not ignore. Undefined when there is none, or the file holds the line already.
+ */
+export type IgnoreFacts = { file: string; exists: boolean; unignored: ReadonlySet<string> };
 
 export type KeyName = "space" | "g" | "d" | "v";
 export type KeyChoice = { key: KeyName; label: string; action: Action } | { key: KeyName; refused: string };
@@ -141,6 +193,19 @@ function whereFor(ctx: PlanContext, reach: Reach, project: string | undefined): 
   return project === undefined || samePath(project, ctx.project)
     ? "in this project"
     : `in ${projectName(project, ctx.inv)}`;
+}
+
+/**
+ * The note an `on --everywhere` adds when a switch in one project's own place still turns the row
+ * off there: an account's entry for the project in its `.claude.json`, the project's settings,
+ * a Codex path entry or project config. It names the account, the switch and its file. Said in
+ * no voice of keys or flags: a note reaches the dialog, the CLI and JSON alike.
+ */
+function stillOff(run: Run, project: string | undefined, what: string, file: string, account?: string): string {
+  const where = whereFor(run.ctx, "here", project);
+  const whose = account === undefined ? "" : ` for ${shortProfile(account)}`;
+  const again = where === "in this project" ? "here" : "there";
+  return `Still off ${where}${whose} (${what} in ${tilde(file, run.inv.homeDir)}). Turn it on ${again} too.`;
 }
 
 // ─── One row ────────────────────────────────────────────────────────
@@ -175,7 +240,9 @@ function outcome(project?: string): Outcome {
 
 function refused(run: Run, row: ScopeRow, code: RefusalCode, fill: RefusalFill = {}): Outcome {
   const out = outcome();
-  out.refused.push(refusal(code, row, firstOf(row).location.tool, { command: run.command, ...fill }));
+  // With no project recorded, the TUI has none to pick with p.
+  const keys = code === "no-project" && run.inv.projects.length === 0 ? NO_PROJECT_KEYS : undefined;
+  out.refused.push(refusal(code, row, firstOf(row).location.tool, { command: run.command, ...fill }, keys));
   return out;
 }
 
@@ -301,8 +368,19 @@ function tomlChange(
   return { kind: "toml", file, edits, expect, create, lines: [lineFor(run, row, file, what, { create })] };
 }
 
-function removal(file: string, what: "folder" | "file" | "link", expect: Expect[], line: PlanLine): FileChange {
-  return { kind: "remove", file, what, expect, lines: [line] };
+function removal(
+  file: string,
+  what: "folder" | "file" | "link",
+  expect: Expect[],
+  line: PlanLine,
+  root?: string,
+): FileChange {
+  return { kind: "remove", file, what, expect, lines: [line], ...(root !== undefined ? { root } : {}) };
+}
+
+/** The skills folder a skill was read from: a Codex skill can sit folders below its top. */
+function skillsRoot(item: Extension): string {
+  return item.skillsDir ?? path.dirname(item.location.file);
 }
 
 /** The fingerprint of an item's raw entry as read, at `at`. */
@@ -362,6 +440,8 @@ function planRow(run: Run, row: ScopeRow): Outcome {
   if (loc.scope === "plugin" && item.kind !== "plugin" && !serverHere) {
     return refused(run, row, "plugin-item", { plugin: loc.plugin ?? "" });
   }
+  // Codex's plugins are switched and uninstalled in Codex; the rest of this file is Claude's.
+  if (item.kind === "plugin" && loc.tool === "codex") return refused(run, row, "codex-plugin");
   if (verb !== "rm" && setByPolicy(run, item)) return refused(run, row, "managed");
   switch (item.kind) {
     case "skill":
@@ -413,6 +493,19 @@ function planClaudeSkill(run: Run, row: ScopeRow): Outcome {
       ),
     );
   const target: SkillVisibility = verb === "visibility" ? (run.action.level ?? "on") : verb === "off" ? "off" : "on";
+  // disableBundledSkills takes the built-in skills out: no level would show this one.
+  const bundled =
+    target !== "off" && item.location.scope === "builtin"
+      ? claudeFlag(inv, "disableBundledSkills", run.ctx.project)
+      : undefined;
+  if (bundled?.value === true) {
+    const file = tilde(bundled.file, inv.homeDir);
+    // A project's own setting holds in that project alone; everywhere goes ahead elsewhere.
+    if (here || (bundled.layer !== "project" && bundled.layer !== "local")) {
+      return refused(run, row, "bundled-off", { "~file": file });
+    }
+    note(out, `Still off in this project: disableBundledSkills in ${file}`);
+  }
   if (target === "off") return effective === "off" ? unchanged(out, row, `already off ${where}`) : write("off");
   if (target !== "on") {
     return current === target ? unchanged(out, row, `already shows ${SHOWS[target]} ${where}`) : write(target);
@@ -420,6 +513,12 @@ function planClaudeSkill(run: Run, row: ScopeRow): Outcome {
   // A toggle takes any level but off as on; visibility on is the full skill.
   const toggle = verb === "on";
   const isOn = (value: unknown) => (toggle ? value !== "off" : value === "on" || (!here && value === undefined));
+  // Everywhere is the user settings: a project's own off, above them, still holds there.
+  if (!here) {
+    const above = claudeSkillOverride(inv, name, seen, ["user"]);
+    if (above?.value === "off" && above.setBy)
+      note(out, stillOff(run, seen, `skillOverrides.${name}`, above.setBy.file));
+  }
   if (isOn(effective)) {
     const why = toggle
       ? here
@@ -432,10 +531,6 @@ function planClaudeSkill(run: Run, row: ScopeRow): Outcome {
   const below = here ? claudeSkillOverride(inv, name, seen, ["local"])?.value : undefined;
   const removable = current !== undefined && (toggle ? below !== "off" : below === undefined || below === "on");
   write(removable ? null : "on");
-  if (!here) {
-    const above = claudeSkillOverride(inv, name, seen, ["user"]);
-    if (above?.value === "off" && above.setBy) note(out, `Still off in ${tilde(above.setBy.file, inv.homeDir)}`);
-  }
   return out;
 }
 
@@ -454,7 +549,8 @@ function planCodexSkill(run: Run, row: ScopeRow): Outcome {
   const unreadable = unreadableAt(run, row, file);
   if (unreadable) return unreadable;
   const seen = here ? item.location.project : undefined;
-  const selector: SkillSelector = here ? { path: path.join(item.location.file, "SKILL.md") } : { name: item.name };
+  // Here, every entry that names the skill by a path, through a link or not, is changed or taken out.
+  const selector: SkillSelector = here ? codexSkillPath(inv, item) : { name: item.name };
   const entry = codexSkillEntry(inv, selector);
   const byName = here ? codexSkillEntry(inv, { name: item.name }) : entry;
   const where = whereFor(run.ctx, reach, seen);
@@ -478,7 +574,14 @@ function planCodexSkill(run: Run, row: ScopeRow): Outcome {
       ? unchanged(out, row, here ? `already off ${where}` : "already off in every project")
       : write(false);
   }
-  if (!here) return byName?.enabled === false ? write(null) : unchanged(out, row, "not off in Codex's config.toml");
+  if (!here) {
+    // A project skill's own path entry, which wins over the name one, still turns it off there.
+    const skillFile = path.join(item.location.file, "SKILL.md");
+    if (item.location.scope === "project" && codexSkillEntry(inv, codexSkillPath(inv, item))?.enabled === false) {
+      note(out, stillOff(run, item.location.project, `skills.config ${tilde(skillFile, inv.homeDir)}`, file));
+    }
+    return byName?.enabled === false ? write(null) : unchanged(out, row, "not off in Codex's config.toml");
+  }
   if (stateHere(inv, item, run.ctx.project).value !== "off") return unchanged(out, row, `already on ${where}`);
   // A path entry wins over a name one: it goes, unless the name entry would then turn it off.
   return write(entry !== undefined && byName?.enabled !== false ? null : true);
@@ -518,7 +621,122 @@ function folderNote(inv: Inventory, copy: Extension, real: string): string | und
   return `the folder at ${tilde(real, inv.homeDir)}`;
 }
 
-/** Each copy's folder by its real path, a link unlinked, a command's file; never what a link leads to. */
+/**
+ * The skill links that lead into a folder being deleted and are not in the action, by name: each
+ * is left broken. Undo puts the folder back, so they are said, not refused - unlike a link to the
+ * folder itself, which sameFolder refuses as the same folder in a second row.
+ */
+function linksInto(run: Run, real: string): { key: string; name: string }[] {
+  const found = new Map<string, string>();
+  for (const other of run.inv.items) {
+    if (other.kind !== "skill" || !other.link || other.link.broken || run.inAction.has(other.id)) continue;
+    if (isWithin(folderKey(other), real)) found.set(rowKey(other), other.name);
+  }
+  return [...found]
+    .map(([key, name]) => ({ key, name }))
+    .sort((a, b) => a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
+}
+
+/** Whether a skill is a folder of its own that rm moves: no link, no command's file. */
+function isSkillFolder(item: Extension): boolean {
+  return item.kind === "skill" && !item.link && item.summary?.type !== "command";
+}
+
+/**
+ * The other skills inside a folder being deleted and not in the action, by name: Codex finds
+ * skills in folders below a skill's own, and the folder's move takes them along. Not the folder
+ * itself through a link, which sameFolder refuses, nor a link, which linksInto says.
+ */
+function skillsInside(run: Run, copy: Extension, real: string): { key: string; name: string }[] {
+  const found = new Map<string, string>();
+  for (const other of run.inv.items) {
+    if (other.id === copy.id || !isSkillFolder(other) || run.inAction.has(other.id)) continue;
+    const key = folderKey(other);
+    if (key !== pathKey(real) && isWithin(key, real)) found.set(rowKey(other), other.name);
+  }
+  return [...found]
+    .map(([key, name]) => ({ key, name }))
+    .sort((a, b) => a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
+}
+
+/**
+ * The outermost folder of another skill in the action that holds this copy's folder: its move
+ * takes this one along, so this copy's line is that folder's.
+ */
+function outerFolder(run: Run, copy: Extension): Extension | undefined {
+  const key = folderKey(copy);
+  let outer: Extension | undefined;
+  for (const other of run.action.rows.flatMap((row) => row.items)) {
+    if (other.id === copy.id || !isSkillFolder(other)) continue;
+    const theirs = folderKey(other);
+    if (theirs === key || !isWithin(key, theirs)) continue;
+    if (!outer || theirs.length < folderKey(outer).length) outer = other;
+  }
+  return outer;
+}
+
+/** How many names `breaksNote` and `deletesNote` show before the `…`. */
+const BREAKS_SHOWN = 3;
+
+/** The first names, and `…` when there are more. */
+function shownNames(names: readonly string[]): string {
+  const shown = names.slice(0, BREAKS_SHOWN).join(", ");
+  return names.length > BREAKS_SHOWN ? `${shown}, …` : shown;
+}
+
+/** "breaks 30 links: canary, careful, freeze, … (add them to delete them too)". */
+function breaksNote(links: readonly { name: string }[]): string | undefined {
+  const names = [...new Set(links.map((link) => link.name))];
+  if (names.length === 0) return undefined;
+  const list = shownNames(names);
+  return names.length === 1
+    ? `breaks 1 link: ${list} (add it to delete it too)`
+    : `breaks ${names.length} links: ${list} (add them to delete them too)`;
+}
+
+/** "also deletes 2 skills inside: deeper, inner". */
+function deletesNote(inside: readonly { name: string }[]): string | undefined {
+  const names = [...new Set(inside.map((skill) => skill.name))];
+  if (names.length === 0) return undefined;
+  return `also deletes ${names.length} ${names.length === 1 ? "skill" : "skills"} inside: ${shownNames(names)}`;
+}
+
+/**
+ * `copy`'s folder moved into the backup, by its real path, on a line for `row`; or the refusal
+ * when another row, not in the action, is the same folder through a link.
+ */
+function folderRemoval(run: Run, row: ScopeRow, copy: Extension): FileChange | Outcome {
+  const other = sameFolder(run, copy);
+  if (other) {
+    return refused(run, row, "one-folder", {
+      Tool: TOOL_WORD[other.location.tool],
+      "Scope label": SCOPE_LABEL[homeScope(other, run.ctx.project)](other.location.tool),
+      name: other.name,
+      a: row.key,
+      b: rowKey(other),
+    });
+  }
+  const listed = copy.location.file;
+  const real = copy.realFolder ?? listed;
+  const inside = skillsInside(run, copy, real);
+  const links = linksInto(run, real);
+  const notes = [folderNote(run.inv, copy, real), deletesNote(inside), breaksNote(links)].filter(
+    (n) => n !== undefined,
+  );
+  const line = lineFor(run, row, listed, "", {
+    change: "delete",
+    note: notes.length > 0 ? notes.join(", ") : undefined,
+  });
+  if (inside.length > 0) line.deletes = inside.map((skill) => skill.key);
+  if (links.length > 0) line.breaks = links.map((link) => link.key);
+  return removal(real, "folder", [{ type: "entry", kind: "dir", realPath: real }], line, skillsRoot(copy));
+}
+
+/**
+ * Each copy's folder by its real path, a link unlinked, a command's file; never what a link leads
+ * to. A folder inside another the action deletes goes with that one: its line is the outer
+ * folder's, which merge() makes one line for both rows - unless the outer one can't go.
+ */
 function planSkillRemoval(run: Run, row: ScopeRow): Outcome {
   for (const copy of row.items) {
     if (copy.location.scope === "synced") return refused(run, row, "cloud-delete");
@@ -534,22 +752,14 @@ function planSkillRemoval(run: Run, row: ScopeRow): Outcome {
     }
     if (copy.summary?.type === "command") {
       const line = lineFor(run, row, listed, "", { change: "delete" });
-      out.changes.push(removal(listed, "file", [{ type: "entry", kind: "file" }], line));
+      out.changes.push(removal(listed, "file", [{ type: "entry", kind: "file" }], line, skillsRoot(copy)));
       continue;
     }
-    const other = sameFolder(run, copy);
-    if (other) {
-      return refused(run, row, "one-folder", {
-        Tool: TOOL_WORD[other.location.tool],
-        "Scope label": SCOPE_LABEL[homeScope(other, run.ctx.project)](other.location.tool),
-        name: other.name,
-        a: row.key,
-        b: rowKey(other),
-      });
-    }
-    const real = copy.realFolder ?? listed;
-    const line = lineFor(run, row, listed, "", { change: "delete", note: folderNote(run.inv, copy, real) });
-    out.changes.push(removal(real, "folder", [{ type: "entry", kind: "dir", realPath: real }], line));
+    const outer = outerFolder(run, copy);
+    const along = outer ? folderRemoval(run, row, outer) : undefined;
+    const made = along && "kind" in along ? along : folderRemoval(run, row, copy);
+    if (!("kind" in made)) return made;
+    out.changes.push(made);
   }
   return out;
 }
@@ -558,10 +768,43 @@ function planSkillRemoval(run: Run, row: ScopeRow): Outcome {
 
 function planClaudeMcp(run: Run, row: ScopeRow): Outcome {
   const item = firstOf(row);
-  if (isMcpjsonServer(item)) return planMcpjson(run, row);
-  if (item.location.scope === "plugin") return planPluginServer(run, row);
-  if (isAccountServer(item)) return planAccountServer(run, row);
-  return refused(run, row, "managed");
+  const kept = run.action.verb === "on" ? keptOffByPolicy(run, row) : undefined;
+  if (kept && "refusal" in kept) return kept.refusal;
+  const out = isMcpjsonServer(item)
+    ? planMcpjson(run, row)
+    : item.location.scope === "plugin"
+      ? planPluginServer(run, row)
+      : isAccountServer(item)
+        ? planAccountServer(run, row)
+        : refused(run, row, "managed");
+  if (kept) note(out, kept.note);
+  return out;
+}
+
+/**
+ * For `on`: whether Claude Code's MCP policy keeps the server from starting (`mcpBlocked`) in
+ * every copy the change takes, which on would not change. managed-mcp.json is named; a list in
+ * managed settings is the organization's, as any managed setting is; a list elsewhere is named
+ * with its file. A project's own list holds in that project alone, so on everywhere goes ahead,
+ * with a note.
+ */
+function keptOffByPolicy(run: Run, row: ScopeRow): { refusal: Outcome } | { note: string } | undefined {
+  const inv = run.inv;
+  const copies = row.items.filter((copy) => chosenIn(run, copy.location.profile));
+  const blocks = copies.map((copy) => mcpBlocked(inv, copy, run.ctx.project)?.setBy);
+  const first = blocks[0];
+  if (first === undefined || blocks.some((block) => block === undefined)) return undefined;
+  const file = tilde(first.file, inv.homeDir);
+  if (first.key === MANAGED_MCP_KEY) return { refusal: refused(run, row, "managed-mcp", { "~file": file }) };
+  if (isManagedSetting(inv, first.file)) return { refusal: refused(run, row, "managed") };
+  const layer = inv.facts.claudeMcpPolicy.find((p) => samePath(p.file, first.file))?.layer;
+  const denied = first.key === "deniedMcpServers";
+  if (run.action.reach === "everywhere" && (layer === "project" || layer === "local")) {
+    return {
+      note: `Still off in this project: ${denied ? "deniedMcpServers" : "not in allowedMcpServers"} in ${file}`,
+    };
+  }
+  return { refusal: refused(run, row, denied ? "mcp-denied" : "mcp-not-allowed", { "~file": file }) };
 }
 
 /** Where an account's server sits in its `.claude.json`: a user one at the top, a local one in its project's entry. */
@@ -602,6 +845,15 @@ function switchHere(
       }),
     );
   }
+}
+
+/** The note that an account's own `disabledMcpServers` for the project still turns its copy off there. */
+function switchStillOff(run: Run, out: Outcome, copy: Extension): void {
+  const account = copy.location.profile;
+  const seen = viewFrom(copy, run.ctx.project);
+  const file = account === undefined ? undefined : run.inv.places.claudeJson[account];
+  if (account === undefined || file === undefined || !mcpDisabled(run.inv, account, seen, copy.name)) return;
+  note(out, stillOff(run, seen, "disabledMcpServers", file, account));
 }
 
 /** An account's own server, each chosen account's copy: here its project switch, everywhere out of its file. */
@@ -649,11 +901,8 @@ function planAccountServer(run: Run, row: ScopeRow): Outcome {
           );
       } else if (!copy.stashed) {
         unchanged(out, row, `not off everywhere in ${short(copy)}`);
-        // Its switch in this project stays as it is. Said in no voice of keys or flags: a note
-        // reaches the dialog, the CLI and JSON alike.
-        if (mcpDisabled(inv, account ?? "", viewFrom(copy, run.ctx.project), name)) {
-          note(out, `Still off in this project for ${short(copy)}.`);
-        }
+        // Its switch in this project stays as it is.
+        switchStillOff(run, out, copy);
       } else if (copy.stashed.gone) {
         // d on a row that holds other accounts' copies too would delete theirs: pick this one's account.
         const others = row.items.some((other) => other.location.profile !== copy.location.profile);
@@ -678,6 +927,8 @@ function planAccountServer(run: Run, row: ScopeRow): Outcome {
             { account, fromStash: copy.stashed.file },
           ),
         );
+        // Put back, it is still off here while the account's switch here says so.
+        switchStillOff(run, out, copy);
       }
     }
     return out;
@@ -766,6 +1017,11 @@ function planMcpjson(run: Run, row: ScopeRow): Outcome {
     );
   }
   if (reach === "everywhere") return refused(run, row, "mcpjson-everywhere");
+  // Of a folder that is no project, seen from outside it: each project below the folder has its
+  // own approvals, and no session reads the folder's own settings.
+  if (notHere(inv, row, run.ctx.project)) {
+    return refused(run, row, "not-here", { "~folder": tilde(item.location.project ?? "", inv.homeDir) });
+  }
   const seen = viewFrom(item, run.ctx.project) ?? inv.homeDir;
   const local = localSettingsFile(seen);
   const unreadable = unreadableAt(run, row, local);
@@ -831,20 +1087,24 @@ function planMcpjson(run: Run, row: ScopeRow): Outcome {
       ...(denied ? [`disabledMcpjsonServers - ${name}`] : []),
       ...(approved ? [] : [`enabledMcpjsonServers + ${name}`]),
     ];
-    out.changes.push(
-      jsonChange(
-        run,
-        row,
-        local,
-        [
-          { op: "list-remove", path: ["disabledMcpjsonServers"], value: name },
-          { op: "list-add", path: ["enabledMcpjsonServers"], value: name },
-        ],
-        [],
-        what.join(", "),
-        { create: true },
-      ),
+    const change = jsonChange(
+      run,
+      row,
+      local,
+      [
+        { op: "list-remove", path: ["disabledMcpjsonServers"], value: name },
+        { op: "list-add", path: ["enabledMcpjsonServers"], value: name },
+      ],
+      [],
+      what.join(", "),
+      { create: true },
     );
+    // Approving runs a command the repo defines: the line says which, as Claude Code's own
+    // approval prompt does. One approved before has nothing new to say.
+    const runs = item.summary?.command ?? item.summary?.url;
+    const line = change.lines[0];
+    if (!approved && runs !== undefined && line) line.runs = runs;
+    out.changes.push(change);
   }
   out.changes.push(...accountChanges);
   return out;
@@ -919,6 +1179,14 @@ function planCodexMcp(run: Run, row: ScopeRow): Outcome {
     const out = outcome();
     const off = codexMcpEntry(inv, own, name)?.enabled === false;
     if (verb === "off") return off ? unchanged(out, row, "already off in every project") : write(out, own, false, true);
+    // This project's own config, which Codex reads where it trusts the project, still turns it off.
+    const project = run.ctx.project;
+    const here = inv.facts.codexMcpEnabled.find(
+      (entry) => entry.name === name && entry.project !== undefined && samePath(entry.project, project),
+    );
+    if (here?.enabled === false && codexTrusted(inv, project)) {
+      note(out, stillOff(run, project, `mcp_servers.${name}.enabled`, here.file));
+    }
     return off ? write(out, own, null, true) : unchanged(out, row, "not off in Codex's config.toml");
   }
   const project = run.ctx.project;
@@ -952,6 +1220,14 @@ function planHook(run: Run, row: ScopeRow): Outcome {
   const at: JsonPath = [...eventPath(place), place.group, "hooks", place.index];
   const event = place.event;
   const out = outcome();
+  // While disableAllHooks holds, turning one hook on would not make it run.
+  const holds = verb === "on" ? claudeFlag(inv, "disableAllHooks", run.ctx.project) : undefined;
+  if (holds?.value === true && allHooksOff(inv, item, run.ctx.project)) {
+    if (holds.layer === "managed") return refused(run, row, "managed");
+    if (holds.layer === "user") return refused(run, row, "all-hooks-off", { "~file": tilde(holds.file, inv.homeDir) });
+    // A project's own setting holds in that project alone, and on is in every project.
+    note(out, `Still off in this project: disableAllHooks in ${tilde(holds.file, inv.homeDir)}`);
+  }
   if (verb === "rm") {
     if (item.stashed) return adding(out, stashRemoval(run, row, item, item.stashed.file));
     return adding(
@@ -981,7 +1257,17 @@ function planHook(run: Run, row: ScopeRow): Outcome {
       ),
     );
   }
-  if (!item.stashed) return unchanged(out, row, "already on in every project");
+  if (!item.stashed) {
+    // In its file already: what keeps a Codex hook from running is Codex's to change.
+    const now = loc.tool === "codex" ? stateHere(inv, item, run.ctx.project).value : "on";
+    const why =
+      now === "pending-approval"
+        ? "already in its file: Codex runs it once you trust it with /hooks"
+        : now === "off"
+          ? "already in its file: turn it back on with /hooks in Codex"
+          : "already on in every project";
+    return unchanged(out, row, why);
+  }
   if (item.stashed.gone) {
     return refused(run, row, "stash-gone", { "~file": tilde(loc.file, inv.homeDir), id: item.id });
   }
@@ -1010,6 +1296,13 @@ function planPlugin(run: Run, row: ScopeRow): Outcome {
   if (unreadable) return unreadable;
   const value = verb === "on";
   const out = outcome(seen);
+  if (!here && value) {
+    // A project's own false still wins over the user's true.
+    const above = (["local", "project"] as const)
+      .map((layer) => inv.facts.claudeEnabledPlugins.find((e) => e.layer === layer && samePath(e.project, seen)))
+      .find((entry) => entry !== undefined && ownValue(entry.map, id) === false);
+    if (above) note(out, stillOff(run, seen, `enabledPlugins.${id}`, above.file));
+  }
   if (pluginState(inv, id, here ? seen : undefined).value === verb) {
     return unchanged(out, row, `already ${verb} ${whereFor(run.ctx, reach, seen)}`);
   }
@@ -1027,13 +1320,6 @@ function planPlugin(run: Run, row: ScopeRow): Outcome {
       { create: true },
     ),
   );
-  if (!here && value) {
-    // A project's own false still wins over the user's true.
-    const above = (["local", "project"] as const)
-      .map((layer) => inv.facts.claudeEnabledPlugins.find((e) => e.layer === layer && samePath(e.project, seen)))
-      .find((entry) => entry !== undefined && ownValue(entry.map, id) === false);
-    if (above) note(out, `Still off in ${tilde(above.file, inv.homeDir)}`);
-  }
   return out;
 }
 
@@ -1308,6 +1594,29 @@ function accountChoices(ctx: PlanContext, command: ExtensionsCommand, action: Ac
   return profiles.map((profile) => ({ profile, chosen: accounts === undefined || accounts.includes(profile) }));
 }
 
+/**
+ * Claude Code keeps a project's `.claude/settings.local.json` out of git by adding
+ * LOCAL_SETTINGS_IGNORE to the global ignore file when it makes that file. A plan that makes one
+ * git would not ignore does the same, as one more change, shown, backed up and undone with the
+ * rest. planChecked finds the files and the ignore file; this only words them.
+ */
+function ignoreChanges(ctx: PlanContext, changes: readonly FileChange[]): FileChange[] {
+  const facts = ctx.ignore;
+  if (!facts) return [];
+  const making = changes.filter((c) => c.kind === "json" && c.create && facts.unignored.has(pathKey(c.file)));
+  const rows = [...new Set(making.flatMap((c) => c.lines.flatMap((line) => line.rows)))];
+  if (rows.length === 0) return [];
+  const line: PlanLine = {
+    file: facts.file,
+    change: facts.exists ? "edit" : "create",
+    what: `adds ${LOCAL_SETTINGS_IGNORE}`,
+    note: "as Claude Code does",
+    tracked: false,
+    rows,
+  };
+  return [{ kind: "text", file: facts.file, add: LOCAL_SETTINGS_IGNORE, create: true, lines: [line] }];
+}
+
 /** Every file change `action` makes, what is already as asked, and what is refused and why. */
 export function plan(ctx: PlanContext, command: ExtensionsCommand, action: Action): Plan {
   const made = planned(ctx, command, action);
@@ -1320,7 +1629,7 @@ export function plan(ctx: PlanContext, command: ExtensionsCommand, action: Actio
     ...(action.verb === "visibility" ? { level: action.level ?? "on" } : {}),
     question,
     done,
-    changes: made.changes,
+    changes: [...made.changes, ...ignoreChanges(ctx, made.changes)],
     unchanged: made.unchanged,
     refused: made.refused,
     notes: made.notes,

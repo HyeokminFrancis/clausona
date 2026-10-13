@@ -19,8 +19,8 @@ import {
 } from "./describe.js";
 import { loadInventory } from "./inventory.js";
 import type { Extension, Inventory } from "./model.js";
-import { stateHere, viewFrom } from "./present.js";
-import { isAccountCopy, rowsIn, type ScopeRow } from "./scopes.js";
+import { projectName, stateHere, tilde, viewFrom } from "./present.js";
+import { isAccountCopy, otherProjects, rowsIn, type ScopeRow } from "./scopes.js";
 import { TestHome } from "./test-home.js";
 
 const DAY = 86_400_000;
@@ -58,6 +58,8 @@ async function seed(extra: Extra = {}): Promise<Seeded> {
   h.codex("personal", ".codex");
   h.skill(".claude/skills", "eli5", "Explain things simply");
   h.skill(".claude/skills", "old-one");
+  // work loads the primary's skills through the link clausona makes for every account.
+  h.link(".claude/skills", ".claude-work/skills");
   h.skill("repos/app/.claude/skills", "eli5");
   h.skill("repos/app/.claude/skills", "deploy-check");
   h.skill("repos/web/.claude/skills", "web-only");
@@ -65,12 +67,7 @@ async function seed(extra: Extra = {}): Promise<Seeded> {
   h.write(".mcp.json", { mcpServers: { tools: { command: "tools-mcp" } } });
   h.write(".claude/settings.json", { hooks: { Stop: [{ hooks: [{ type: "command", command: "notify-me" }] }] } });
   extra.more?.(h, app, web);
-  const inv = await loadInventory({
-    homeDir: h.home,
-    registry: h.registry,
-    cwd: app,
-    managedSettings: h.path("none.json"),
-  });
+  const inv = await loadInventory(h.inventoryOptions(app));
   return { h, inv, app, web };
 }
 
@@ -192,12 +189,7 @@ describe("tagsOf", () => {
       h.skill(".claude/skills", "x");
       h.write(file, { skillOverrides: { x: "off" } });
       // Started in the home dir, which is then the project: every file is under it.
-      const inv = await loadInventory({
-        homeDir: h.home,
-        registry: h.registry,
-        cwd: h.home,
-        managedSettings: h.path("none.json"),
-      });
+      const inv = await loadInventory(h.inventoryOptions(h.home));
       expect(inv.currentProject).toBe(h.home);
       return tagsOf(inv, single(claudeSkill(inv, "x")), h.home, NOW);
     };
@@ -219,10 +211,156 @@ describe("tagsOf", () => {
     expect(tagsOf(inv, { key: row.key, name: "github", items: [work] }, app, NOW)).toEqual(["off here"]);
   });
 
+  it("says no front matter last, for a Claude SKILL.md without it, and for a Codex one, which Codex skips", async () => {
+    const { inv, app } = await seed({
+      more: (h) => {
+        h.write(".claude/skills/bare/SKILL.md", "Do the thing.\n");
+        h.write("repos/app/.claude/skills/plain/SKILL.md", "Deploy it.\n");
+        h.write(".agents/skills/bare/SKILL.md", "Do the thing.\n");
+      },
+    });
+    // Never used, 200 days on: unused comes first.
+    expect(tagsOf(inv, single(claudeSkill(inv, "bare")), app, NOW)).toEqual(["unused", "no front matter"]);
+    const plain = single(claudeSkill(inv, "plain", app));
+    expect(tagsOf(inv, plain, app, NOW)).toEqual(["unused", "no front matter"]);
+    expect(jsonItem(inv, plain, app, NOW).tags).toEqual(["unused", "no front matter"]);
+    const codex = find(inv, (i) => i.location.tool === "codex" && i.name === "bare", "codex bare");
+    expect(tagsOf(inv, single(codex), app, NOW)).toEqual(["no front matter"]);
+    // Claude Code lists, and loads, its row under its folder's name; Codex skips its own.
+    expect(rowsIn(inv, "claude", "skill", "loaded", app, NOW).map((r) => r.name)).toContain("bare");
+    expect(rowsIn(inv, "codex", "skill", "loaded", app, NOW).map((r) => r.name)).not.toContain("bare");
+  });
+
   it("puts broken link first and leaves unused out after it; a .mcp.json server waits for approval", async () => {
     const { inv, app } = await seed({ more: (h) => h.link(path.join(h.home, "gone"), ".claude/skills/dangling") });
     expect(tagsOf(inv, single(claudeSkill(inv, "dangling")), app, NOW)).toEqual(["broken link"]);
     expect(tagsOf(inv, single(find(inv, (i) => i.name === "tools", "tools")), app, NOW)).toEqual(["pending approval"]);
+  });
+});
+
+describe("settings that turn a whole kind off", () => {
+  it("reads every Claude hook off under disableAllHooks, and says where it is set", async () => {
+    const { h, inv, app } = await seed({
+      more: (h) =>
+        h.write(".claude/settings.json", {
+          disableAllHooks: true,
+          hooks: { Stop: [{ hooks: [{ type: "command", command: "notify-me" }] }] },
+        }),
+    });
+    const stop = rowsIn(inv, "claude", "hook", "global", app, NOW)[0] as ScopeRow;
+    expect(tagsOf(inv, stop, app, NOW)).toEqual(["off"]);
+    expect(jsonItem(inv, stop, app, NOW).state).toBe("off");
+    expect(detailsOf(inv, stop, app, NOW).find((l) => l.label === "Loaded")).toEqual({
+      label: "Loaded",
+      text: `off everywhere (disableAllHooks in ${tilde(h.path(".claude", "settings.json"), h.home)})`,
+      tone: "warning",
+    });
+    expect(rowsIn(inv, "claude", "hook", "loaded", app, NOW)).toEqual([]);
+  });
+
+  it("says off here for a project's own disableAllHooks", async () => {
+    const { inv, app } = await seed({
+      more: (h) => h.write("repos/app/.claude/settings.local.json", { disableAllHooks: true }),
+    });
+    const stop = rowsIn(inv, "claude", "hook", "global", app, NOW)[0] as ScopeRow;
+    expect(tagsOf(inv, stop, app, NOW)).toEqual(["off here"]);
+    expect(detailsOf(inv, stop, app, NOW).find((l) => l.label === "Loaded")?.text).toBe(
+      `off here (disableAllHooks in this project's ${path.join(".claude", "settings.local.json")})`,
+    );
+  });
+
+  it("reads the built-in skills off under disableBundledSkills, and leaves the others on", async () => {
+    const { h, inv, app } = await seed({
+      more: (h) =>
+        h.write(".claude/settings.json", { disableBundledSkills: true, skillOverrides: { "claude-api": "name-only" } }),
+    });
+    const builtin = rowsIn(inv, "claude", "skill", "builtin", app, NOW);
+    expect(builtin.map((r) => r.name)).toEqual(["claude-api"]);
+    const api = builtin[0] as ScopeRow;
+    expect(tagsOf(inv, api, app, NOW)).toEqual(["off"]);
+    expect(jsonItem(inv, api, app, NOW).state).toBe("off");
+    expect(detailsOf(inv, api, app, NOW).find((l) => l.label === "Loaded")?.text).toBe(
+      `off everywhere (disableBundledSkills in ${tilde(h.path(".claude", "settings.json"), h.home)})`,
+    );
+    expect(tagsOf(inv, single(claudeSkill(inv, "eli5")), app, NOW)).toEqual([]);
+  });
+});
+
+describe("managed MCP servers and the MCP lists", () => {
+  /** seed()'s home with managed settings beside a managed-mcp.json, in a folder of its own. */
+  async function managedSeed(more: (h: TestHome, app: string) => void) {
+    const h = new TestHome();
+    homes.push(h);
+    const app = h.project("repos/app");
+    h.claude("default", ".claude", { projects: { [app]: {} }, mcpServers: { github: { command: "gh-mcp" } } });
+    h.claude("work", ".claude-work", { projects: { [app]: {} }, mcpServers: { github: { command: "gh-mcp" } } });
+    more(h, app);
+    const inv = await loadInventory(h.inventoryOptions(app, h.path("policy", "managed-settings.json")));
+    return { h, inv, app };
+  }
+
+  it("lists managed-mcp.json's servers under Managed, and every other server off while it is there", async () => {
+    const { h, inv, app } = await managedSeed((h) =>
+      h.write("policy/managed-mcp.json", { mcpServers: { company: { type: "http", url: "https://c.example/mcp" } } }),
+    );
+    const managed = rowsIn(inv, "claude", "mcp", "managed", app, NOW);
+    expect(managed.map((r) => r.name)).toEqual(["company"]);
+    expect(whereLabel(managed[0]?.items[0] as Extension, inv, app)).toBe("Managed");
+    expect(rowsIn(inv, "claude", "mcp", "loaded", app, NOW).map((r) => r.name)).toEqual(["company"]);
+    const github = serverRow(inv, "global", app, "github");
+    expect(tagsOf(inv, github, app, NOW)).toEqual(["off"]);
+    expect(detailsOf(inv, github, app, NOW).find((l) => l.label === "Accounts")?.text).toBe(
+      `off (only the servers in ${tilde(h.path("policy", "managed-mcp.json"), h.home)} start) in every account`,
+    );
+  });
+
+  it("says which list turns a server off, and where it is", async () => {
+    const { h, inv, app } = await managedSeed((h) =>
+      h.write("policy/managed-settings.json", { deniedMcpServers: [{ serverName: "github" }] }),
+    );
+    const github = serverRow(inv, "global", app, "github");
+    expect(jsonItem(inv, github, app, NOW)).toMatchObject({
+      state: "off",
+      stateByAccount: { "claude:default": "off", "claude:work": "off" },
+      tags: ["off"],
+    });
+    expect(detailsOf(inv, github, app, NOW).find((l) => l.label === "Accounts")?.text).toBe(
+      `off (deniedMcpServers in ${tilde(h.path("policy", "managed-settings.json"), h.home)}) in every account`,
+    );
+    const allow = await managedSeed((h, app) =>
+      h.write(path.join(path.relative(h.home, app), ".claude", "settings.local.json"), { allowedMcpServers: [] }),
+    );
+    const blocked = serverRow(allow.inv, "global", allow.app, "github");
+    expect(tagsOf(allow.inv, blocked, allow.app, NOW)).toEqual(["off here"]);
+    expect(detailsOf(allow.inv, blocked, allow.app, NOW).find((l) => l.label === "Accounts")?.text).toBe(
+      `off (not in allowedMcpServers in this project's ${path.join(".claude", "settings.local.json")}) in every account`,
+    );
+  });
+});
+
+describe("Cloud skills of an account whose skills folder is its own", () => {
+  it("lists them as that account's, and the primary's stale bucket for it nowhere", async () => {
+    const { inv, app } = await seed({
+      defaultJson: () => ({ oauthAccount: { organizationUuid: "org1", accountUuid: "a" } }),
+      more: (h) => {
+        h.claude("solo", ".claude-solo", { oauthAccount: { organizationUuid: "org1", accountUuid: "c" } });
+        h.skill(".claude-solo/skills/synced/org1_c", "fresh");
+        h.skill(".claude/skills/synced/org1_c", "stale");
+      },
+    });
+    const cloud = rowsIn(inv, "claude", "skill", "cloud", app, NOW);
+    expect(cloud.map((r) => r.name)).toEqual(["fresh"]);
+    const fresh = cloud[0] as ScopeRow;
+    expect(rowAccounts(inv, fresh)).toEqual(["claude:solo"]);
+    expect(jsonItem(inv, fresh, app, NOW).copies).toEqual([
+      {
+        id: fresh.items[0]?.id,
+        account: "claude:solo",
+        file: inv.items.find((i) => i.name === "fresh")?.location.file,
+      },
+    ]);
+    expect(rowsIn(inv, "claude", "skill", "loaded", app, NOW).map((r) => r.name)).toContain("fresh");
+    expect(inv.items.some((i) => i.name === "stale")).toBe(false);
   });
 });
 
@@ -295,6 +433,10 @@ describe("fromLabel and scopeSentence", () => {
       "CLOUD — skills on your claude.ai accounts, different per account",
     );
     expect(scopeSentence("project", "claude", "skill", inv, undefined)).toBe("PROJECT — no project · pick one with p");
+    // With no project recorded there is none to pick.
+    expect(scopeSentence("project", "claude", "skill", { ...inv, projects: [] }, undefined)).toBe(
+      "PROJECT — no project",
+    );
     expect(scopeSentence("loaded", "claude", "skill", inv, web)).toMatch(
       /^LOADED — what Claude Code loads in ~[\\/]repos[\\/]web, in at least one account$/,
     );
@@ -366,9 +508,32 @@ describe("detailsOf", () => {
     expect(lines[accountsAt + 1]?.text).toMatch(
       /^work {5}off \(this project's entry in ~[\\/]\.claude-work[\\/]\.claude\.json\)$/,
     );
+    // Each copy's file, with the account it is in, as Also in names one.
     const fileAt = lines.findIndex((l) => l.label === "File");
     expect(lines.slice(fileAt, fileAt + 2).map((l) => l.text)).toEqual([
-      `~${path.sep}.claude.json`,
+      `~${path.sep}.claude.json · default`,
+      `~${path.sep}${path.join(".claude-work", ".claude.json")} · work`,
+    ]);
+  });
+
+  it("names the account of each local copy's file, before whose entry it is, and none for one account's", async () => {
+    const pg = { "pg-dev": { command: "pg" } };
+    const { inv, app } = await seed({
+      defaultJson: (app) => ({ projects: { [app]: { mcpServers: pg } } }),
+      workJson: (app) => ({ projects: { [app]: { mcpServers: pg } }, mcpServers: { solo: { command: "solo" } } }),
+    });
+    // The File lines come last in a Claude server's details.
+    const files = (row: ScopeRow) => {
+      const lines = detailsOf(inv, row, app, NOW);
+      const at = lines.findIndex((l) => l.label === "File");
+      return at < 0 ? [] : lines.slice(at);
+    };
+    expect(files(serverRow(inv, "project", app, "pg-dev")).map((l) => l.text)).toEqual([
+      `~${path.sep}.claude.json · default (this project's entry)`,
+      `~${path.sep}${path.join(".claude-work", ".claude.json")} · work (this project's entry)`,
+    ]);
+    // One account's server: its file says whose it is already.
+    expect(files(serverRow(inv, "global", app, "solo")).map((l) => l.text)).toEqual([
       `~${path.sep}${path.join(".claude-work", ".claude.json")}`,
     ]);
   });
@@ -471,6 +636,7 @@ describe("rowAccounts and accountsWord", () => {
       plugin: "sp@m",
       file: `/${dir}/.mcp.json`,
       ...(accounts ? { accounts } : {}),
+      installScope: "user",
     },
   });
   const row = (...items: Extension[]): ScopeRow => ({ key: "row", name: "plugin:sp:search", items });
@@ -562,6 +728,7 @@ describe("jsonItem", () => {
       "accounts",
       "state",
       "stateByAccount",
+      "loadsByAccount",
       "usage",
       "tags",
       "file",
@@ -589,6 +756,45 @@ describe("jsonItem", () => {
     expect(JSON.stringify(item)).not.toContain(KEY);
     expect(item.summary).toMatchObject({ env: "GITHUB_TOKEN" });
   });
+
+  it("says per account whether a row loads here: not where a local copy wins, nor where it is off", async () => {
+    // default's local github wins over its user one; work turned figma off in app.
+    const { inv, app, web } = await seed({
+      defaultJson: (app) => ({
+        projects: { [app]: { mcpServers: { github: { command: "gh-local" } } } },
+        mcpServers: { github: { command: "gh-mcp" }, figma: { command: "figma-mcp" } },
+      }),
+      workJson: (app) => ({
+        projects: { [app]: { disabledMcpServers: ["figma"] } },
+        mcpServers: { github: { command: "gh-mcp" }, figma: { command: "figma-mcp" } },
+      }),
+    });
+    const loads = (row: ScopeRow, from = app) => {
+      const item = jsonItem(inv, row, from, NOW);
+      return { state: item.stateByAccount, loads: item.loadsByAccount };
+    };
+    // Both accounts' switches are on, but in default its local copy is the one that loads.
+    expect(loads(serverRow(inv, "global", app, "github"))).toEqual({
+      state: { "claude:default": "on", "claude:work": "on" },
+      loads: { "claude:default": false, "claude:work": true },
+    });
+    expect(loads(serverRow(inv, "project", app, "github"))).toEqual({
+      state: { "claude:default": "on" },
+      loads: { "claude:default": true },
+    });
+    expect(loads(serverRow(inv, "global", app, "figma"))).toEqual({
+      state: { "claude:default": "on", "claude:work": "off" },
+      loads: { "claude:default": true, "claude:work": false },
+    });
+    // Seen from web, app's local server loads for no one: it is not in web's Loaded.
+    const local = rowsIn(inv, "claude", "mcp", "other", web, NOW, app).find((r) => r.name === "github");
+    if (!local) throw new Error("no local github seen from web");
+    expect(loads(local, web)).toEqual({ state: { "claude:default": "on" }, loads: { "claude:default": false } });
+    // A row read in one state has neither.
+    const skill = jsonItem(inv, single(claudeSkill(inv, "eli5")), app, NOW);
+    expect(skill).not.toHaveProperty("stateByAccount");
+    expect(skill).not.toHaveProperty("loadsByAccount");
+  });
 });
 
 describe("rows across accounts", () => {
@@ -603,6 +809,8 @@ describe("rows across accounts", () => {
     });
     h.claude("work", ".claude-work", { oauthAccount: { organizationUuid: "org1", accountUuid: "acc2" } });
     h.claude("solo", ".claude-solo");
+    // work finds its Cloud skills in the primary's folder through the link clausona makes.
+    h.link(".claude/skills", ".claude-work/skills");
     h.skill(".claude/skills/synced/org1_acc1", "pdf", "Read PDFs");
     h.skill(".claude/skills/synced/org1_acc2", "pdf", "Read PDFs");
     h.skill(".claude/skills", "pdf", "My own pdf");
@@ -613,12 +821,7 @@ describe("rows across accounts", () => {
     h.write(".claude/settings.json", { enabledPlugins: { "kit@m": true } });
     h.skill(".claude/plugins/cache/m/kit/1.0.0/skills", "plan");
     h.skill(".claude-work/plugins/cache/m/kit/1.0.0/skills", "plan");
-    const inv = await loadInventory({
-      homeDir: h.home,
-      registry: h.registry,
-      cwd: app,
-      managedSettings: h.path("none.json"),
-    });
+    const inv = await loadInventory(h.inventoryOptions(app));
     const row = (scope: "cloud" | "plugins" | "loaded", name: string): ScopeRow => {
       const found = rowsIn(inv, "claude", "skill", scope, app, NOW).find((r) => r.name === name);
       if (!found) throw new Error(`no ${name} row`);
@@ -664,6 +867,7 @@ describe("rows across accounts", () => {
       "accounts",
       "state",
       "stateByAccount",
+      "loadsByAccount",
       "usage",
       "tags",
       "file",
@@ -676,6 +880,7 @@ describe("rows across accounts", () => {
       scope: "cloud",
       accounts: ["claude:default", "claude:work"],
       stateByAccount: { "claude:default": "on", "claude:work": "on" },
+      loadsByAccount: { "claude:default": true, "claude:work": true },
       copies: pdf.items.map((i) => ({ id: i.id, account: i.location.profile, file: i.location.file })),
       file: pdf.items[0]?.location.file,
     });
@@ -706,5 +911,96 @@ describe("rows across accounts", () => {
     expect(plan.items).toHaveLength(2);
     expect(statesByAccount(inv, plan, app)?.map((a) => a.profile)).toEqual(["claude:default", "claude:work"]);
     expect(detailsOf(inv, plan, app, NOW).some((l) => l.label === "Also in")).toBe(false);
+  });
+});
+
+describe("an account whose skills folder is not the primary's", () => {
+  /**
+   * default is the primary; work's skills folder links to it; solo has a folder of its own and
+   * bare none. A Global eli5, and app's own eli5, read from app.
+   */
+  async function unlinked() {
+    const h = new TestHome();
+    homes.push(h);
+    const app = h.project("repos/app");
+    h.claude("default", ".claude", { projects: { [app]: {} } });
+    h.claude("work", ".claude-work", { projects: { [app]: {} } });
+    h.claude("solo", ".claude-solo", { projects: { [app]: {} } });
+    h.claude("bare", ".claude-bare");
+    h.skill(".claude/skills", "eli5", "Explain things simply");
+    h.link(".claude/skills", ".claude-work/skills");
+    h.skill(".claude-solo/skills", "mine");
+    h.skill("repos/app/.claude/skills", "eli5");
+    const inv = await loadInventory(h.inventoryOptions(app));
+    return { inv, app };
+  }
+
+  it("leaves it out of a Global skill's accounts, and out of where that skill loads", async () => {
+    const { inv, app } = await unlinked();
+    const eli5 = single(claudeSkill(inv, "eli5"));
+    expect(detailsOf(inv, eli5, app, NOW).filter((l) => l.label === "Loaded" || l.label === "")).toEqual([
+      { label: "Loaded", text: "on in 2 accounts, every project" },
+      { label: "", text: "default, work" },
+    ]);
+    expect(jsonItem(inv, eli5, app, NOW).accounts).toEqual(["claude:default", "claude:work"]);
+    expect(rowAccounts(inv, eli5)).toEqual(["claude:default", "claude:work"]);
+  });
+
+  it("loads a project skill there that the Global copy hides in the linked accounts", async () => {
+    const { inv, app } = await unlinked();
+    const project = single(claudeSkill(inv, "eli5", app));
+    expect(statesByAccount(inv, project, app)?.map((a) => [a.profile, a.state.shadowedBy !== undefined])).toEqual([
+      ["claude:default", true],
+      ["claude:work", true],
+      ["claude:solo", false],
+      ["claude:bare", false],
+    ]);
+    // Hidden in some accounts only: no tag says so, it is in Loaded, and its details say where.
+    expect(tagsOf(inv, project, app, NOW).filter((tag) => tag.startsWith("hidden"))).toEqual([]);
+    expect(rowsIn(inv, "claude", "skill", "loaded", app, NOW).map((r) => r.key)).toContain(project.key);
+    expect(detailsOf(inv, project, app, NOW).find((l) => l.label === "Loaded")?.text).toBe(
+      "hidden by the Global copy in default, work · on in solo, bare",
+    );
+    expect(jsonItem(inv, project, app, NOW).loadsByAccount).toEqual({
+      "claude:default": false,
+      "claude:work": false,
+      "claude:solo": true,
+      "claude:bare": true,
+    });
+  });
+});
+
+describe("two projects of one folder name", () => {
+  /** work/app and personal/app, each with a skill and a local server, and tool, seen from tool. */
+  async function twins() {
+    const h = new TestHome();
+    homes.push(h);
+    const [work, mine, tool] = ["work/app", "personal/app", "repos/tool"].map((dir) => h.project(dir));
+    const pg = { mcpServers: { pg: { command: "pg" } } };
+    h.claude("default", ".claude", { projects: { [work as string]: pg, [mine as string]: pg, [tool as string]: {} } });
+    h.skill("work/app/.claude/skills", "deploy");
+    h.skill("personal/app/.claude/skills", "deploy");
+    const inv = await loadInventory(h.inventoryOptions(tool as string));
+    return { inv, work: work as string, mine: mine as string, tool: tool as string };
+  }
+
+  it("names each by the folder above it, everywhere a project is named, and one of its own name short", async () => {
+    const { inv, work, mine, tool } = await twins();
+    const [workApp, mineApp] = [path.join("work", "app"), path.join("personal", "app")];
+    expect([projectName(work, inv), projectName(mine, inv), projectName(tool, inv)]).toEqual([
+      workApp,
+      mineApp,
+      "tool",
+    ]);
+    expect(otherProjects(inv, "claude", "skill", tool).map((p) => p.name)).toEqual([mineApp, workApp]);
+    const deploy = claudeSkill(inv, "deploy", work);
+    expect([whereLabel(deploy, inv, tool), fromLabel(deploy, inv, tool)]).toEqual([workApp, workApp]);
+    expect(jsonItem(inv, single(deploy), tool, NOW).from).toBe(workApp);
+    // A local server of one of them says whose entry its file is by that name too.
+    const pg = rowsIn(inv, "claude", "mcp", "other", tool, NOW, mine).find((r) => r.name === "pg");
+    if (!pg) throw new Error("no pg row");
+    expect(detailsOf(inv, pg, tool, NOW).find((l) => l.label === "File")?.text).toBe(
+      `~${path.sep}.claude.json (${mineApp}'s entry)`,
+    );
   });
 });

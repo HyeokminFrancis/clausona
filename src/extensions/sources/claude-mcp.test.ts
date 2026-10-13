@@ -1,9 +1,12 @@
+import { realpathSync } from "node:fs";
+import path from "node:path";
+
 import { afterEach, describe, expect, it } from "vitest";
 
 import { valueHash } from "../hash.js";
 import { type Collector, emptyFacts, type Project } from "../model.js";
 import { TestHome } from "../test-home.js";
-import { loadClaudeAccounts, loadClaudeContext } from "./claude-context.js";
+import { collectClaudeSettingsFacts, loadClaudeAccounts, loadClaudeContext } from "./claude-context.js";
 import { readClaudeMcp } from "./claude-mcp.js";
 
 const homes: TestHome[] = [];
@@ -43,6 +46,7 @@ describe("readClaudeMcp", () => {
       homeDir: h.home,
       projects,
       managedSettings: h.path("none.json"),
+      mcpjsonStop: h.home,
       warnings: out.warnings,
     });
     await readClaudeMcp(ctx, projects, out);
@@ -74,7 +78,7 @@ describe("readClaudeMcp", () => {
     expect(Object.keys(out.facts.fingerprints).sort()).toEqual(out.items.map((i) => i.id).sort());
   });
 
-  it("keeps the first of a plugin server defined in both its .mcp.json and its manifest", async () => {
+  it("takes the last of a plugin server defined more than once, as Claude Code picks it", async () => {
     const h = new TestHome();
     homes.push(h);
     h.claude("default", ".claude");
@@ -87,7 +91,151 @@ describe("readClaudeMcp", () => {
 
     const out = await read(h, []);
 
-    expect(out.items.map((i) => [i.name, i.summary?.command])).toEqual([["plugin:context7:context7", "from-mcp-json"]]);
+    // Claude Code 2.1.296 reads the plugin's .mcp.json first, then what the manifest declares, in
+    // its order, and a server name declared later replaces an earlier one.
+    expect(out.items.map((i) => [i.name, i.summary?.command])).toEqual([["plugin:context7:context7", "from-manifest"]]);
+    const [context7] = out.items;
+    expect(context7?.location.file).toBe(path.join(realpathSync.native(ctx7), ".claude-plugin", "plugin.json"));
+    expect(out.facts.fingerprints[context7?.id ?? ""]).toBe(valueHash({ command: "from-manifest" }));
+
+    // In a list, the last entry that names it wins too, a file of servers as an inline one.
+    h.write(".claude/plugins/cache/m/context7/1.0.0/servers.json", { context7: { command: "from-file" } });
+    h.write(".claude/plugins/cache/m/context7/1.0.0/.claude-plugin/plugin.json", {
+      mcpServers: ["./servers.json", { context7: { command: "from-list" } }],
+    });
+    expect((await read(h, [])).items.map((i) => i.summary?.command)).toEqual(["from-list"]);
+    h.write(".claude/plugins/cache/m/context7/1.0.0/.claude-plugin/plugin.json", {
+      mcpServers: [{ context7: { command: "from-list" } }, "./servers.json"],
+    });
+    expect((await read(h, [])).items.map((i) => i.summary?.command)).toEqual(["from-file"]);
+  });
+
+  it("reads the servers a plugin's manifest names by path, in a list too, with the plugin's place", async () => {
+    const h = new TestHome();
+    homes.push(h);
+    h.claude("default", ".claude");
+    h.claude("work", ".claude-work");
+    const root = ".claude/plugins/cache/m/kit/1.0.0";
+    const kit = h.path(root);
+    const installs = { "kit@m": [{ installPath: kit }] };
+    h.write(".claude-work/plugins/installed_plugins.json", { plugins: installs });
+    h.write(`${root}/.mcp.json`, { mcpServers: { base: { command: "base-mcp" } } });
+    h.write(`${root}/mcp/servers.json`, { mcpServers: { files: { command: "files-mcp" } } });
+    // A file of servers may be the map itself, as a plugin's .mcp.json may.
+    h.write(`${root}/mcp/more.json`, { more: { command: "more-mcp" } });
+    h.write(`${root}/.claude-plugin/plugin.json`, {
+      name: "kit",
+      mcpServers: ["./mcp/servers.json", { inline: { command: "inline-mcp" } }, "mcp/more.json"],
+    });
+    // A second plugin whose manifest names one path, the string form.
+    const solo = ".claude/plugins/cache/m/solo/1.0.0";
+    h.write(".claude/plugins/installed_plugins.json", {
+      plugins: { ...installs, "solo@m": [{ installPath: h.path(solo) }] },
+    });
+    h.write(`${solo}/servers.json`, { mcpServers: { only: { type: "http", url: "https://only.example/mcp" } } });
+    h.write(`${solo}/.claude-plugin/plugin.json`, { mcpServers: "./servers.json" });
+
+    const out = await read(h, []);
+
+    const home = realpathSync.native(h.home);
+    const servers = out.items.map((i) => `${i.name}|${path.relative(home, i.location.file)}`);
+    expect(servers.sort()).toEqual(
+      [
+        `plugin:kit:base|${path.join(root, ".mcp.json")}`,
+        `plugin:kit:files|${path.join(root, "mcp", "servers.json")}`,
+        `plugin:kit:inline|${path.join(root, ".claude-plugin", "plugin.json")}`,
+        `plugin:kit:more|${path.join(root, "mcp", "more.json")}`,
+        `plugin:solo:only|${path.join(solo, "servers.json")}`,
+      ].sort(),
+    );
+    // Each read as the plugin's .mcp.json server is: the plugin, its accounts, its install, its owner.
+    const files = out.items.find((i) => i.name === "plugin:kit:files");
+    const base = out.items.find((i) => i.name === "plugin:kit:base");
+    expect(files?.location).toEqual({ ...base?.location, file: files?.location.file });
+    expect(files?.location.accounts).toEqual(["claude:default", "claude:work"]);
+    expect(files?.id).toBe(base?.id.replace(/:base$/, ":files"));
+    expect(out.facts.fingerprints[files?.id ?? ""]).toBe(valueHash({ command: "files-mcp" }));
+    expect(out.items.find((i) => i.name === "plugin:solo:only")?.summary?.url).toBe("https://only.example/mcp");
+    expect(out.warnings).toEqual([]);
+  });
+
+  it("reads no server file a plugin's manifest names outside the plugin, or that is no .json file", async () => {
+    const h = new TestHome();
+    homes.push(h);
+    h.claude("default", ".claude");
+    const root = ".claude/plugins/cache/m/kit/1.0.0";
+    h.write(".claude/plugins/installed_plugins.json", { plugins: { "kit@m": [{ installPath: h.path(root) }] } });
+    const outside = h.write("elsewhere/servers.json", { mcpServers: { away: { command: "away-mcp" } } });
+    h.write(".claude/plugins/cache/m/kit/servers.json", { mcpServers: { up: { command: "up-mcp" } } });
+    h.write(`${root}/bundle.mcpb`, { mcpServers: { bundled: { command: "bundled-mcp" } } });
+    // A link inside the plugin that leads out of it.
+    h.link("elsewhere", `${root}/linked`);
+    h.write(`${root}/.claude-plugin/plugin.json`, {
+      mcpServers: ["../servers.json", outside, "./linked/servers.json", "./missing.json", "./bundle.mcpb"],
+    });
+
+    const out = await read(h, []);
+
+    expect(out.items).toEqual([]);
+    expect(out.warnings).toEqual([]);
+  });
+
+  it("lists managed-mcp.json's servers as managed, and says the file is there even when it cannot be read", async () => {
+    const h = new TestHome();
+    homes.push(h);
+    h.claude("default", ".claude", { mcpServers: { mine: { command: "mine-mcp" } } });
+    const managed = h.write("policy/managed-mcp.json", {
+      mcpServers: { company: { type: "http", url: "https://mcp.example.com/api" } },
+    });
+
+    const out = await read(h, [], h.path("policy", "managed-settings.json"));
+    expect(out.items.map((i) => `${i.location.scope}|${i.name}`).sort()).toEqual(["account|mine", "managed|company"]);
+    const company = out.items.find((i) => i.name === "company");
+    expect(company?.id).toBe("mcp:claude:managed:-:company");
+    expect(company?.location).toEqual({ tool: "claude", scope: "managed", file: managed });
+    expect(out.facts.claudeManagedMcp).toBe(managed);
+    // What each server starts, for the lists to match: a remote one's URL, a stdio one's words hashed.
+    expect(out.facts.mcpTargets["mcp:claude:managed:-:company"]).toEqual({
+      url: "https://mcp.example.com/api",
+      vars: false,
+    });
+    expect(out.facts.mcpTargets["mcp:claude:account:claude:default:mine"]).toEqual({
+      command: valueHash(["mine-mcp"]),
+      vars: false,
+    });
+
+    // A file Claude Code cannot parse still takes control of the servers, as it does there.
+    h.write("policy/managed-mcp.json", "{ nope");
+    const broken = await read(h, [], h.path("policy", "managed-settings.json"));
+    expect(broken.items.map((i) => i.name)).toEqual(["mine"]);
+    expect(broken.facts.claudeManagedMcp).toBe(managed);
+    expect(broken.warnings.map((w) => w.file)).toEqual([managed]);
+    // And with no file, nothing does.
+    expect((await read(h, [])).facts.claudeManagedMcp).toBeUndefined();
+  });
+
+  it("reads every settings file's allowedMcpServers and deniedMcpServers, and the managed lock", async () => {
+    const h = new TestHome();
+    homes.push(h);
+    h.claude("default", ".claude");
+    const app = h.project("repos/app");
+    const managed = h.write("policy/managed-settings.json", {
+      allowManagedMcpServersOnly: true,
+      allowedMcpServers: [{ serverUrl: "https://*.example.com/*" }, { serverName: "two", serverUrl: "x" }],
+    });
+    const user = h.write(".claude/settings.json", { deniedMcpServers: [{ serverCommand: ["npx", "bad"] }] });
+    const local = h.write("repos/app/.claude/settings.local.json", {
+      allowedMcpServers: [],
+      // Only managed settings can turn the lock on.
+      allowManagedMcpServersOnly: true,
+    });
+
+    const out = await read(h, [{ path: app, tools: ["claude"], profiles: [] }], managed);
+    expect(out.facts.claudeMcpPolicy).toEqual([
+      { file: managed, layer: "managed", allowed: [{ serverUrl: "https://*.example.com/*" }], managedOnly: true },
+      { file: user, layer: "user", denied: [{ serverCommand: valueHash(["npx", "bad"]) }] },
+      { file: local, layer: "local", project: app, allowed: [] },
+    ]);
   });
 
   it("reads a project once when two of an account's keys resolve to it", async () => {
@@ -115,7 +263,7 @@ describe("readClaudeMcp", () => {
   });
 });
 
-async function read(h: TestHome, projects: Project[]): Promise<Collector> {
+async function read(h: TestHome, projects: Project[], managedSettings = h.path("none.json")): Promise<Collector> {
   const out: Collector = { items: [], facts: emptyFacts(), warnings: [] };
   const accounts = await loadClaudeAccounts(h.registry, h.home, out.warnings);
   const ctx = await loadClaudeContext({
@@ -123,9 +271,11 @@ async function read(h: TestHome, projects: Project[]): Promise<Collector> {
     registry: h.registry,
     homeDir: h.home,
     projects,
-    managedSettings: h.path("none.json"),
+    managedSettings,
+    mcpjsonStop: h.home,
     warnings: out.warnings,
   });
+  collectClaudeSettingsFacts(ctx, out);
   await readClaudeMcp(ctx, projects, out);
   return out;
 }

@@ -27,7 +27,7 @@ import {
   stateLoads,
   type ToolName,
 } from "./scopes.js";
-import { codexTrusted, relevantIn, STASH_KEY } from "./state.js";
+import { codexTrusted, isMcpjsonServer, MANAGED_MCP_KEY, relevantIn, STASH_KEY } from "./state.js";
 
 /**
  * The words the Extensions screen and the CLI say about a row: its tags, a hook's event in plain
@@ -35,7 +35,10 @@ import { codexTrusted, relevantIn, STASH_KEY } from "./state.js";
  * reads the inventory, and what it shows of an MCP server or a hook is the redacted summary.
  */
 
-/** One of the verbatim tags: off, off here, off in N of M accounts, unused, broken link, pending approval, hidden by … copy. */
+/**
+ * One of the verbatim tags: off, off here, off in N of M accounts, not here, unused, broken
+ * link, pending approval, hidden by … copy, no front matter, name too long, invalid hooks file.
+ */
 export type Tag = string;
 
 export type DetailLine = { label?: string; text: string; tone?: "muted" | "warning" | "error" | "healthy" };
@@ -92,6 +95,13 @@ export function hookWhen(item: Extension): string {
   const words = EVENTS.get(event)?.(TOOL_WORD[item.location.tool]) ?? event;
   return matcher === undefined ? words : `${words} (${matcher})`;
 }
+
+/** Why Codex does not load something, by its `codexError`, for its details. */
+const CODEX_SKIPS: Record<NonNullable<Extension["codexError"]>, string> = {
+  "no front matter": "Codex skips its SKILL.md: it has no front matter",
+  "name too long": "Codex skips its SKILL.md: its name is over 64 characters",
+  "invalid hooks file": "Codex skips its hooks file: it holds more than hooks and a description at its top",
+};
 
 /** A plugin's name without its marketplace: `superpowers@official` is `superpowers`. */
 function pluginName(item: Extension): string {
@@ -156,6 +166,23 @@ export function statesByAccount(
   return [...states].map(([profile, state]) => ({ profile, state })).sort((a, b) => rank(a.profile) - rank(b.profile));
 }
 
+/**
+ * Whether a row is a `.mcp.json` server of a folder that is no project, seen from a project
+ * outside that folder. It loads in each project below the folder, with that project's
+ * approvals, and has no state of its own to show here: it reads `not here`, where its approvals
+ * in the folder itself, which no session starts in, would say pending approval.
+ */
+export function notHere(inv: Inventory, row: ScopeRow, project: string | undefined): boolean {
+  const item = firstOf(row);
+  const dir = item.location.project;
+  return (
+    isMcpjsonServer(item) &&
+    dir !== undefined &&
+    !relevantIn(item, project) &&
+    !inv.projects.some((p) => samePath(p.path, dir))
+  );
+}
+
 /** A row's first item: its only one, or the primary-most account's copy. Rows are never empty. */
 function firstOf(row: ScopeRow): Extension {
   const first = row.items[0];
@@ -190,11 +217,33 @@ export function hiddenHere(inv: Inventory, row: ScopeRow, project: string | unde
  */
 export function loadsFor(inv: Inventory, row: ScopeRow, project: string | undefined, profiles: string[]): boolean {
   const item = firstOf(row);
-  if (!relevantIn(item, project) || item.link?.broken === true) return false;
+  if (!canLoad(item, project)) return false;
   const perAccount = statesByAccount(inv, row, project);
   if (perAccount) return perAccount.some((a) => profiles.includes(a.profile) && stateLoads(a.state));
   const who = rowAccounts(inv, row);
   return (who === undefined || who.some((p) => profiles.includes(p))) && stateLoads(stateHere(inv, item, project));
+}
+
+/**
+ * Whether an item can load here at all: relevant here, not a link to nothing, which has no
+ * SKILL.md to read, and no SKILL.md Codex refuses.
+ */
+function canLoad(item: Extension, project: string | undefined): boolean {
+  return relevantIn(item, project) && item.link?.broken !== true && item.codexError === undefined;
+}
+
+/**
+ * For a row read per account, whether it loads here for each account, by the rule Loaded uses:
+ * the row can load here, and that account's state loads (`stateLoads`: its switch, and no copy
+ * that wins over it there). JSON's `loadsByAccount`.
+ */
+function loadsByAccount(
+  row: ScopeRow,
+  project: string | undefined,
+  perAccount: AccountState[],
+): Record<string, boolean> {
+  const can = canLoad(firstOf(row), project);
+  return Object.fromEntries(perAccount.map((a) => [a.profile, can && stateLoads(a.state)]));
 }
 
 /**
@@ -229,9 +278,13 @@ function isProjectSetting(inv: Inventory, file: string): boolean {
   return (
     facts.claudeSkillOverrides.some(at) ||
     facts.claudeEnabledPlugins.some(at) ||
+    facts.claudeFlags.some(at) ||
+    facts.claudeMcpPolicy.some(at) ||
     facts.claudeMcpDisabled.some(at) ||
     facts.claudeMcpjson.some(at) ||
-    facts.codexMcpEnabled.some(at)
+    facts.codexMcpEnabled.some(at) ||
+    facts.codexPlugins.some(at) ||
+    facts.codexPluginServers.some(at)
   );
 }
 
@@ -239,12 +292,20 @@ function scopeLabel(item: Extension, project: string | undefined): string {
   return SCOPE_LABEL[homeScope(item, project)](item.location.tool);
 }
 
-/** Every tag that applies, most important first: broken link > off > off here > off in N of M accounts > pending approval > hidden by … > unused. */
+/**
+ * Every tag that applies, most important first: broken link > off > off here > off in N of M
+ * accounts > not here > pending approval > hidden by … > unused > no front matter > name too
+ * long > invalid hooks file. A row that is not here has no state here, so no tag of one. `no
+ * front matter` is a quiet note for a Claude skill, which Claude Code loads all the same; for a
+ * Codex skill, which Codex skips, it and `name too long` are why it is not in Loaded, and
+ * `invalid hooks file` is why a Codex hook does not run, which its details say.
+ */
 export function tagsOf(inv: Inventory, row: ScopeRow, project: string | undefined, now: number): Tag[] {
   const item = firstOf(row);
   const tags: Tag[] = [];
   const broken = item.link?.broken === true;
   if (broken) tags.push("broken link");
+  if (notHere(inv, row, project)) return [...tags, "not here"];
   const perAccount = statesByAccount(inv, row, project);
   const states = perAccount?.map((a) => a.state) ?? [stateHere(inv, item, project)];
   const off = states.filter((s) => s.value === "off");
@@ -259,6 +320,8 @@ export function tagsOf(inv: Inventory, row: ScopeRow, project: string | undefine
   const winner = winnerOf(inv, row, project);
   if (winner) tags.push(`hidden by ${scopeLabel(winner, project)} copy`);
   if (!broken && marksOf(inv, item, now).includes("cleanup")) tags.push("unused");
+  if (item.noFrontMatter) tags.push("no front matter");
+  if (item.codexError) tags.push(item.codexError);
   return tags;
 }
 
@@ -319,7 +382,9 @@ function sentence(scope: ScopeId, tool: ToolName, kind: ItemKind, inv: Inventory
       if (here === undefined) return `what ${TOOL_NAME[tool]} ${loads} with no project`;
       return `what ${TOOL_NAME[tool]} ${loads} in ${here}${tool === "claude" ? ", in at least one account" : ""}`;
     case "project":
-      return here === undefined ? "no project · pick one with p" : PROJECT_FILES[tool][kind](here);
+      // With no project recorded, there is none to pick with p.
+      if (here === undefined) return inv.projects.length === 0 ? "no project" : "no project · pick one with p";
+      return PROJECT_FILES[tool][kind](here);
     case "parents": {
       // Nearest first, as Claude Code lets the nearest file win a name.
       const dirs = [...new Set(inScope(inv, tool, kind, "parents", project).map((i) => i.location.project ?? ""))]
@@ -381,6 +446,26 @@ function settingPlace(inv: Inventory, item: Extension, project: string | undefin
   return `${whose} ${inside ? path.relative(here, file) : `entry in ${tilde(file, inv.homeDir)}`}`;
 }
 
+/** The settings that turn a whole kind off, or a list of servers, which the words name along with their file. */
+const WHOLE_KIND: ReadonlySet<string> = new Set(["disableAllHooks", "disableBundledSkills", "deniedMcpServers"]);
+
+/**
+ * Where a state is set, in words: the file (`settingPlace`), and for a setting that turns a whole
+ * kind off, or a list of servers, the setting too - "disableAllHooks in ~/.claude/settings.json",
+ * "not in allowedMcpServers in …", "only the servers in …/managed-mcp.json start".
+ */
+function setByWords(
+  inv: Inventory,
+  item: Extension,
+  project: string | undefined,
+  setBy: { file: string; key: string },
+): string {
+  const place = settingPlace(inv, item, project, setBy.file);
+  if (setBy.key === "allowedMcpServers") return `not in allowedMcpServers in ${place}`;
+  if (setBy.key === MANAGED_MCP_KEY) return `only the servers in ${place} start`;
+  return WHOLE_KIND.has(setBy.key) ? `${setBy.key} in ${place}` : place;
+}
+
 /** A state in words, and where it is set when that matters: off, and where it is turned off. */
 function stateParts(
   inv: Inventory,
@@ -396,7 +481,7 @@ function stateParts(
   if (state.value !== "off") return { word: "on" };
   // The stash file is clausona's, no setting of the tool's: no place to name.
   if (state.setBy?.key === STASH_KEY) return { word: "off everywhere", because: "kept by clausona" };
-  return state.setBy ? { word: "off", because: settingPlace(inv, item, project, state.setBy.file) } : { word: "off" };
+  return state.setBy ? { word: "off", because: setByWords(inv, item, project, state.setBy) } : { word: "off" };
 }
 
 /** A state as one account line says it: "on", "off (this project's …)", "pending approval". */
@@ -441,6 +526,7 @@ function loadedLines(inv: Inventory, row: ScopeRow, project: string | undefined)
   const item = firstOf(row);
   // A link to nothing has no SKILL.md to read, whatever the settings say.
   if (item.link?.broken) return [{ label: "Loaded", text: "no, its link leads nowhere", tone: "error" }];
+  if (item.codexError) return [{ label: "Loaded", text: `no, ${CODEX_SKIPS[item.codexError]}`, tone: "error" }];
   const perAccount = statesByAccount(inv, row, project);
   const parts = perAccount?.map((a) => ({ name: shortProfile(a.profile), ...stateParts(inv, item, project, a.state) }));
   const groups = new Map<string, { word: string; because?: string; names: string[] }>();
@@ -470,9 +556,14 @@ function loadedLines(inv: Inventory, row: ScopeRow, project: string | undefined)
       const text = "off everywhere — clausona keeps its settings so you can turn it back on";
       return [{ label: "Loaded", text, tone: "warning" }];
     }
-    const place = settingPlace(inv, item, project, state.setBy.file);
+    const place = setByWords(inv, item, project, state.setBy);
     const here = isProjectSetting(inv, state.setBy.file);
     return [{ label: "Loaded", text: `${here ? "off here" : "off everywhere"} (${place})`, tone: "warning" }];
+  }
+  if (state.value === "pending-approval" && item.kind === "hook" && item.location.tool === "codex") {
+    // Codex runs a hook only once it is trusted, and as it was trusted.
+    const why = state.setBy ? "it changed since you trusted it" : "you have not trusted it yet";
+    return [{ label: "Loaded", text: `not yet: ${why} - review it with /hooks in Codex`, tone: "warning" }];
   }
   if (state.value === "pending-approval") return [{ label: "Loaded", text: "pending approval here", tone: "warning" }];
   const own = item.location.project;
@@ -496,6 +587,10 @@ function loadedLines(inv: Inventory, row: ScopeRow, project: string | undefined)
 /** Each account's state of an MCP server, one line each, and "on in every account" when that says it all. */
 function accountLines(inv: Inventory, row: ScopeRow, project: string | undefined): DetailLine[] {
   const item = firstOf(row);
+  if (notHere(inv, row, project)) {
+    const dir = tilde(item.location.project ?? "", inv.homeDir);
+    return [{ label: "Accounts", text: `not here: it loads in the projects in ${dir}, each with its own approvals` }];
+  }
   const perAccount = statesByAccount(inv, row, project);
   if (!perAccount) {
     const words = stateWords(inv, item, project, stateHere(inv, item, project));
@@ -665,13 +760,16 @@ function mcpLines(inv: Inventory, row: ScopeRow, project: string | undefined): D
   const codex = firstOf(row).location.tool === "codex";
   lines.push(...(codex ? loadedLines(inv, row, project) : accountLines(inv, row, project)));
   if (codex) lines.push(...trustLines(inv, row, project));
+  // Copies from several accounts' .claude.json: each line names its account, as Also in does.
+  const owners = new Set(row.items.flatMap((copy) => (copy.location.profile ? [copy.location.profile] : [])));
   row.items.forEach((copy, i) => {
     const loc = copy.location;
+    const whose = owners.size > 1 && loc.profile ? ` · ${shortProfile(loc.profile)}` : "";
     const entry =
       loc.scope === "local" && loc.project !== undefined
         ? ` (${samePath(loc.project, project) ? "this project's" : `${projectName(loc.project, inv)}'s`} entry)`
         : "";
-    lines.push({ label: i === 0 ? "File" : "", text: `${tilde(loc.file, inv.homeDir)}${entry}` });
+    lines.push({ label: i === 0 ? "File" : "", text: `${tilde(loc.file, inv.homeDir)}${whose}${entry}` });
   });
   return lines;
 }
@@ -699,7 +797,7 @@ function hookLines(inv: Inventory, row: ScopeRow, project: string | undefined): 
   if (runs) lines.push({ label: "Runs", text: tildeIn(runs, inv.homeDir) });
   lines.push({ label: "File", text: tilde(item.location.file, inv.homeDir) });
   // A plugin's hook is off with its plugin: say where, as for any item that is off.
-  if (stateHere(inv, item, project).value !== "on") lines.push(...loadedLines(inv, row, project));
+  if (stateHere(inv, item, project).value !== "on" || item.codexError) lines.push(...loadedLines(inv, row, project));
   return lines;
 }
 
@@ -807,8 +905,13 @@ export function jsonItem(
     project: loc.project ?? null,
     ...(loc.plugin ? { plugin: loc.plugin } : {}),
     ...(accounts ? { accounts } : {}),
-    state: values.length === 1 ? values[0] : "mixed",
-    ...(perAccount ? { stateByAccount: Object.fromEntries(perAccount.map((a) => [a.profile, a.state.value])) } : {}),
+    state: notHere(inv, row, project) ? "not-here" : values.length === 1 ? values[0] : "mixed",
+    ...(perAccount
+      ? {
+          stateByAccount: Object.fromEntries(perAccount.map((a) => [a.profile, a.state.value])),
+          loadsByAccount: loadsByAccount(row, project, perAccount),
+        }
+      : {}),
     usage: counted
       ? {
           total: usage?.total ?? 0,

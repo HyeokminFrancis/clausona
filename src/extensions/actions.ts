@@ -1,3 +1,5 @@
+import path from "node:path";
+
 import type { ToolName } from "../types.js";
 import type { UndoSkip } from "./apply.js";
 import { statesByAccount } from "./describe.js";
@@ -6,7 +8,7 @@ import { isClaudeJson } from "./places.js";
 import { stateHere, tilde, viewFrom } from "./present.js";
 import { isWithin, samePath } from "./read.js";
 import { type ItemKind, isAccountServer, type ScopeRow } from "./scopes.js";
-import { pluginState, stateOf } from "./state.js";
+import { namesCodexSkill, pluginState, stateOf } from "./state.js";
 import type { SkillSelector } from "./writers/toml.js";
 
 /**
@@ -40,6 +42,7 @@ export const REFUSAL_CODES = [
   "cloud-delete",
   "builtin-delete",
   "plugin-delete",
+  "codex-plugin",
   "plugin-project-everywhere",
   "hook-here",
   "managed",
@@ -48,6 +51,7 @@ export const REFUSAL_CODES = [
   "codex-project-everywhere",
   "codex-home-here",
   "mcpjson-everywhere",
+  "not-here",
   "broken-link",
   "no-visibility",
   "no-project",
@@ -58,6 +62,11 @@ export const REFUSAL_CODES = [
   "tracked",
   "no-account",
   "elsewhere",
+  "all-hooks-off",
+  "mcp-denied",
+  "mcp-not-allowed",
+  "managed-mcp",
+  "bundled-off",
 ] as const;
 export type RefusalCode = (typeof REFUSAL_CODES)[number];
 
@@ -83,8 +92,14 @@ type Words = string | Readonly<Record<ToolName, string>>;
 export const REFUSALS: Readonly<Record<RefusalCode, { reason: Words; keys?: Words; flags?: Words }>> = {
   "plugin-item": {
     reason: "It comes with the plugin {plugin}.",
-    keys: "Turn the plugin on or off in Plugins.",
-    flags: "Turn the plugin on or off: clausona {command} off {plugin} --scope plugins.",
+    keys: {
+      claude: "Turn the plugin on or off in Plugins.",
+      codex: "Turn the plugin on or off with /plugins in Codex.",
+    },
+    flags: {
+      claude: "Turn the plugin on or off: clausona {command} off {plugin} --scope plugins.",
+      codex: "Turn the plugin on or off with /plugins in Codex.",
+    },
   },
   "cloud-delete": {
     reason: "It comes back from claude.ai.",
@@ -100,6 +115,7 @@ export const REFUSALS: Readonly<Record<RefusalCode, { reason: Words; keys?: Word
     },
   },
   "plugin-delete": { reason: "Use /plugin in Claude Code to uninstall a plugin." },
+  "codex-plugin": { reason: "Use /plugins in Codex to turn a plugin on or off, or to uninstall it." },
   "plugin-project-everywhere": {
     reason: "It is installed for this project only.",
     keys: "Press space.",
@@ -134,6 +150,11 @@ export const REFUSALS: Readonly<Record<RefusalCode, { reason: Words; keys?: Word
     reason: "Claude Code turns a .mcp.json server on or off per project.",
     keys: "Press space.",
     flags: "Leave out --everywhere.",
+  },
+  "not-here": {
+    reason: "It loads in the projects in {~folder}, each with its own approvals.",
+    keys: "Pick one of them with p.",
+    flags: "Run it in one of them, or pass --project <path>.",
   },
   "broken-link": {
     reason: "Its link leads nowhere.",
@@ -177,17 +198,53 @@ export const REFUSALS: Readonly<Record<RefusalCode, { reason: Words; keys?: Word
     keys: "Change it there.",
     flags: "Change it there.",
   },
+  "all-hooks-off": {
+    reason: "disableAllHooks in {~file} turns every hook off.",
+    keys: "Change it there.",
+    flags: "Change it there.",
+  },
+  "mcp-denied": {
+    reason: "deniedMcpServers in {~file} keeps it from starting.",
+    keys: "Change it there.",
+    flags: "Change it there.",
+  },
+  "mcp-not-allowed": {
+    reason: "allowedMcpServers in {~file} leaves it out.",
+    keys: "Change it there.",
+    flags: "Change it there.",
+  },
+  "managed-mcp": {
+    reason: "{~file} lets only its own servers start.",
+    keys: "Only your organization can change that file.",
+    flags: "Only your organization can change that file.",
+  },
+  "bundled-off": {
+    reason: "disableBundledSkills in {~file} turns off the skills that come with Claude Code.",
+    keys: "Change it there.",
+    flags: "Change it there.",
+  },
 };
 
 const TOOL_NAME: Record<ToolName, string> = { claude: "Claude Code", codex: "Codex" };
 
 /**
  * What a refusal's words name. `name` is the row's unless given (one-folder names the other
- * row's item); `~file` is already tilded; `a` and `b` are row ids.
+ * row's item); `~file` and `~folder` are already tilded; `a` and `b` are row ids.
  */
 export type RefusalFill = Partial<
   Record<
-    "name" | "plugin" | "command" | "~file" | "id" | "Tool" | "Scope label" | "a" | "b" | "project name" | "short",
+    | "name"
+    | "plugin"
+    | "command"
+    | "~file"
+    | "~folder"
+    | "id"
+    | "Tool"
+    | "Scope label"
+    | "a"
+    | "b"
+    | "project name"
+    | "short",
     string
   >
 >;
@@ -203,6 +260,12 @@ function filled(words: Words | undefined, tool: ToolName, values: Record<string,
  * of a server whose row holds other accounts' copies too: d on the row would delete theirs as well.
  */
 export const ONE_ACCOUNT_KEYS = "Press d and choose only {short} in the dialog.";
+
+/**
+ * What the TUI says instead of "Pick one with p." where Claude Code and Codex have recorded no
+ * project: p has none to pick.
+ */
+export const NO_PROJECT_KEYS = "Run csn in a project.";
 
 /** The refusal `code` for a row of `tool`, its words filled in; `keysInstead` stands in for the table's keys words. */
 export function refusal(
@@ -299,6 +362,14 @@ export const LEFT_ALONE: Readonly<Record<UndoSkip["reason"], string>> = {
 /** How undo names a file of clausona's own that it left alone. */
 export const KEPT_COPY = "the copy clausona kept";
 
+/**
+ * What undo says after the path of a file it leaves as the change made it, where it lists what it
+ * puts back: the line the change added to git's global ignore file stays, as Claude Code leaves it.
+ */
+export function keptWords(line: string): string {
+  return `keeps ${line}, as Claude Code does`;
+}
+
 /** The visibility `v` goes to next: on → name-only → user-invocable-only → off → on. */
 export const NEXT_VISIBILITY: Record<SkillVisibility, SkillVisibility> = {
   on: "name-only",
@@ -325,19 +396,41 @@ export function layerMap(
 
 /**
  * The `[[skills.config]]` entry `selector` names, as writers/toml.ts finds it: by name an entry
- * with no path, by path (samePath) one with no name - the inventory reads no entry with both,
- * as Codex ignores those. The last of several, as state.ts reads them.
+ * with no path, by path one with no name whose path, or real path, is the selector's or one of
+ * its aliases - the inventory reads no entry with both, as Codex ignores those. The last of
+ * several, as state.ts reads them.
  */
 export function codexSkillEntry(inv: Inventory, selector: SkillSelector): { enabled: boolean } | undefined {
+  const paths = "name" in selector ? [] : [selector.path, ...(selector.aliases ?? [])];
   let found: { enabled: boolean } | undefined;
   for (const entry of inv.facts.codexSkillConfig) {
     const named =
       "name" in selector
         ? entry.path === undefined && entry.name === selector.name
-        : entry.name === undefined && entry.path !== undefined && samePath(entry.path, selector.path);
+        : entry.name === undefined &&
+          entry.path !== undefined &&
+          [entry.path, entry.realPath].some((p) => paths.some((q) => samePath(p, q)));
     if (named) found = entry;
   }
   return found;
+}
+
+/**
+ * A Codex skill's own path selector: its SKILL.md as listed, which a new entry is written with,
+ * and as aliases every other path that names it as state.ts reads one (namesCodexSkill) - its
+ * real SKILL.md, and each `[[skills.config]]` path, as written, that leads to either. So an
+ * edit finds every entry that names the skill, the ones Codex wrote by its real path too.
+ */
+export function codexSkillPath(inv: Inventory, item: Extension): SkillSelector {
+  const own = path.join(item.location.file, "SKILL.md");
+  const others = [
+    ...(item.realFolder !== undefined ? [path.join(item.realFolder, "SKILL.md")] : []),
+    ...inv.facts.codexSkillConfig.flatMap((entry) =>
+      entry.name === undefined && entry.path !== undefined && namesCodexSkill(entry, item) ? [entry.path] : [],
+    ),
+  ];
+  const aliases = others.filter((p, at) => !samePath(p, own) && others.findIndex((q) => samePath(q, p)) === at);
+  return aliases.length > 0 ? { path: own, aliases } : { path: own };
 }
 
 /** `mcp_servers.<name>.enabled` as read in one config.toml. */
@@ -366,7 +459,10 @@ export function chosenAccount(accounts: readonly string[] | undefined, profile: 
   return accounts === undefined || profile === undefined || accounts.includes(profile);
 }
 
-/** Whether a row is off at that reach, as plan() reads "already off". */
+/**
+ * Whether a row is off at that reach, as plan() reads "already off" - or, for a `.mcp.json`
+ * server, pending approval, which does not run either.
+ */
 function offAt(
   inv: Inventory,
   row: ScopeRow,
@@ -401,7 +497,8 @@ function offAt(
         const states = statesByAccount(inv, row, project)
           ?.filter((a) => chosenAccount(accounts, a.profile))
           .map((a) => a.state);
-        return isOff(states ?? [stateHere(inv, first, project)]);
+        const read = states ?? [stateHere(inv, first, project)];
+        return read.length > 0 && read.every((s) => s.value === "off" || s.value === "pending-approval");
       }
       const copies = row.items.filter((copy) => chosenAccount(accounts, copy.location.profile));
       if (!here) return copies.length > 0 && copies.every((copy) => copy.stashed);
@@ -417,7 +514,10 @@ function offAt(
   }
 }
 
-/** The verb a toggle key means for this row: "on" when it is off at that reach, else "off". */
+/**
+ * The verb a toggle key means for this row: "on" when its switch is off at that reach, or it is a
+ * `.mcp.json` server pending approval, which on approves - else "off", whether it loads or not.
+ */
 export function toggleVerb(
   inv: Inventory,
   row: ScopeRow,

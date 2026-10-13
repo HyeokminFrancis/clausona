@@ -1,8 +1,20 @@
 import { afterEach, describe, expect, it } from "vitest";
 
+import { ONE_ACCOUNT_KEYS, REFUSAL_CODES, refusal } from "../../extensions/actions.js";
 import { loadInventory } from "../../extensions/inventory.js";
+import { rowsIn } from "../../extensions/scopes.js";
 import { TestHome } from "../../extensions/test-home.js";
-import { ago, buildMatrix, cell, wrapText } from "./view-model.js";
+import {
+  ago,
+  buildMatrix,
+  type CellTarget,
+  cell,
+  cellTarget,
+  type Matrix,
+  matrixLeft,
+  matrixRefusal,
+  wrapText,
+} from "./view-model.js";
 
 const homes: TestHome[] = [];
 afterEach(() => {
@@ -38,12 +50,7 @@ async function seed(more?: (h: TestHome, app: string, web: string) => void) {
   });
   h.codex("personal", ".codex", '[mcp_servers.exa]\ncommand = "npx"\n');
   more?.(h, app, web);
-  const inv = await loadInventory({
-    homeDir: h.home,
-    registry: h.registry,
-    cwd: app,
-    managedSettings: h.path("none.json"),
-  });
+  const inv = await loadInventory(h.inventoryOptions(app));
   return { h, app, web, inv };
 }
 
@@ -106,6 +113,117 @@ describe("buildMatrix, one server per name", () => {
   });
 });
 
+describe("cellTarget", () => {
+  const column = (matrix: Matrix, label: string) => {
+    const found = matrix.columns.find((c) => c.label === label);
+    if (!found) throw new Error(`no column ${label}`);
+    return found;
+  };
+  const rowOf = (target: CellTarget) => ("row" in target ? target.row : undefined);
+
+  it("is the table's row of the copy a cell shows, for that account alone, and for Codex's column no account", async () => {
+    const { app, inv } = await seed();
+    const matrix = buildMatrix(inv, app);
+    const stitch = cellTarget(inv, app, "stitch", column(matrix, "work"));
+    expect(stitch).toMatchObject({ accounts: ["claude:work"] });
+    expect(rowOf(stitch)).toEqual(rowsIn(inv, "claude", "mcp", "global", app, 0).find((r) => r.name === "stitch"));
+    const pg = cellTarget(inv, app, "pg-dev", column(matrix, "default"));
+    expect(rowOf(pg)).toEqual(rowsIn(inv, "claude", "mcp", "project", app, 0).find((r) => r.name === "pg-dev"));
+    const exa = cellTarget(inv, app, "exa", column(matrix, "Codex"));
+    expect(exa).not.toHaveProperty("accounts");
+    expect(rowOf(exa)?.items.map((i) => i.id)).toEqual([inv.items.find((i) => i.name === "exa")?.id]);
+  });
+
+  it("holds every account's copy of a server, primary first, as the table's row does", async () => {
+    const { app, inv } = await seed((h, a) =>
+      h.claude("default", ".claude", { projects: { [a]: {} }, mcpServers: { stitch: { command: "s" } } }),
+    );
+    const matrix = buildMatrix(inv, app);
+    const stitch = rowOf(cellTarget(inv, app, "stitch", column(matrix, "work")));
+    expect(stitch?.items.map((i) => i.location.profile)).toEqual(["claude:default", "claude:work"]);
+    expect(stitch).toEqual(rowsIn(inv, "claude", "mcp", "global", app, 0).find((r) => r.name === "stitch"));
+  });
+
+  it("says why a cell with no server in it can't change", async () => {
+    const { app, inv } = await seed();
+    const matrix = buildMatrix(inv, app);
+    expect(cellTarget(inv, app, "stitch", column(matrix, "default"))).toEqual({
+      refused: "default has no stitch here.",
+    });
+    expect(cellTarget(inv, app, "exa", column(matrix, "work"))).toEqual({ refused: "work has no exa here." });
+    expect(cellTarget(inv, app, "pg-dev", column(matrix, "Codex"))).toEqual({ refused: "Codex has no pg-dev here." });
+  });
+});
+
+describe("matrixRefusal", () => {
+  const row = { key: "mcp:claude:account:-:github", name: "github" };
+  /** The keys a text names, as refusals name them: after press, with or or, space or a letter. */
+  const keysNamed = (text: string) => [...text.matchAll(/\b(?:press|with|or) (space|[a-z])\b/gi)].map((m) => m[1]);
+
+  it("sends a refusal that names a key the matrix doesn't take to the server's row", () => {
+    expect(matrixRefusal(refusal("stashed-here", row, "claude", {}))).toBe(
+      "It is off everywhere. From its row, press g to turn it back on.",
+    );
+    expect(matrixRefusal(refusal("stash-gone", row, "claude", { "~file": "~/.claude-work/.claude.json" }))).toBe(
+      "~/.claude-work/.claude.json, where it came from, is gone. From its row, press d to delete the copy clausona kept.",
+    );
+    expect(matrixRefusal(refusal("stash-gone", row, "claude", { short: "work" }, ONE_ACCOUNT_KEYS))).toMatch(
+      / From its row, press d and choose only work in the dialog\.$/,
+    );
+    expect(matrixRefusal(refusal("codex-home-here", row, "codex", {}))).toBe(
+      "In your home folder, Codex's project config is your user config. From its row, press g.",
+    );
+  });
+
+  it("keeps words that name no key, or only space, which the matrix takes", () => {
+    expect(matrixRefusal(refusal("no-account", row, "claude", {}))).toBe(
+      "No account that has it has opened this project.",
+    );
+    expect(matrixRefusal(refusal("codex-untrusted", row, "codex", {}))).toBe(
+      "Codex does not trust this project, so it ignores its .codex folder. Trust the project in Codex first.",
+    );
+    expect(matrixRefusal(refusal("mcpjson-everywhere", row, "claude", {}))).toBe(
+      "Claude Code turns a .mcp.json server on or off per project. Press space.",
+    );
+  });
+
+  it("names no key but space and u before it sends to the row, for every refusal of either tool", () => {
+    for (const code of REFUSAL_CODES) {
+      for (const tool of ["claude", "codex"] as const) {
+        const [here] = matrixRefusal(refusal(code, row, tool, {})).split(" From its row, ");
+        expect(
+          keysNamed(here ?? "").filter((key) => key !== "space" && key !== "u"),
+          `${code}, ${tool}`,
+        ).toEqual([]);
+      }
+    }
+  });
+});
+
+describe("matrixLeft", () => {
+  /** Ten accounts acct0 to acct9: each column 9 wide, brackets and gap in it, after a SERVER column 10 wide. */
+  const ten: Matrix = {
+    columns: Array.from({ length: 10 }, (_, i) => ({ key: `claude:acct${i}`, label: `acct${i}` })),
+    rows: [{ name: "s", cells: [] }],
+  };
+
+  it("never scrolls where every column fits", () => {
+    for (const column of [0, 5, 9]) expect(matrixLeft(0, column, ten, 120)).toBe(0);
+    expect(matrixLeft(4, 9, ten, 120)).toBe(0);
+  });
+
+  it("scrolls as little as keeps the cursor's column in sight, either way", () => {
+    // 60 columns wide: four accounts fit beside the note that says how many more there are.
+    expect(matrixLeft(0, 3, ten, 60)).toBe(0);
+    expect(matrixLeft(0, 4, ten, 60)).toBe(1);
+    expect(matrixLeft(1, 9, ten, 60)).toBe(6);
+    expect(matrixLeft(6, 7, ten, 60)).toBe(6);
+    expect(matrixLeft(6, 2, ten, 60)).toBe(2);
+    // A cursor past the last column, as a matrix with fewer columns can leave it, stays in sight.
+    expect(matrixLeft(0, 15, ten, 60)).toBe(6);
+  });
+});
+
 describe("a .mcp.json in a parent dir", () => {
   async function ancestorSeed() {
     const h = new TestHome();
@@ -115,12 +233,7 @@ describe("a .mcp.json in a parent dir", () => {
     h.claude("work", ".claude-work", { projects: { [app]: {} } });
     h.write(".mcp.json", { mcpServers: { tools: { command: "tools-mcp" }, notes: { command: "home-notes" } } });
     h.write("repos/app/.mcp.json", { mcpServers: { notes: { command: "app-notes" } } });
-    const inv = await loadInventory({
-      homeDir: h.home,
-      registry: h.registry,
-      cwd: app,
-      managedSettings: h.path("none.json"),
-    });
+    const inv = await loadInventory(h.inventoryOptions(app));
     return { h, app, inv };
   }
 

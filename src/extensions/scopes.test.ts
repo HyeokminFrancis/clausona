@@ -1,15 +1,17 @@
+import { realpathSync } from "node:fs";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 import { statesByAccount, tagsOf } from "./describe.js";
 import { loadInventory } from "./inventory.js";
-import type { Inventory } from "./model.js";
+import type { Extension, Inventory } from "./model.js";
 import { pathKey } from "./read.js";
 import {
   homeScope,
   itemsIn,
   otherProjects,
   pluginContents,
+  rowKey,
   rowsIn,
   SCOPE_LABEL,
   type ScopeRow,
@@ -51,6 +53,8 @@ async function seed(more?: (h: TestHome, app: string, web: string) => void): Pro
   h.codex("personal", ".codex");
   h.skill(".claude/skills", "eli5", "Explain things simply");
   h.skill(".claude/skills", "old-one");
+  // work loads the primary's skills through the link clausona makes for every account.
+  h.link(".claude/skills", ".claude-work/skills");
   h.skill("repos/app/.claude/skills", "eli5");
   h.skill("repos/app/.claude/skills", "deploy-check");
   h.skill("repos/web/.claude/skills", "web-only");
@@ -58,12 +62,7 @@ async function seed(more?: (h: TestHome, app: string, web: string) => void): Pro
   h.write(".mcp.json", { mcpServers: { tools: { command: "tools-mcp" } } });
   h.write(".claude/settings.json", { hooks: { Stop: [{ hooks: [{ type: "command", command: "notify-me" }] }] } });
   more?.(h, app, web);
-  const inv = await loadInventory({
-    homeDir: h.home,
-    registry: h.registry,
-    cwd: app,
-    managedSettings: h.path("none.json"),
-  });
+  const inv = await loadInventory(h.inventoryOptions(app));
   return { h, inv, app, web };
 }
 
@@ -153,17 +152,66 @@ describe("scopes", () => {
     expect(itemsIn(inv, "codex", "skill", "unused", app, NOW)).toEqual([]);
   });
 
+  it("lists Codex's plugins in its Plugins scope, and what an enabled one brings in Loaded", async () => {
+    const { inv, app } = await seed((h) => {
+      h.write(".codex/config.toml", '[plugins."kit@m"]\nenabled = true\n\n[plugins."off@m"]\nenabled = false\n');
+      for (const name of ["kit", "off"]) {
+        h.write(`.codex/plugins/cache/m/${name}/1.0.0/.codex-plugin/plugin.json`, { name });
+        h.skill(`.codex/plugins/cache/m/${name}/1.0.0/skills`, `${name}-skill`);
+        h.write(`.codex/plugins/cache/m/${name}/1.0.0/.mcp.json`, { mcpServers: { [`${name}db`]: { command: "db" } } });
+      }
+    });
+    const scopes = scopesFor(inv, "codex", "skill", app, NOW);
+    expect(scopes.map((s) => [s.id, s.count])).toEqual([
+      ["loaded", 2],
+      ["project", 0],
+      ["global", 1],
+      ["plugins", 2],
+    ]);
+    expect(scopesFor(inv, "codex", "mcp", app, NOW).map((s) => s.id)).toEqual(["loaded", "project", "plugins"]);
+    expect(scopesFor(inv, "codex", "hook", app, NOW).map((s) => s.id)).toEqual(["loaded", "project"]);
+    expect(rowsIn(inv, "codex", "skill", "plugins", app, NOW).map((r) => r.name)).toEqual(["kit@m", "off@m"]);
+    expect(rowsIn(inv, "codex", "skill", "loaded", app, NOW).map((r) => r.name)).toEqual(["eli5", "kit:kit-skill"]);
+    expect(rowsIn(inv, "codex", "mcp", "loaded", app, NOW).map((r) => r.name)).toEqual(["kitdb"]);
+    const kit = rowsIn(inv, "codex", "skill", "plugins", app, NOW)[0];
+    if (!kit) throw new Error("no kit row");
+    expect(pluginContents(inv, kit).skill.map((r) => r.name)).toEqual(["kit:kit-skill"]);
+    expect(pluginContents(inv, kit).mcp.map((r) => r.name)).toEqual(["kitdb"]);
+    // Claude's Plugins scope has none of them.
+    expect(rowsIn(inv, "claude", "skill", "plugins", app, NOW)).toEqual([]);
+  });
+
+  it("leaves a Codex skill Codex does not load out of Loaded, with its reason as a tag", async () => {
+    const { inv, app } = await seed((h) => {
+      h.write(".agents/skills/plain/SKILL.md", "just text\n");
+      h.write(".agents/skills/long/SKILL.md", `---\nname: ${"x".repeat(65)}\ndescription: d\n---\n`);
+    });
+    const loaded = rowsIn(inv, "codex", "skill", "loaded", app, NOW).map((r) => r.name);
+    expect(loaded).toEqual(["eli5"]);
+    const global = rowsIn(inv, "codex", "skill", "global", app, NOW);
+    const tags = (name: string) => tagsOf(inv, global.find((r) => r.name === name) as ScopeRow, app, NOW);
+    expect([tags("plain"), tags("x".repeat(65)), tags("eli5")]).toEqual([["no front matter"], ["name too long"], []]);
+  });
+
+  it("tags a Codex plugin a trusted project turns off as off here, and leaves it on elsewhere", async () => {
+    const { inv, app, web } = await seed((h, app) => {
+      h.write(".codex/config.toml", `[projects.'${app}']\ntrust_level = "trusted"\n\n[plugins."kit@m"]\n`);
+      h.write("repos/app/.codex/config.toml", '[plugins."kit@m"]\nenabled = false\n');
+      h.write(".codex/plugins/cache/m/kit/1.0.0/.codex-plugin/plugin.json", { name: "kit" });
+      h.skill(".codex/plugins/cache/m/kit/1.0.0/skills", "kit-skill");
+    });
+    const kit = (project: string) => rowsIn(inv, "codex", "skill", "plugins", project, NOW)[0] as ScopeRow;
+    expect(tagsOf(inv, kit(app), app, NOW)).toEqual(["off here"]);
+    expect(tagsOf(inv, kit(web), web, NOW)).toEqual([]);
+    expect(rowsIn(inv, "codex", "skill", "loaded", web, NOW).map((r) => r.name)).toContain("kit:kit-skill");
+  });
+
   it("shows Loaded and Project at 0 when the project has nothing of a kind (Review Focus 1)", async () => {
     const h = new TestHome();
     homes.push(h);
     const app = h.project("repos/app");
     h.claude("default", ".claude", { projects: { [app]: {} } });
-    const inv = await loadInventory({
-      homeDir: h.home,
-      registry: h.registry,
-      cwd: app,
-      managedSettings: h.path("none.json"),
-    });
+    const inv = await loadInventory(h.inventoryOptions(app));
     const scopes = scopesFor(inv, "claude", "hook", app, NOW);
     expect(scopes).toEqual([
       { id: "loaded", label: "Loaded", count: 0 },
@@ -276,12 +324,7 @@ describe("rows", () => {
       mcpServers: { github: { command: "gh-mcp" } },
     });
     h.skill(".claude/skills", "eli5");
-    const inv = await loadInventory({
-      homeDir: h.home,
-      registry: h.registry,
-      cwd: app,
-      managedSettings: h.path("none.json"),
-    });
+    const inv = await loadInventory(h.inventoryOptions(app));
     return { h, inv, app, web };
   }
 
@@ -360,7 +403,8 @@ describe("rows across accounts", () => {
     });
     h.claude("solo", ".claude-solo");
     h.skill(".claude/skills/synced/org1_acc1", "pdf");
-    h.skill(".claude/skills/synced/org1_acc2", "pdf");
+    // work's skills folder is its own, so Claude Code keeps work's Cloud skills there.
+    h.skill(".claude-work/skills/synced/org1_acc2", "pdf");
     h.skill(".claude-work/skills", "mine");
     h.skill(".claude-solo/skills", "mine");
     const kitA = h.path(".claude/plugins/cache/m/kit/1.0.0");
@@ -399,12 +443,7 @@ describe("rows across accounts", () => {
     }
     h.skill(".claude/plugins/cache/m/sp/1.0.0/skills", "search");
     h.skill(".claude/plugins/cache/m/lp/1.0.0/skills", "lint");
-    const inv = await loadInventory({
-      homeDir: h.home,
-      registry: h.registry,
-      cwd: app,
-      managedSettings: h.path("none.json"),
-    });
+    const inv = await loadInventory(h.inventoryOptions(app));
     return { h, inv, app, web };
   }
 
@@ -465,6 +504,35 @@ describe("rows across accounts", () => {
     expect(contents.mcp).toEqual([]);
   });
 
+  it("keys a plugin's rows by the install scope its items carry, with the same keys and ids as before", async () => {
+    const { h, inv, app } = await shared();
+    const kit = rowsIn(inv, "claude", "skill", "plugins", app, NOW)[0];
+    const plan = rowsIn(inv, "claude", "skill", "loaded", app, NOW)[0];
+    if (!kit || !plan) throw new Error("no kit rows");
+    // The keys and ids an agent may have stored: the row key, and each install's own id.
+    const owner = (dir: string) => `kit@m|user|-|${pathKey(realpathSync.native(dir))}`;
+    const [kitA, kitB] = [
+      h.path(".claude/plugins/cache/m/kit/1.0.0"),
+      h.path(".claude-work/plugins/cache/m/kit/1.0.0"),
+    ];
+    expect(kit.key).toBe("plugin:claude:user:-:kit@m");
+    expect(kit.items.map((i) => i.id)).toEqual([
+      `plugin:claude:plugin:${owner(kitA)}:kit@m`,
+      `plugin:claude:plugin:${owner(kitB)}:kit@m`,
+    ]);
+    expect(plan.key).toBe("skill:claude:plugin:user:-:kit@m:kit:plan");
+    expect(plan.items.map((i) => i.id)).toEqual([
+      `skill:claude:plugin:${owner(kitA)}:kit:plan`,
+      `skill:claude:plugin:${owner(kitB)}:kit:plan`,
+    ]);
+    expect([...kit.items, ...plan.items].map((i) => i.location.installScope)).toEqual(["user", "user", "user", "user"]);
+    const lint = itemsIn(inv, "claude", "skill", "loaded", app, NOW).find((i) => i.name === "lp:lint");
+    expect(lint?.location.installScope).toBe("project");
+    // The install scope is read from the item, not from its id: an id of another form keys alike.
+    const copy = { ...(plan.items[0] as Extension), id: "skill:claude:plugin:another-form:kit:plan" };
+    expect(rowKey(copy)).toBe(plan.key);
+  });
+
   it("keeps an account's own skills folder per account", async () => {
     const { inv, app } = await shared();
     const mine = rowsIn(inv, "claude", "skill", "global", app, NOW).filter((r) => r.name === "mine");
@@ -493,12 +561,7 @@ describe("one copy per name, account by account", () => {
     h.claude("personal", ".claude", { projects: { [app]: entries.personal ?? {}, [web]: {} }, mcpServers: user });
     h.claude("work", ".claude-work", { projects: { [app]: entries.work ?? {} }, mcpServers: user });
     more?.(h);
-    const inv = await loadInventory({
-      homeDir: h.home,
-      registry: h.registry,
-      cwd: app,
-      managedSettings: h.path("none.json"),
-    });
+    const inv = await loadInventory(h.inventoryOptions(app));
     return { h, inv, app, web };
   }
 

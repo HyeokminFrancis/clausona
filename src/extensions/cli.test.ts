@@ -56,6 +56,7 @@ const run = (h: TestHome, cwd: string, command: ExtensionsCommand, args: string[
       now: NOW,
       columns,
       managedSettings: h.path("managed-settings.json"),
+      mcpjsonStop: h.home,
     }),
   );
 
@@ -137,6 +138,24 @@ describe("skills ls", () => {
     expect(firstLine(fromWeb)).toMatch(/project ~[\\/]repos[\\/]web$/);
     expect(fromWeb).toContain("web-only");
     expect(fromWeb).not.toContain("deploy-check");
+  });
+
+  it("tells two other projects of one folder name apart in WHERE, by the folder above", async () => {
+    const { h, app, web } = seed();
+    const [work, mine] = ["work/site", "personal/site"].map((dir) => h.project(dir));
+    h.claude("default", ".claude", { projects: { [app]: {}, [web]: {}, [work as string]: {}, [mine as string]: {} } });
+    h.skill("work/site/.claude/skills", "ship");
+    h.skill("personal/site/.claude/skills", "ship");
+    const other = await run(h, app, "skills", ["ls", "--scope", "other"]);
+    const where = (text: string) => text.match(/^ship\s+claude\s+(\S+)\s/gm)?.map((line) => line.split(/\s+/)[2]);
+    expect(where(other)).toEqual([path.join("personal", "site"), path.join("work", "site")]);
+    // A name no other project has stays short.
+    expect(other).toMatch(/^web-only\s+claude\s+web\s/m);
+    const json = JSON.parse(await run(h, app, "skills", ["ls", "--scope", "other", "--json"]));
+    expect(json.items.filter((i: { name: string }) => i.name === "ship").map((i: { from: string }) => i.from)).toEqual([
+      path.join("personal", "site"),
+      path.join("work", "site"),
+    ]);
   });
 
   it("lists every place but Loaded once with --scope all", async () => {
@@ -254,7 +273,7 @@ describe("skills ls", () => {
     const text = await run(h, app, "skills", ["ls", "--scope", "builtin", "--tool", "claude"]);
     expect(firstLine(text)).toMatch(/^1 skill · Built-in · project ~/);
     expect(text).toMatch(/^claude-api\s+Built-in\s+0\s+never\s+off$/m);
-    const inv = await loadInventory({ homeDir: h.home, registry: h.registry, cwd: app });
+    const inv = await loadInventory(h.inventoryOptions(app));
     // In the screen's scope list, after Plugins' place and before Not used in 90 days.
     expect(scopesFor(inv, "claude", "skill", app, NOW).map((s) => s.id)).toEqual([
       "loaded",
@@ -290,6 +309,8 @@ describe("ls, rows that differ only in whose they are", () => {
       oauthAccount: { organizationUuid: "org1", accountUuid: "acc1" },
     });
     h.claude("work", ".claude-work", { oauthAccount: { organizationUuid: "org1", accountUuid: "acc2" } });
+    // work finds its Cloud skills in the primary's folder through the link clausona makes.
+    h.link(".claude/skills", ".claude-work/skills");
     h.skill(".claude/skills/synced/org1_acc1", "pdf");
     h.skill(".claude/skills/synced/org1_acc2", "pdf");
     h.skill(".claude/skills", "eli5");
@@ -399,6 +420,17 @@ describe("ls options", () => {
         const json = JSON.parse(await run(h, app, command, ["ls", "--scope", scope, "--json"]));
         expect(json).toMatchObject({ version: 1, command, scope });
         await expect(run(h, app, command, ["ls", `--scope=${scope}`])).resolves.toMatch(/^\d+ /);
+      }
+    }
+  });
+
+  it("says on the ls and show pages what state and stateByAccount hold", async () => {
+    const { h, app } = seed();
+    for (const command of ["skills", "mcp", "hooks"] as const) {
+      for (const sub of ["ls", "show"]) {
+        const help = await run(h, app, command, [sub, "--help"]);
+        expect(help, `${command} ${sub}`).toContain("state: the row's one state, or mixed when its accounts differ");
+        expect(help, `${command} ${sub}`).toContain("stateByAccount: each account's, for a row read per account");
       }
     }
   });
@@ -523,6 +555,8 @@ describe("what an agent tripped on", () => {
       cwd: app,
       registry: h.registry,
       now: Date.now() + 3 * DAY,
+      managedSettings: h.path("managed-settings.json"),
+      mcpjsonStop: h.home,
     });
     expect(fresh).toMatch(/^Used {6}never, in any account · added 3d ago$/m);
   });
@@ -786,6 +820,56 @@ describe("mcp ls, a server more than one account sees", () => {
   });
 });
 
+describe("mcp ls --scope other, a .mcp.json server seen from outside its folder", () => {
+  /**
+   * site is the project looked from. app, under repos, has docs in its .mcp.json, approved there
+   * by default; repos is no project, and its .mcp.json has wiki, which loads in app.
+   */
+  function outside() {
+    const h = new TestHome();
+    homes.push(h);
+    const app = h.project("repos/app");
+    const site = h.project("site");
+    h.write("repos/app/.mcp.json", { mcpServers: { docs: { command: "docs-mcp" } } });
+    h.write("repos/.mcp.json", { mcpServers: { wiki: { command: "wiki-mcp" } } });
+    h.claude("default", ".claude", {
+      projects: { [app]: { enabledMcpjsonServers: ["docs", "wiki"] }, [site]: {} },
+    });
+    h.claude("work", ".claude-work", { projects: { [app]: {}, [site]: {} } });
+    return { h, app, site };
+  }
+
+  it("reads each row's state in its own project, where WHERE says it is", async () => {
+    const { h, app, site } = outside();
+    const parsed = JSON.parse(await run(h, site, "mcp", ["ls", "--scope", "other", "--json"]));
+    const docs = parsed.items.find((i: { name: string }) => i.name === "docs");
+    // In app, where it is: approved by default, pending for work. site has no say in it.
+    expect(docs).toMatchObject({ project: app, from: "app", state: "mixed" });
+    expect(docs.stateByAccount).toEqual({ "claude:default": "on", "claude:work": "pending-approval" });
+    expect(docs.tags).toEqual([]);
+    expect(await run(h, site, "mcp", ["ls", "--scope", "other"])).toMatch(/^docs\s+claude\s+app\s+all\s*$/m);
+  });
+
+  it("says not here for one of a folder that is no project, which has no state of its own", async () => {
+    const { h, app, site } = outside();
+    const text = await run(h, site, "mcp", ["ls", "--scope", "other"]);
+    expect(text).toMatch(/^wiki\s+claude\s+~[\\/]repos\s+all\s+not here$/m);
+    const wiki = JSON.parse(await run(h, site, "mcp", ["ls", "--scope", "other", "--json"])).items.find(
+      (i: { name: string }) => i.name === "wiki",
+    );
+    expect(wiki).toMatchObject({ project: h.path("repos"), state: "not-here", tags: ["not here"] });
+    expect(wiki).not.toHaveProperty("stateByAccount");
+    expect(await run(h, site, "mcp", ["show", "wiki"])).toMatch(
+      /^Accounts {2}not here: it loads in the projects in ~[\\/]repos, each with its own approvals$/m,
+    );
+    // Seen from app, below it, it has app's approvals.
+    const fromApp = JSON.parse(await run(h, app, "mcp", ["ls", "--json"])).items.find(
+      (i: { name: string }) => i.name === "wiki",
+    );
+    expect(fromApp.stateByAccount).toEqual({ "claude:default": "on", "claude:work": "pending-approval" });
+  });
+});
+
 describe("skills, a project skill an account's own copy hides", () => {
   it("loads it in the other accounts, untagged, and says per account where it is hidden", async () => {
     const h = new TestHome();
@@ -869,6 +953,117 @@ describe("hooks ls", () => {
     const json = JSON.parse(await run(h, app, "hooks", ["ls", "--json"]));
     expect(json.items[0].summary.command).toBe(command);
     expect(firstLine(await run(h, app, "hooks", ["show", "Stop"]))).toBe("GLOBAL › Stop");
+  });
+});
+
+describe("Codex hooks and Codex's trust", () => {
+  it("lists a hook Codex has not trusted as pending approval, out of Loaded, and one it trusts as on", async () => {
+    const { h, app } = seed();
+    const file = h.path(".codex", "hooks.json");
+    h.write(".codex/hooks.json", {
+      hooks: {
+        Stop: [
+          {
+            hooks: [
+              { type: "command", command: "echo a" },
+              { type: "command", command: "echo b" },
+            ],
+          },
+        ],
+      },
+    });
+    // Trusted at the hash Codex 0.159.3 gives `echo a` on Stop; `echo b` never reviewed.
+    h.write(
+      ".codex/config.toml",
+      `[mcp_servers.exa]\ncommand = "npx"\n\n[hooks.state.${JSON.stringify(`${file}:stop:0:0`)}]\ntrusted_hash = "sha256:f9b7a328de9c5845f5eed806f12f8f5adeba50ba82617690fd3f8ededeb12f90"\n`,
+    );
+    const loaded = await run(h, app, "hooks", ["ls", "--tool", "codex"]);
+    expect(loaded).toContain("echo a");
+    expect(loaded).not.toContain("echo b");
+    const global = await run(h, app, "hooks", ["ls", "--tool", "codex", "--scope", "global"], 160);
+    expect(global).toMatch(/^Stop\s+Global\s+When Codex finishes replying\s+echo b\s+pending approval$/m);
+    const json = JSON.parse(await run(h, app, "hooks", ["ls", "--tool", "codex", "--scope", "global", "--json"]));
+    const b = json.items.find((i: { summary: { command: string } }) => i.summary.command === "echo b");
+    expect(b).toMatchObject({ state: "pending-approval", tags: ["pending approval"] });
+    const shown = await run(h, app, "hooks", ["show", "--id", b.id]);
+    expect(shown).toMatch(/^Loaded\s+not yet: you have not trusted it yet - review it with \/hooks in Codex$/m);
+    const on = await run(h, app, "hooks", ["on", "--id", b.id, "--yes"]);
+    expect(on).toContain("already in its file: Codex runs it once you trust it with /hooks");
+  });
+});
+
+describe("Codex skills Codex skips", () => {
+  it("lists one with no front matter under its folder, tagged, out of Loaded, and says why", async () => {
+    const { h, app } = seed();
+    h.write(".agents/skills/plain/SKILL.md", "just text\n");
+    expect(await run(h, app, "skills", ["ls", "--tool", "codex"])).not.toMatch(/^plain\s/m);
+    expect(await run(h, app, "skills", ["ls", "--tool", "codex", "--scope", "global"])).toMatch(
+      /^plain\s+Global\s+—\s+—\s+no front matter$/m,
+    );
+    const shown = await run(h, app, "skills", ["show", "plain"]);
+    expect(shown).toMatch(/^Loaded\s+no, Codex skips its SKILL\.md: it has no front matter$/m);
+    const json = JSON.parse(await run(h, app, "skills", ["ls", "--tool", "codex", "--scope", "global", "--json"]));
+    expect(json.items.find((i: { name: string }) => i.name === "plain")).toMatchObject({
+      state: "on",
+      tags: ["no front matter"],
+    });
+  });
+});
+
+describe("Codex plugins", () => {
+  /** The seed, with Codex's plugin kit@m on, bringing a skill, a server and a hook. */
+  function withKit() {
+    const { h, app } = seed();
+    h.write(".codex/config.toml", '[mcp_servers.exa]\ncommand = "npx"\n\n[plugins."kit@m"]\nenabled = true\n');
+    const kit = ".codex/plugins/cache/m/kit/1.0.0";
+    h.write(`${kit}/.codex-plugin/plugin.json`, { name: "kit", description: "Kit tools" });
+    h.skill(`${kit}/skills`, "plan");
+    h.write(`${kit}/.mcp.json`, { mcpServers: { kitdb: { command: "kitdb-mcp", args: ["--token", KEY] } } });
+    h.write(`${kit}/hooks/hooks.json`, { hooks: { Stop: [{ hooks: [{ type: "command", command: "kit-notify" }] }] } });
+    return { h, app };
+  }
+
+  it("lists them under --scope plugins, and what they bring in Loaded", async () => {
+    const { h, app } = withKit();
+    const plugins = await run(h, app, "skills", ["ls", "--tool", "codex", "--scope", "plugins"]);
+    expect(firstLine(plugins)).toMatch(/^1 plugin · Plugins · /);
+    expect(plugins).toMatch(/^kit@m\s+1 skill · 1 MCP server · 1 hook$/m);
+    const loaded = await run(h, app, "skills", ["ls", "--tool", "codex"]);
+    expect(loaded).toMatch(/^kit:plan\s+kit\s+—\s+—$/m);
+    const mcp = await run(h, app, "mcp", ["ls", "--tool", "codex"]);
+    expect(mcp).toMatch(/^kitdb\s+kit\s+—$/m);
+    const server = await run(h, app, "mcp", ["show", "kitdb"]);
+    expect(firstLine(server)).toBe("PLUGINS › kitdb");
+    expect(server).toMatch(/^Runs\s+kitdb-mcp --token <hidden>$/m);
+    expect(await run(h, app, "hooks", ["ls", "--tool", "codex", "--scope", "plugins"])).toMatch(/^kit@m\s/m);
+    const shown = await run(h, app, "skills", ["show", "kit@m", "--tool", "codex"]);
+    expect(firstLine(shown)).toBe("PLUGINS › kit");
+    expect(shown).toContain("Kit tools");
+    expect(leakedWindows([plugins, loaded, mcp, server, shown], KEY)).toEqual([]);
+  });
+
+  it("refuses to change one, and points to Codex's /plugins", async () => {
+    const { h, app } = withKit();
+    const error = await failure(
+      run(h, app, "skills", ["off", "kit@m", "--tool", "codex", "--scope", "plugins", "--yes"]),
+    );
+    expect(error.code).toBe(1);
+    expect(error.message).toContain("Use /plugins in Codex to turn a plugin on or off, or to uninstall it.");
+    const skill = await failure(run(h, app, "skills", ["off", "kit:plan", "--tool", "codex", "--everywhere", "--yes"]));
+    expect(skill.message).toContain(
+      "It comes with the plugin kit@m. Turn the plugin on or off with /plugins in Codex.",
+    );
+  });
+
+  it("shows a server named as its plugin is, and the plugin by its full name", async () => {
+    const { h, app } = withKit();
+    // Shipped off, so it is not in Loaded: the lookup goes on to the places, the plugin's among them.
+    h.write(".codex/plugins/cache/m/kit/1.0.0/.mcp.json", {
+      mcpServers: { kit: { command: "kit-mcp", enabled: false } },
+    });
+    expect(firstLine(await run(h, app, "mcp", ["show", "kit"]))).toBe("PLUGINS › kit");
+    expect(await run(h, app, "mcp", ["show", "kit"])).toMatch(/^Runs\s+kit-mcp$/m);
+    expect(await run(h, app, "mcp", ["show", "kit@m"])).toMatch(/^Contains\s+1 skill · 1 MCP server · 1 hook$/m);
   });
 });
 

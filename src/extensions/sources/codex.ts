@@ -10,7 +10,16 @@ import { isHomeProject, type ProjectRecord, recordedPaths } from "../projects.js
 import { isRecord, readJsonObject, readText, realPath, samePath } from "../read.js";
 import { mcpSummary } from "../redact.js";
 import { addHooksFile } from "./claude-hooks.js";
-import { readSkillFolders, type SkillLocation } from "./skill-dirs.js";
+import {
+  addCodexHookStates,
+  addCodexHookTrust,
+  codexHomeHooksFile,
+  codexReadsHooksFile,
+  markRefusedHooksFile,
+} from "./codex-hooks.js";
+import { addPluginSwitches, readCodexPlugins } from "./codex-plugins.js";
+import { readCodexSkills } from "./codex-skills.js";
+import type { SkillLocation } from "./skill-dirs.js";
 
 export type CodexHome = { id: string; dir: string; isPrimary: boolean };
 
@@ -77,26 +86,27 @@ export function codexProjectRecords(ctx: CodexContext): ProjectRecord[] {
 }
 
 /**
- * Codex's skills, MCP servers and hooks, and the switches for them: `[[skills.config]]` in the
- * user config.toml (by name, or by the SKILL.md path - the only per-project skill switch, since
- * Codex ignores `[[skills.config]]` in a project's config; spec, Spike 1), and
- * `mcp_servers.<name>.enabled` in the user and project config.toml. Beside them, the trust the
- * user config.toml records for each project: Codex 0.159.3 reads a project's `.codex/` only
- * when it trusts the project, so `state.ts` leaves the switches of any other out. Codex keeps
- * no skill usage on disk that we found, so its skills carry no usage keys.
+ * Codex's skills, MCP servers, hooks and plugins, and the switches for them: `[[skills.config]]`
+ * in the user config.toml (by name, or by the SKILL.md path - the only per-project skill switch,
+ * since Codex ignores `[[skills.config]]` in a project's config; spec, Spike 1),
+ * `mcp_servers.<name>.enabled`, and the `[plugins."<id>"]` tables, in the user and project
+ * config.toml. Beside them, the trust the user config.toml records for each project: Codex
+ * 0.159.3 reads a project's `.codex/` only when it trusts the project, so `state.ts` leaves the
+ * switches of any other out. Codex keeps no skill usage on disk that we found, so its skills
+ * carry no usage keys.
  */
 export async function readCodex(ctx: CodexContext, projects: Project[], out: Collector): Promise<void> {
-  const noUsage = { usageKeys: () => [] };
   const global: SkillLocation = { tool: "codex", scope: "global" };
   const jobs: Promise<void>[] = [
-    readSkillFolders(path.join(ctx.homeDir, ".agents", "skills"), global, "agents", out, noUsage),
-    readSkillFolders(path.join(ctx.primary.dir, "skills"), global, "home", out, noUsage),
-    readSkillFolders(
+    readCodexSkills(path.join(ctx.homeDir, ".agents", "skills"), global, "agents", out),
+    readCodexSkills(path.join(ctx.primary.dir, "skills"), global, "home", out),
+    // Codex writes these itself, and follows no link among them.
+    readCodexSkills(
       path.join(ctx.primary.dir, "skills", ".system"),
       { tool: "codex", scope: "builtin" },
       "system",
       out,
-      noUsage,
+      { followLinks: false },
     ),
   ];
   for (const home of ctx.homes) {
@@ -108,12 +118,11 @@ export async function readCodex(ctx: CodexContext, projects: Project[], out: Col
           realPath(path.join(ctx.primary.dir, "skills")).catch(() => undefined),
         ]);
         if (mine === undefined || samePath(mine, primary)) return;
-        await readSkillFolders(
+        await readCodexSkills(
           path.join(home.dir, "skills"),
           { tool: "codex", scope: "account", profile: home.id },
           home.id,
           out,
-          noUsage,
         );
       })(),
     );
@@ -122,15 +131,28 @@ export async function readCodex(ctx: CodexContext, projects: Project[], out: Col
     // The home dir's .agents/skills and .codex/ are the user's own, read above.
     if (isHomeProject(project, ctx.homeDir)) continue;
     const here: SkillLocation = { tool: "codex", scope: "project", project: project.path };
-    jobs.push(readSkillFolders(path.join(project.path, ".agents", "skills"), here, project.path, out, noUsage));
+    jobs.push(readCodexSkills(path.join(project.path, ".agents", "skills"), here, project.path, out));
     jobs.push(
       (async () => {
         const file = codexProjectConfig(project.path);
         const config = await readTomlObject(file, out.warnings);
-        if (config) addServers(config, { ...here, file }, project.path, out);
+        if (config) {
+          addServers(config, { ...here, file }, project.path, out);
+          addPluginSwitches(config, file, project.path, out.facts);
+        }
         const hooksFile = codexProjectHooks(project.path);
         const hooks = await readJsonObject(hooksFile, out.warnings);
-        if (hooks) addHooksFile(hooks, { ...here, file: hooksFile }, project.path, out);
+        if (hooks) {
+          addHooksFile(hooks, { ...here, file: hooksFile }, project.path, out);
+          if (!codexReadsHooksFile(hooks)) markRefusedHooksFile(out, hooksFile);
+          else
+            addCodexHookTrust(
+              hooks.hooks,
+              `hook:codex:project:${project.path}`,
+              await hookSources(hooksFile),
+              out.facts,
+            );
+        }
       })(),
     );
   }
@@ -138,30 +160,84 @@ export async function readCodex(ctx: CodexContext, projects: Project[], out: Col
     (async () => {
       const file = path.join(ctx.primary.dir, "hooks.json");
       const hooks = await readJsonObject(file, out.warnings);
-      if (hooks) addHooksFile(hooks, { ...global, file }, "-", out);
+      if (!hooks) return;
+      addHooksFile(hooks, { ...global, file }, "-", out);
+      if (!codexReadsHooksFile(hooks)) markRefusedHooksFile(out, file);
+      else addCodexHookTrust(hooks.hooks, "hook:codex:global:-", await userHookSources(ctx, file), out.facts);
     })(),
   );
+  jobs.push(readCodexPlugins(ctx.primary.dir, out));
   if (ctx.config) {
     addServers(ctx.config, { ...global, file: ctx.configFile }, "-", out);
+    addPluginSwitches(ctx.config, ctx.configFile, undefined, out.facts);
+    addCodexHookStates(ctx.config, ctx.configFile, out.facts);
     for (const [project, table] of Object.entries(isRecord(ctx.config.projects) ? ctx.config.projects : {})) {
       if (isRecord(table)) out.facts.codexTrust.push({ project, trusted: table.trust_level === "trusted" });
     }
     const skills = isRecord(ctx.config.skills) ? ctx.config.skills : undefined;
-    for (const entry of Array.isArray(skills?.config) ? skills.config : []) {
-      if (!isRecord(entry) || typeof entry.enabled !== "boolean") continue;
+    const entries = (Array.isArray(skills?.config) ? skills.config : []).flatMap((entry) => {
+      if (!isRecord(entry) || typeof entry.enabled !== "boolean") return [];
       const name = typeof entry.name === "string" ? entry.name : undefined;
       const skillPath = typeof entry.path === "string" ? entry.path : undefined;
       // Codex ignores an entry with neither selector or with both.
-      if ((name === undefined) === (skillPath === undefined)) continue;
+      if ((name === undefined) === (skillPath === undefined)) return [];
+      return [{ name, skillPath, enabled: entry.enabled }];
+    });
+    // In their order, which decides between two that name one skill.
+    const real = await Promise.all(entries.map(({ skillPath }) => resolvedSkillPath(skillPath)));
+    for (const [k, { name, skillPath, enabled }] of entries.entries()) {
+      const realPath = real[k];
       out.facts.codexSkillConfig.push({
         file: ctx.configFile,
         ...(name ? { name } : {}),
         ...(skillPath ? { path: skillPath } : {}),
-        enabled: entry.enabled,
+        ...(realPath !== undefined ? { realPath } : {}),
+        enabled,
       });
     }
   }
   await Promise.all(jobs);
+}
+
+/**
+ * The paths a trust key can name a hooks file by: as found, and its real path - how Codex names
+ * it depends on how it reached the project.
+ */
+async function hookSources(file: string): Promise<string[]> {
+  const real = await realPath(file).catch(() => undefined);
+  return real === undefined || real === file ? [file] : [file, real];
+}
+
+/**
+ * The user hooks.json under each Codex profile that shares the primary's: Codex keys a hook's
+ * trust by the hooks file's path under the CODEX_HOME it runs with, so each profile trusts it on
+ * its own. The primary runs with none set, at its folder as it is; any other with the folder
+ * clausona sets, which Codex makes canonical first.
+ */
+async function userHookSources(ctx: CodexContext, file: string): Promise<string[]> {
+  const shared = await realPath(file).catch(() => undefined);
+  const each = await Promise.all(
+    ctx.homes.map(async (home) => {
+      const own = path.join(home.dir, "hooks.json");
+      if (home.isPrimary) return hookSources(own);
+      const real = await realPath(own).catch(() => undefined);
+      if (real === undefined || !samePath(real, shared)) return [];
+      const keyed = await codexHomeHooksFile(home.dir);
+      return keyed === undefined ? [] : [keyed];
+    }),
+  );
+  return [...new Set(each.flat())];
+}
+
+/**
+ * A `[[skills.config]]` path with its folder resolved through every link - a linked skills
+ * folder, a skill folder that is a link, `/tmp` on macOS - for matching the skill as Codex
+ * does. Undefined for no path, a relative one, or a folder that is not there.
+ */
+async function resolvedSkillPath(skillPath: string | undefined): Promise<string | undefined> {
+  if (skillPath === undefined || !path.isAbsolute(skillPath)) return undefined;
+  const folder = await realPath(path.dirname(skillPath)).catch(() => undefined);
+  return folder === undefined ? undefined : path.join(folder, path.basename(skillPath));
 }
 
 /**

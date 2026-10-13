@@ -280,7 +280,7 @@ const MCP_ACCOUNT = option("--account <name>", "Only this Claude account (repeat
 function undoPage(command: ExtensionsCommand): WritePage {
   return {
     title: `Put back what the last ${command} change changed`,
-    about: `Takes the newest ${command} change not undone yet and puts back each file it changed, unless something else changed it since. Run it again to go one change further back.`,
+    about: `Takes the newest ${command} change not undone yet and puts back each file it changed, unless something else changed it since.${command === "hooks" ? "" : " The line a change added to git's global ignore file stays, as Claude Code leaves it."} Run it again to go one change further back.`,
     options: [],
     shared: { only: ["--dry-run", "--yes", "--json"] },
     examples: [
@@ -440,7 +440,12 @@ export function extensionsHelp(command: ExtensionsCommand, sub?: Sub): string {
       ]
     : [];
   const project = option("--project <path>", "Look from another project instead of the current dir (~ works)");
-  const json = [option("--json", "JSON output (version 1). Its fields:"), optionMore(`${DOCS_URL}#json`)];
+  const json = [
+    option("--json", "JSON output (version 1). Its fields:"),
+    optionMore(`${DOCS_URL}#json`),
+    optionMore("state: the row's one state, or mixed when its accounts differ."),
+    optionMore("stateByAccount: each account's, for a row read per account."),
+  ];
   if (sub === "ls") {
     const [first = "", ...rest] = scopeList(SCOPES[command].map((s) => (s === "loaded" ? "loaded (default)" : s)));
     return [

@@ -2,6 +2,7 @@ import { type ReactElement, useEffect, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { loadInventory } from "../../extensions/inventory.js";
+import { writesFor } from "../../extensions/load.js";
 import type { Inventory } from "../../extensions/model.js";
 import { TestHome } from "../../extensions/test-home.js";
 import { stripAnsi } from "../../lib/cli-style.js";
@@ -67,11 +68,13 @@ async function seed(more?: (h: TestHome) => void): Promise<Inventory> {
   });
   h.skill(".claude/skills", "eli5", "Explain things simply");
   h.skill(".claude/skills", `a-very-long-skill-name-${"x".repeat(50)}`);
+  // work loads the primary's skills through the link clausona makes for every account.
+  h.link(".claude/skills", ".claude-work/skills");
   h.skill("repos/app/.claude/skills", "deploy-check");
   h.write(".claude/settings.json", { hooks: { Stop: [{ hooks: [{ type: "command", command: "notify-me" }] }] } });
   h.write("repos/app/.claude/settings.local.json", "{ broken");
   more?.(h);
-  return loadInventory({ homeDir: h.home, registry: h.registry, cwd: app, managedSettings: h.path("none.json") });
+  return loadInventory(h.inventoryOptions(app));
 }
 
 function mount(tree: ReactElement, columns: number, rows?: number): WatchedInstance {
@@ -398,12 +401,7 @@ describe("ExtensionsScreen", () => {
     h.claude("default", ".claude", {
       projects: { [h.home]: { mcpServers: { "home-db": { command: "db-mcp" } } }, [app]: {} },
     });
-    const inv = await loadInventory({
-      homeDir: h.home,
-      registry: h.registry,
-      cwd: h.home,
-      managedSettings: h.path("none.json"),
-    });
+    const inv = await loadInventory(h.inventoryOptions(h.home));
     const { instance } = screen(inv, 140);
     expect(await seen(instance, (f) => f.includes("Extensions │ ~"))).toContain("▸ ~ (here)");
     await press(instance, "2");
@@ -629,12 +627,7 @@ describe("ExtensionsScreen", () => {
     const app = h.project("repos/app");
     h.claude("default", ".claude");
     h.write("repos/app/.mcp.json", { mcpServers: { docs: { command: "docs" } } });
-    const inv = await loadInventory({
-      homeDir: h.home,
-      registry: h.registry,
-      cwd: app,
-      managedSettings: h.path("none.json"),
-    });
+    const inv = await loadInventory(h.inventoryOptions(app));
     const { instance } = screen(inv, 140, 40);
     await seen(instance, (f) => f.includes("Skills"));
     await press(instance, "2");
@@ -938,24 +931,36 @@ describe("ExtensionsScreen", () => {
 
   it("says so on p where no project is recorded, rather than open an empty list", async () => {
     const { currentProject: _, ...outside } = await seed();
-    const { instance } = screen({ ...outside, projects: [] }, 140, 40);
-    await seen(instance, (f) => f.includes("No project — pick one with p"));
+    const none = { ...outside, projects: [] };
+    // With the writes, for what a change that needs a project says.
+    const tree = <ExtensionsScreen load={async () => none} onExit={vi.fn()} writes={writesFor(none.homeDir)} />;
+    const instance = mount(tree, 140, 40);
+    const title = await seen(instance, (f) => f.includes("Read "));
+    expect(title).toContain("Extensions │ No project\n");
     await press(instance, "p");
     const frame = await seen(instance, (f) => f.includes("No projects to pick"));
     expect(frame).toContain("No projects to pick: Claude Code and Codex have recorded none.");
     expect(listOpen(frame)).toBe(false);
+    // With none to pick, nothing says to pick one with p: the Project table, a change, the matrix.
+    await scopeTo(instance, "Project");
+    const project = await seen(instance, (f) => f.includes("PROJECT — "));
+    expect(project.split("\n").find((line) => line.includes("PROJECT — "))).toMatch(/PROJECT — no project +0$/);
+    await scopeTo(instance, "Global");
+    await press(instance, RIGHT);
+    await moveTo(instance, "eli5");
+    await press(instance, " ");
+    await seen(instance, (f) => f.includes("There is no project to change it in. Run csn in a project."));
+    await press(instance, "2");
+    await press(instance, "m");
+    await seen(instance, (f) => f.includes("Run csn in a project first."));
+    for (const shown of instance.frames) expect(stripAnsi(shown)).not.toMatch(/pick one with p|first: p/i);
   });
 
   it("says a sentence for a scope with nothing in it, never a blank pane (Review Focus 1)", async () => {
     const h = new TestHome();
     homes.push(h);
     h.claude("default", ".claude");
-    const inv = await loadInventory({
-      homeDir: h.home,
-      registry: h.registry,
-      cwd: h.home,
-      managedSettings: h.path("none.json"),
-    });
+    const inv = await loadInventory(h.inventoryOptions(h.home));
     const { instance } = screen(inv, 100, 30);
     const frame = await seen(instance, (f) => f.includes("Nothing is loaded here."));
     // Started in the home dir, which is a project for what Claude Code keys by it.
@@ -1024,12 +1029,7 @@ describe("ExtensionsScreen", () => {
     const projects = names.map((name) => h.project(`repos/${name}`));
     h.claude("default", ".claude", { projects: Object.fromEntries(projects.map((p) => [p, {}])) });
     for (const name of names) h.write(`repos/${name}/.claude/settings.local.json`, "{ broken");
-    const inv = await loadInventory({
-      homeDir: h.home,
-      registry: h.registry,
-      cwd: h.home,
-      managedSettings: h.path("none.json"),
-    });
+    const inv = await loadInventory(h.inventoryOptions(h.home));
     expect(inv.warnings).toHaveLength(7);
     const { instance } = screen(inv, 60, 20);
     await seen(instance, (f) => f.includes("Skills"));

@@ -101,12 +101,7 @@ function home(more?: More): { h: TestHome; app: string; web: string } {
 
 // The managed settings are the home's own, so no test reads this machine's.
 function load(h: TestHome, cwd: string): Promise<Inventory> {
-  return loadInventory({
-    homeDir: h.home,
-    registry: h.registry,
-    cwd,
-    managedSettings: h.path("managed-settings.json"),
-  });
+  return loadInventory(h.inventoryOptions(cwd, h.path("managed-settings.json")));
 }
 
 function contextFor(h: TestHome, inv: Inventory, project: string | undefined): PlanContext {
@@ -234,7 +229,19 @@ describe("plan: Claude skills", () => {
     });
     const p = plan(ctx, "skills", act("on", "everywhere", [rowIn(inv, app, "global", "eli5")]));
     expect(p.changes).toHaveLength(1);
-    expect(p.notes).toEqual([`Still off in ${tilde(path.join(app, ".claude", "settings.local.json"), inv.homeDir)}`]);
+    const local = tilde(path.join(app, ".claude", "settings.local.json"), inv.homeDir);
+    expect(p.notes).toEqual([`Still off in this project (skillOverrides.eli5 in ${local}). Turn it on here too.`]);
+  });
+
+  it("notes the project's own off when on everywhere finds the user settings not off", async () => {
+    const { app, inv, ctx } = await seed((h) =>
+      h.write("repos/app/.claude/settings.local.json", { skillOverrides: { eli5: "off" } }),
+    );
+    const p = plan(ctx, "skills", act("on", "everywhere", [rowIn(inv, app, "global", "eli5")]));
+    expect(p.changes).toEqual([]);
+    expect(p.unchanged.map((u) => u.why)).toEqual(["not off in your user settings"]);
+    const local = tilde(path.join(app, ".claude", "settings.local.json"), inv.homeDir);
+    expect(p.notes).toEqual([`Still off in this project (skillOverrides.eli5 in ${local}). Turn it on here too.`]);
   });
 
   it("sets a visibility level in this project", async () => {
@@ -276,6 +283,8 @@ describe("plan: Claude skills", () => {
         lines: [
           { file: h.path(".claude/skills/old-one"), change: "delete", what: "", tracked: false, rows: [oldOne.key] },
         ],
+        // The skills folder it was read from, which a move across volumes keeps it out of.
+        root: h.path(".claude/skills"),
       },
     ]);
     expect(p.question).toBe("Delete old-one?");
@@ -398,6 +407,103 @@ describe("plan: Claude skills", () => {
     expect(both.question).toBe("Delete 2 skills?");
   });
 
+  it("says which skill links a deleted folder leaves broken, unless they are deleted too", async () => {
+    // gstack's shape: a skill folder that holds more skills, each linked in next to it.
+    const names = ["canary", "careful", "freeze", "guard"];
+    const { app, inv, ctx } = await seed((h) => {
+      h.skill("repos/app/.claude/skills", "gstack");
+      for (const name of names) {
+        h.skill("repos/app/.claude/skills/gstack", name);
+        h.link(`repos/app/.claude/skills/gstack/${name}`, `repos/app/.claude/skills/${name}`);
+      }
+    });
+    const gstack = rowIn(inv, app, "project", "gstack");
+    const links = Object.fromEntries(names.map((name) => [name, rowIn(inv, app, "project", name)]));
+    const keys = (...picked: string[]) => picked.map((name) => links[name]?.key);
+    const folderLine = (p: Plan) => p.changes.find((c) => c.kind === "remove" && c.what === "folder")?.lines[0];
+
+    const alone = plan(ctx, "skills", act("rm", "here", [gstack]));
+    // Undo puts the folder back, so the links are only said, never refused.
+    expect(alone.refused).toEqual([]);
+    expect(folderLine(alone)).toMatchObject({
+      note: "breaks 4 links: canary, careful, freeze, … (add them to delete them too)",
+      breaks: keys("canary", "careful", "freeze", "guard"),
+    });
+
+    const some = plan(ctx, "skills", act("rm", "here", [gstack, links.canary, links.careful] as ScopeRow[]));
+    expect(folderLine(some)).toMatchObject({
+      note: "breaks 2 links: freeze, guard (add them to delete them too)",
+      breaks: keys("freeze", "guard"),
+    });
+    const one = plan(
+      ctx,
+      "skills",
+      act("rm", "here", [gstack, links.canary, links.careful, links.freeze] as ScopeRow[]),
+    );
+    expect(folderLine(one)).toMatchObject({ note: "breaks 1 link: guard (add it to delete it too)" });
+
+    const all = plan(ctx, "skills", act("rm", "here", [gstack, ...Object.values(links)]));
+    expect(all.changes).toHaveLength(5);
+    expect(folderLine(all)?.note).toBeUndefined();
+    expect(folderLine(all)?.breaks).toBeUndefined();
+    // A link into the folder is a row of its own: deleting it alone says nothing of gstack.
+    expect(plan(ctx, "skills", act("rm", "here", [links.canary as ScopeRow])).changes[0]?.lines[0]).toMatchObject({
+      change: "unlink",
+      note: "link only, target kept",
+    });
+  });
+
+  it("says which Codex skills a folder it deletes holds, and takes those in the same rm along in one move", async () => {
+    // Codex finds skills in folders below a skill: pack holds inner, which holds deeper.
+    const { h, inv, ctx } = await seed((h) => {
+      h.skill(".agents/skills", "pack");
+      h.skill(".agents/skills/pack", "inner");
+      h.skill(".agents/skills/pack/inner", "deeper");
+    });
+    const [pack, inner, deeper] = ["pack", "inner", "deeper"].map((name) =>
+      rowIn(inv, undefined, "global", name, "codex"),
+    );
+    if (!pack || !inner || !deeper) throw new Error("no pack rows");
+    const folder = realpathSync.native(h.path(".agents/skills/pack"));
+    const removals = (p: Plan) =>
+      p.changes.map((c) => ({ kind: c.kind, file: c.file, lines: c.lines.map((l) => [l.rows, l.note, l.deletes]) }));
+
+    const alone = plan(ctx, "skills", act("rm", "here", [pack]));
+    expect(alone.refused).toEqual([]);
+    expect(removals(alone)).toEqual([
+      {
+        kind: "remove",
+        file: folder,
+        lines: [[[pack.key], "also deletes 2 skills inside: deeper, inner", [deeper.key, inner.key]]],
+      },
+    ]);
+    expect(alone.question).toBe("Delete pack?");
+
+    // inner goes with pack: one move, one line for both, and deeper still said.
+    const two = plan(ctx, "skills", act("rm", "here", [pack, inner]));
+    expect(two.refused).toEqual([]);
+    expect(removals(two)).toEqual([
+      {
+        kind: "remove",
+        file: folder,
+        lines: [[[pack.key, inner.key], "also deletes 1 skill inside: deeper", [deeper.key]]],
+      },
+    ]);
+    expect(two.question).toBe("Delete 2 skills?");
+    // In whatever order they are named, the outer folder is the one that moves.
+    expect(removals(plan(ctx, "skills", act("rm", "here", [deeper, inner, pack])))).toEqual([
+      { kind: "remove", file: folder, lines: [[[deeper.key, inner.key, pack.key], undefined, undefined]] },
+    ]);
+    // inner alone moves its own folder, and deeper with it.
+    expect(removals(plan(ctx, "skills", act("rm", "here", [inner])))).toEqual([
+      {
+        kind: "remove",
+        file: path.join(folder, "inner"),
+        lines: [[[inner.key], "also deletes 1 skill inside: deeper", [deeper.key]]],
+      },
+    ]);
+  });
+
   it("refuses to delete a Cloud skill or a plugin, and to switch a plugin's skill", async () => {
     const { app, inv, ctx } = await seed();
     const pdf = rowIn(inv, app, "cloud", "pdf");
@@ -463,6 +569,17 @@ describe("plan: Claude skills", () => {
     const p = plan(ctx, "skills", act("off", "here", [rowIn(inv, undefined, "global", "eli5")]));
     expect(p.refused.map((r) => [r.code, refusalText(r, "keys")])).toEqual([
       ["no-project", "There is no project to change it in. Pick one with p."],
+    ]);
+    // With no project recorded there is none to pick: the screen says to start in one. The CLI's words stay.
+    const none = { ...inv, projects: [] };
+    const [refused] = plan(
+      contextFor(h, none, undefined),
+      "skills",
+      act("off", "here", [rowIn(none, undefined, "global", "eli5")]),
+    ).refused;
+    expect(refused && [refusalText(refused, "keys"), refusalText(refused, "flags")]).toEqual([
+      "There is no project to change it in. Run csn in a project.",
+      "There is no project to change it in. Run it in a project, or pass --project <path>.",
     ]);
   });
 
@@ -750,6 +867,85 @@ describe("plan: Claude MCP servers", () => {
     ]);
   });
 
+  it("refuses off and on for a .mcp.json server not here, which loads in the projects below its folder", async () => {
+    // labs is no project; labs/lab and app are. Seen from app, labs' lab has no state of its own.
+    const h = new TestHome();
+    homes.push(h);
+    const app = h.project("repos/app");
+    const lab = h.project("labs/lab");
+    h.claude("default", ".claude", { projects: { [app]: {}, [lab]: {} } });
+    h.write("labs/.mcp.json", { mcpServers: { lab: { command: "lab-mcp" } } });
+    const inv = await load(h, app);
+    const ctx = contextFor(h, inv, app);
+    const [row] = rowsIn(inv, "claude", "mcp", "other", app, NOW, h.path("labs"));
+    if (!row) throw new Error("no lab row");
+    const folder = tilde(h.path("labs"), inv.homeDir);
+    for (const verb of ["off", "on"] as const) {
+      const p = plan(ctx, "mcp", act(verb, "here", [row]));
+      expect(p.changes, verb).toEqual([]);
+      expect(p.refused.map((r) => [r.code, refusalText(r, "flags"), refusalText(r, "keys")])).toEqual([
+        [
+          "not-here",
+          `It loads in the projects in ${folder}, each with its own approvals. Run it in one of them, or pass --project <path>.`,
+          `It loads in the projects in ${folder}, each with its own approvals. Pick one of them with p.`,
+        ],
+      ]);
+    }
+    expect(actionsLine(keysFor(ctx, "mcp", row))).toBe("d delete");
+    // Deleting it from its file is the same from anywhere.
+    expect(plan(ctx, "mcp", act("rm", "here", [row])).changes.map((c) => c.file)).toEqual([
+      h.path("labs", ".mcp.json"),
+    ]);
+    // From the project below it, it is that project's to approve.
+    const below = await load(h, lab);
+    const there = plan(
+      contextFor(h, below, lab),
+      "mcp",
+      act("on", "here", [rowIn(below, lab, "parents", "lab", "claude", "mcp")]),
+    );
+    expect(there.refused).toEqual([]);
+    expect(there.changes.map((c) => c.file)).toEqual([path.join(lab, ".claude", "settings.local.json")]);
+  });
+
+  it("says what a .mcp.json server runs, secrets hidden, on the line that approves it", async () => {
+    const { h, app, inv, ctx } = await seed((h) =>
+      h.write("repos/app/.mcp.json", {
+        mcpServers: {
+          "docs-search": { command: "npx", args: ["docs-mcp", "--api-key", KEY], env: { DOCS_TOKEN: KEY } },
+          wiki: { type: "http", url: "https://wiki.example.com/mcp" },
+        },
+      }),
+    );
+    const docs = rowIn(inv, app, "project", "docs-search", "claude", "mcp");
+    const wiki = rowIn(inv, app, "project", "wiki", "claude", "mcp");
+    const lines = (p: Plan) => p.changes.flatMap((c) => c.lines);
+    // Pending approval: on approves the command the repo defines, and the line says what it is,
+    // as the details say it.
+    const approve = plan(ctx, "mcp", act("on", "here", [docs, wiki]));
+    expect(lines(approve).map((l) => [l.what, l.runs])).toEqual([
+      ["enabledMcpjsonServers + docs-search", docs.items[0]?.summary?.command],
+      ["enabledMcpjsonServers + wiki", "https://wiki.example.com/mcp"],
+    ]);
+    expect(docs.items[0]?.summary?.command).toMatch(/^npx docs-mcp --api-key \S+$/);
+    expect(JSON.stringify(approve)).not.toContain(KEY);
+    // Off says nothing of what it runs.
+    expect(lines(plan(ctx, "mcp", act("off", "here", [docs])))[0]?.runs).toBeUndefined();
+
+    // Approved before, and only an account's denial left to clear: nothing new to approve.
+    const approved = await seed((h, app) => {
+      h.write("repos/app/.mcp.json", { mcpServers: { "docs-search": { command: "ds" } } });
+      h.write("repos/app/.claude/settings.local.json", { enabledMcpjsonServers: ["docs-search"] });
+      h.claude("work", ".claude-work", { projects: { [app]: { disabledMcpjsonServers: ["docs-search"] } } });
+    });
+    const again = plan(
+      approved.ctx,
+      "mcp",
+      act("on", "here", [rowIn(approved.inv, approved.app, "project", "docs-search", "claude", "mcp")]),
+    );
+    expect(lines(again).map((l) => [l.what, l.runs])).toEqual([["disabledMcpjsonServers - docs-search", undefined]]);
+    expect(h.home).not.toBe(approved.h.home);
+  });
+
   it("turns a .mcp.json server on here, also in the accounts that denied it, and not over user settings", async () => {
     const accounts = await seed((h, app) => {
       h.claude("work", ".claude-work", {
@@ -891,7 +1087,9 @@ describe("plan: Claude MCP servers", () => {
       { file: h.path(".claude.json"), edits: [{ op: "restore", path: ["mcpServers", "github"] }] },
     ]);
     expect(on.unchanged).toEqual([{ rowKey: github.key, name: "github", why: "not off everywhere in work" }]);
-    expect(on.notes).toEqual(["Still off in this project for work."]);
+    expect(on.notes).toEqual([
+      `Still off in this project for work (disabledMcpServers in ${tilde(h.path(".claude-work", ".claude.json"), h.home)}). Turn it on here too.`,
+    ]);
     // Seen from web, where work has turned nothing off, there is nothing to note.
     const fromWeb = rowIn(inv, web, "global", "github", "claude", "mcp");
     expect(plan(contextFor(h, inv, web), "mcp", act("on", "everywhere", [fromWeb])).notes).toEqual([]);
@@ -1023,6 +1221,203 @@ describe("plan: Claude MCP servers", () => {
         refusalText(r, "keys"),
       ]),
     ).toEqual([["plugin-item", "It comes with the plugin kit@m. Turn the plugin on or off in Plugins."]]);
+  });
+});
+
+describe("plan: a setting that keeps a Claude server or a built-in skill off", () => {
+  const text = (p: Plan, voice: "keys" | "flags" = "flags") =>
+    refusalText(p.refused[0] as Plan["refused"][number], voice);
+
+  it("refuses on for a server a deny list keeps from starting, naming the list and its file", async () => {
+    const { h, app, inv, ctx } = await seed((h) =>
+      h.write(".claude/settings.json", { ...SETTINGS, deniedMcpServers: [{ serverName: "figma" }] }),
+    );
+    const figma = rowIn(inv, app, "global", "figma", "claude", "mcp");
+    const said = `deniedMcpServers in ${tilde(h.path(".claude", "settings.json"), h.home)} keeps it from starting. Change it there.`;
+    for (const reach of ["here", "everywhere"] as const) {
+      const on = plan(ctx, "mcp", act("on", reach, [figma]));
+      expect(codes(on)).toEqual(["mcp-denied"]);
+      expect(on.changes).toEqual([]);
+      expect(text(on)).toBe(said);
+      expect(text(on, "keys")).toBe(said);
+    }
+    // Off still goes ahead: it stays off once the list lets it go.
+    expect(codes(plan(ctx, "mcp", act("off", "here", [figma])))).toEqual([]);
+  });
+
+  it("refuses on for a server an allow list leaves out, and for one managed-mcp.json shuts out", async () => {
+    const allow = await seed((h) =>
+      h.write(".claude/settings.json", { ...SETTINGS, allowedMcpServers: [{ serverName: "github" }] }),
+    );
+    const figma = rowIn(allow.inv, allow.app, "global", "figma", "claude", "mcp");
+    const notAllowed = plan(allow.ctx, "mcp", act("on", "here", [figma]));
+    expect(codes(notAllowed)).toEqual(["mcp-not-allowed"]);
+    expect(text(notAllowed)).toBe(
+      `allowedMcpServers in ${tilde(allow.h.path(".claude", "settings.json"), allow.h.home)} leaves it out. Change it there.`,
+    );
+
+    const exclusive = await seed((h) => h.write("managed-mcp.json", { mcpServers: {} }));
+    const docs = rowIn(exclusive.inv, exclusive.app, "project", "docs-search", "claude", "mcp");
+    const shutOut = plan(exclusive.ctx, "mcp", act("on", "here", [docs]));
+    expect(codes(shutOut)).toEqual(["managed-mcp"]);
+    expect(text(shutOut)).toBe(
+      `${tilde(exclusive.h.path("managed-mcp.json"), exclusive.h.home)} lets only its own servers start. Only your organization can change that file.`,
+    );
+
+    // A list in the managed settings is the organization's, as any managed setting is.
+    const managed = await seed((h) =>
+      h.write("managed-settings.json", { deniedMcpServers: [{ serverName: "figma" }] }),
+    );
+    const fromPolicy = plan(
+      managed.ctx,
+      "mcp",
+      act("on", "here", [rowIn(managed.inv, managed.app, "global", "figma", "claude", "mcp")]),
+    );
+    expect(codes(fromPolicy)).toEqual(["managed"]);
+  });
+
+  it("goes ahead with a note when the project's own list keeps it off and on is everywhere", async () => {
+    const { app, inv, ctx } = await seed((h, app) =>
+      h.write(path.join(path.relative(h.home, app), ".claude", "settings.json"), {
+        deniedMcpServers: [{ serverName: "docs-search" }],
+      }),
+    );
+    const docs = rowIn(inv, app, "project", "docs-search", "claude", "mcp");
+    // On here would not start it: the project's list holds here.
+    expect(codes(plan(ctx, "mcp", act("on", "here", [docs])))).toEqual(["mcp-denied"]);
+    const github = await seed((h, app) =>
+      h.write(path.join(path.relative(h.home, app), ".claude", "settings.local.json"), {
+        deniedMcpServers: [{ serverName: "github" }],
+      }),
+    );
+    const row = rowIn(github.inv, github.app, "global", "github", "claude", "mcp");
+    const everywhere = plan(github.ctx, "mcp", act("on", "everywhere", [row]));
+    expect(codes(everywhere)).toEqual([]);
+    expect(everywhere.notes).toContain(
+      `Still off in this project: deniedMcpServers in ${tilde(path.join(github.app, ".claude", "settings.local.json"), github.h.home)}`,
+    );
+  });
+
+  it("refuses on and a visibility for a built-in skill while disableBundledSkills holds", async () => {
+    const { h, app, inv, ctx } = await seed((h) =>
+      h.write(".claude/settings.json", {
+        ...SETTINGS,
+        disableBundledSkills: true,
+        skillOverrides: { "claude-api": "off" },
+      }),
+    );
+    const api = rowIn(inv, app, "builtin", "claude-api");
+    for (const action of [
+      act("on", "here", [api]),
+      act("on", "everywhere", [api]),
+      act("visibility", "here", [api], { level: "name-only" }),
+    ]) {
+      const p = plan(ctx, "skills", action);
+      expect(codes(p)).toEqual(["bundled-off"]);
+      expect(text(p, "keys")).toBe(
+        `disableBundledSkills in ${tilde(h.path(".claude", "settings.json"), h.home)} turns off the skills that come with Claude Code. Change it there.`,
+      );
+    }
+    expect(codes(plan(ctx, "skills", act("off", "here", [api])))).toEqual([]);
+
+    // The project's own setting holds there alone: everywhere goes ahead, and says so.
+    const local = await seed((h, app) => {
+      h.write(".claude/settings.json", { ...SETTINGS, skillOverrides: { "claude-api": "off" } });
+      h.write(path.join(path.relative(h.home, app), ".claude", "settings.local.json"), { disableBundledSkills: true });
+    });
+    const projectApi = rowIn(local.inv, local.app, "builtin", "claude-api");
+    expect(codes(plan(local.ctx, "skills", act("on", "here", [projectApi])))).toEqual(["bundled-off"]);
+    const everywhere = plan(local.ctx, "skills", act("on", "everywhere", [projectApi]));
+    expect(codes(everywhere)).toEqual([]);
+    expect(everywhere.notes).toContain(
+      `Still off in this project: disableBundledSkills in ${tilde(path.join(local.app, ".claude", "settings.local.json"), local.h.home)}`,
+    );
+  });
+});
+
+describe("plan: on everywhere, and what is still off in this project", () => {
+  it("notes an account's own switch here when it puts a server clausona kept back", async () => {
+    const { h, app, inv, ctx } = await seed((h, app) => {
+      // default turned github off here, then off everywhere: clausona keeps its entry.
+      const mine = h.claude("default", ".claude", {
+        oauthAccount: { organizationUuid: "org", accountUuid: "one" },
+        projects: { [app]: { disabledMcpServers: ["github"] } },
+        mcpServers: { figma: { command: "figma" } },
+      });
+      const id = stashIdFor("mcp:claude:account:claude:default:github", NOW - DAY);
+      h.write(
+        path.join(STASH, stashFileName(id)),
+        stashText({
+          version: 1,
+          id,
+          kind: "mcp",
+          tool: "claude",
+          name: "github",
+          file: mine.jsonPath,
+          path: ["mcpServers", "github"],
+          scope: "account",
+          profile: "claude:default",
+          entry: { command: "gh" },
+          stashedAt: new Date(NOW - DAY).toISOString(),
+        }),
+      );
+    });
+    const github = rowIn(inv, app, "global", "github", "claude", "mcp");
+    const on = plan(ctx, "mcp", act("on", "everywhere", [github], { accounts: ["claude:default"] }));
+    expect(on.changes).toMatchObject([
+      { file: h.path(".claude.json"), edits: [{ op: "restore", path: ["mcpServers", "github"] }] },
+    ]);
+    expect(on.notes).toEqual([
+      `Still off in this project for default (disabledMcpServers in ${tilde(h.path(".claude.json"), h.home)}). Turn it on here too.`,
+    ]);
+  });
+
+  it("notes a plugin the project's own settings keep off, whether or not the user settings change", async () => {
+    const { app, inv, ctx } = await seed((h) => {
+      h.write(".claude/settings.json", { ...SETTINGS, enabledPlugins: { "kit@m": false } });
+      h.write("repos/app/.claude/settings.local.json", { enabledPlugins: { "kit@m": false } });
+    });
+    const kit = rowIn(inv, app, "plugins", "kit@m");
+    const local = tilde(path.join(app, ".claude", "settings.local.json"), inv.homeDir);
+    const note = `Still off in this project (enabledPlugins.kit@m in ${local}). Turn it on here too.`;
+    const on = plan(ctx, "skills", act("on", "everywhere", [kit]));
+    expect(on.changes).toHaveLength(1);
+    expect(on.notes).toEqual([note]);
+    const already = await seed((h) =>
+      h.write("repos/app/.claude/settings.local.json", { enabledPlugins: { "kit@m": false } }),
+    );
+    const unchangedOn = plan(
+      already.ctx,
+      "skills",
+      act("on", "everywhere", [rowIn(already.inv, already.app, "plugins", "kit@m")]),
+    );
+    expect(unchangedOn.changes).toEqual([]);
+    expect(unchangedOn.notes).toEqual([note.replace(app, already.app)]);
+  });
+
+  it("notes a Codex project skill's own off, and a trusted project's enabled = false for a server", async () => {
+    const skillFile = (app: string) => path.join(app, ".agents", "skills", "app-lint", "SKILL.md");
+    const skill = await seed((h, appDir) =>
+      h.codex(
+        "personal",
+        ".codex",
+        `[projects.'${appDir}']\ntrust_level = "trusted"\n\n[[skills.config]]\npath = '${skillFile(appDir)}'\nenabled = false\n`,
+      ),
+    );
+    const appLint = rowIn(skill.inv, skill.app, "project", "app-lint", "codex");
+    const on = plan(skill.ctx, "skills", act("on", "everywhere", [appLint]));
+    expect(on.changes).toEqual([]);
+    expect(on.notes).toEqual([
+      `Still off in this project (skills.config ${tilde(skillFile(skill.app), skill.h.home)} in ${tilde(skill.h.path(".codex", "config.toml"), skill.h.home)}). Turn it on here too.`,
+    ]);
+
+    const server = await seed((h) => h.write("repos/app/.codex/config.toml", "[mcp_servers.docs]\nenabled = false\n"));
+    const docs = rowIn(server.inv, server.app, "global", "docs", "codex", "mcp");
+    const onServer = plan(server.ctx, "mcp", act("on", "everywhere", [docs]));
+    expect(onServer.unchanged.map((u) => u.why)).toEqual(["not off in Codex's config.toml"]);
+    expect(onServer.notes).toEqual([
+      `Still off in this project (mcp_servers.docs.enabled in ${tilde(path.join(server.app, ".codex", "config.toml"), server.h.home)}). Turn it on here too.`,
+    ]);
   });
 });
 
@@ -1190,6 +1585,36 @@ describe("plan: hooks and plugins", () => {
     expect(codes(plan(ctx, "hooks", act("off", "everywhere", [kitHook])))).toEqual(["plugin-item"]);
   });
 
+  it("refuses to turn a hook on while disableAllHooks keeps every hook off, naming where it is set", async () => {
+    const user = await seed((h) => h.write(".claude/settings.json", { ...SETTINGS, disableAllHooks: true }));
+    const notifyA = hookRow(user.inv, user.app, "notify-a");
+    const on = plan(user.ctx, "hooks", act("on", "everywhere", [notifyA]));
+    expect(codes(on)).toEqual(["all-hooks-off"]);
+    expect(refusalText(on.refused[0] as Plan["refused"][number], "flags")).toBe(
+      `disableAllHooks in ${tilde(user.h.path(".claude", "settings.json"), user.h.home)} turns every hook off. Change it there.`,
+    );
+    // Off still goes ahead: the hook stays out once disableAllHooks is gone.
+    expect(plan(user.ctx, "hooks", act("off", "everywhere", [notifyA])).changes).toHaveLength(1);
+
+    const managed = await seed((h) => h.write("managed-settings.json", { disableAllHooks: true }));
+    const fromPolicy = plan(
+      managed.ctx,
+      "hooks",
+      act("on", "everywhere", [hookRow(managed.inv, managed.app, "notify-a")]),
+    );
+    expect(codes(fromPolicy)).toEqual(["managed"]);
+
+    // A project's own setting holds in that project alone: on is everywhere, so it goes ahead and says so.
+    const project = await seed((h, app) =>
+      h.write(path.join(path.relative(h.home, app), ".claude", "settings.json"), { disableAllHooks: true }),
+    );
+    const here = plan(project.ctx, "hooks", act("on", "everywhere", [hookRow(project.inv, project.app, "notify-a")]));
+    expect(codes(here)).toEqual([]);
+    expect(here.notes).toEqual([
+      `Still off in this project: disableAllHooks in ${tilde(path.join(project.app, ".claude", "settings.json"), project.h.home)}`,
+    ]);
+  });
+
   it("takes two hooks of one group out last first, so each place still holds its hook", async () => {
     const { app, inv, ctx } = await seed();
     const rows = [hookRow(inv, app, "notify-a"), hookRow(inv, app, "notify-b")];
@@ -1305,6 +1730,30 @@ describe("plan: hooks and plugins", () => {
       { rowKey: kit.key, name: "kit@m", why: "already on in every project" },
     ]);
   });
+
+  it("leaves a Codex plugin, of the same id as a Claude one too, and what it brings to Codex's /plugins", async () => {
+    const { app, inv, ctx } = await seed((h) => {
+      h.write(".codex/plugins/cache/m/kit/1.0.0/.codex-plugin/plugin.json", { name: "kit" });
+      h.skill(".codex/plugins/cache/m/kit/1.0.0/skills", "codex-plan");
+    });
+    const kit = rowIn(inv, app, "plugins", "kit@m", "codex");
+    for (const verb of ["off", "on", "rm"] as const) {
+      for (const reach of ["here", "everywhere"] as const) {
+        const p = plan(ctx, "skills", act(verb, reach, [kit]));
+        expect(p.changes).toEqual([]);
+        expect(p.refused.map((r) => [r.code, refusalText(r, "flags")])).toEqual([
+          ["codex-plugin", "Use /plugins in Codex to turn a plugin on or off, or to uninstall it."],
+        ]);
+      }
+    }
+    const skill = pluginContents(inv, kit).skill[0] as ScopeRow;
+    expect(skill.name).toBe("kit:codex-plan");
+    const off = plan(ctx, "skills", act("off", "everywhere", [skill])).refused[0] as Plan["refused"][number];
+    expect([refusalText(off, "keys"), refusalText(off, "flags")]).toEqual([
+      "It comes with the plugin kit@m. Turn the plugin on or off with /plugins in Codex.",
+      "It comes with the plugin kit@m. Turn the plugin on or off with /plugins in Codex.",
+    ]);
+  });
 });
 
 describe("keys and toggles", () => {
@@ -1346,6 +1795,27 @@ describe("keys and toggles", () => {
     const github = rowIn(inv, app, "global", "github", "claude", "mcp");
     expect(toggleVerb(inv, github, app, "here")).toBe("off");
     expect(toggleVerb(inv, github, app, "here", ["claude:work"])).toBe("on");
+  });
+
+  it("toggles a .mcp.json server pending approval on, as it does not run, and off once an account runs it", async () => {
+    const { app, inv, ctx } = await seed();
+    const docs = rowIn(inv, app, "project", "docs-search", "claude", "mcp");
+    expect(toggleVerb(inv, docs, app, "here")).toBe("on");
+    const keys = keysFor(ctx, "mcp", docs);
+    expect(keys[0]).toMatchObject({ key: "space", label: "on here", action: { verb: "on", reach: "here" } });
+    expect(actionsLine(keys)).toBe("space on here · d delete");
+    // Off is still there to ask for: it denies the server.
+    const off = plan(ctx, "mcp", act("off", "here", [docs]));
+    expect(off.changes.flatMap((c) => c.lines).map((l) => l.what)).toEqual(["disabledMcpjsonServers + docs-search"]);
+
+    // work has approved it: it runs there, so the toggle turns it off, but for default alone.
+    const approved = await seed((h, a) =>
+      h.claude("work", ".claude-work", { projects: { [a]: { enabledMcpjsonServers: ["docs-search"] } } }),
+    );
+    const one = rowIn(approved.inv, approved.app, "project", "docs-search", "claude", "mcp");
+    expect(toggleVerb(approved.inv, one, approved.app, "here")).toBe("off");
+    expect(toggleVerb(approved.inv, one, approved.app, "here", ["claude:default"])).toBe("on");
+    expect(toggleVerb(approved.inv, one, approved.app, "here", ["claude:work"])).toBe("off");
   });
 
   it("goes round the visibility levels, names each command's kind, and words every refusal", () => {

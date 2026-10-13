@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { runCommand } from "../commands.js";
 import { stripAnsi } from "../lib/cli-style.js";
-import { LEFT_ALONE, REFUSAL_CODES, REFUSALS } from "./actions.js";
+import { LEFT_ALONE, REFUSAL_CODES, REFUSALS, toggleVerb } from "./actions.js";
 import { KEEP_OPERATIONS } from "./apply.js";
 import {
   CHANGE_JSON_KEYS,
@@ -19,10 +19,10 @@ import {
   UNDO_JSON_KEYS,
   withJsonErrors,
 } from "./cli.js";
-import { hookWhen } from "./describe.js";
+import { hookWhen, tagsOf } from "./describe.js";
 import { ERROR_KINDS, ExitError } from "./exit-error.js";
-import { CLEANUP_GRACE_DAYS, CLEANUP_UNUSED_DAYS } from "./inventory.js";
-import { SCOPE_LABEL, type ScopeId } from "./scopes.js";
+import { CLEANUP_GRACE_DAYS, CLEANUP_UNUSED_DAYS, loadInventory } from "./inventory.js";
+import { rowsIn, SCOPE_LABEL, type ScopeId } from "./scopes.js";
 import { TestHome } from "./test-home.js";
 
 /**
@@ -55,11 +55,15 @@ const TAGS = [
   "off",
   "off here",
   "off in N of M accounts",
+  "not here",
   "pending approval",
   "hidden by Project copy",
   "hidden by Global copy",
   "hidden by Parent folders copy",
   "unused",
+  "no front matter",
+  "name too long",
+  "invalid hooks file",
 ];
 
 /** The keys `ls --json` writes, in order. */
@@ -78,6 +82,7 @@ const ITEM_KEYS = [
   "accounts",
   "state",
   "stateByAccount",
+  "loadsByAccount",
   "usage",
   "tags",
   "file",
@@ -167,6 +172,7 @@ const anchors = (doc: string) =>
  */
 const PLACEHOLDER: Record<string, string> = {
   "~file": "file",
+  "~folder": "folder",
   "project name": "project",
   "Claude Code|Codex": "tool",
   Tool: "tool",
@@ -234,12 +240,15 @@ afterEach(() => {
  * - a working link and a broken one, a skill off in user settings and one off in the project's;
  * - a Project eli5 a Global one hides; a `.mcp.json` server pending approval, hidden by the
  *   project's copy in the folder above, and one hidden by a nearer parent folder's;
- * - a plugin and its skill, a hook, and an eli5 that Claude and Codex both load here.
+ * - a plugin and its skill, a hook, and an eli5 that Claude and Codex both load here;
+ * - a skill whose SKILL.md has no front matter;
+ * - a `.mcp.json` server of a folder that is no project, above another project.
  */
 function seed() {
   const h = new TestHome();
   homes.push(h);
   const app = h.project("repos/team/app");
+  const lab = h.project("labs/lab");
   const server = { github: { command: "npx", args: ["gh-mcp"], env: { GITHUB_TOKEN: "x" } } };
   h.claude("personal", ".claude", {
     oauthAccount: { organizationUuid: "org", accountUuid: "one" },
@@ -248,13 +257,16 @@ function seed() {
   });
   h.claude("work", ".claude-work", {
     oauthAccount: { organizationUuid: "org", accountUuid: "two" },
-    projects: { [app]: { disabledMcpServers: ["github"] } },
+    projects: { [app]: { disabledMcpServers: ["github"] }, [lab]: {} },
     mcpServers: server,
   });
   h.skill(".claude/skills/synced/org_one", "pdf");
   h.skill(".claude/skills/synced/org_two", "pdf");
   h.skill(".claude/skills", "eli5");
   h.skill(".claude/skills", "old-one");
+  h.write(".claude/skills/bare/SKILL.md", "Do the thing, step by step.\n");
+  // work loads the primary's skills through the link clausona makes for every account.
+  h.link(".claude/skills", ".claude-work/skills");
   h.skill("shared", "notes");
   h.link("shared/notes", ".claude/skills/notes");
   h.link(h.path("gone", "lost"), ".claude/skills/lost");
@@ -264,6 +276,8 @@ function seed() {
   h.write("repos/team/app/.mcp.json", { mcpServers: { docs: { command: "docs-mcp" } } });
   h.write("repos/team/.mcp.json", { mcpServers: { docs: { command: "docs-mcp" }, wiki: { command: "wiki-mcp" } } });
   h.write("repos/.mcp.json", { mcpServers: { wiki: { command: "wiki-mcp" } } });
+  // A folder that is no project, above a project that is not app's: its server is not here.
+  h.write("labs/.mcp.json", { mcpServers: { lab: { command: "lab-mcp" } } });
   const kit = h.path(".claude/plugins/cache/m/kit/1.0.0");
   h.write(".claude/plugins/installed_plugins.json", { plugins: { "kit@m": [{ installPath: kit }] } });
   h.skill(".claude/plugins/cache/m/kit/1.0.0/skills", "plan");
@@ -274,6 +288,13 @@ function seed() {
   });
   h.codex("personal", ".codex");
   h.skill(".agents/skills", "eli5");
+  // Two SKILL.md files and a hooks file Codex skips.
+  h.write(".codex/hooks.json", {
+    $schema: "x",
+    hooks: { Stop: [{ hooks: [{ type: "command", command: "codex-done" }] }] },
+  });
+  h.write(".agents/skills/plain/SKILL.md", "just text\n");
+  h.write(".agents/skills/long/SKILL.md", `---\nname: ${"x".repeat(65)}\ndescription: d\n---\n`);
   // The managed settings are the home's own, so the test never reads this machine's. `terminal`
   // runs it as if on one, answering yes.
   const run = (command: ExtensionsCommand, args: string[], terminal = false) =>
@@ -283,6 +304,7 @@ function seed() {
       registry: h.registry,
       now: NOW,
       managedSettings: h.path("managed-settings.json"),
+      mcpjsonStop: h.home,
       ...(terminal ? { interactive: true, confirm: async () => true, print: () => {} } : {}),
     });
   /** Every item `ls --json` writes: `all` has every place's rows but the plugins, which `plugins` lists. */
@@ -563,6 +585,59 @@ describe("docs/extensions.md", () => {
     );
     expect(linked).toContain("changing-things");
     expect(anchors(DOC)).toEqual(expect.arrayContaining([...linked]));
+  });
+
+  it("says how on is refused under disableAllHooks, what space toggles, and what a .mcp.json cell changes", async () => {
+    // The prose, its line breaks as spaces.
+    const said = (title: string) => section(DOC, title).join(" ").replace(/\s+/g, " ");
+    const h = new TestHome();
+    homes.push(h);
+    const app = h.project("app");
+    h.claude("personal", ".claude", { projects: { [app]: {} } });
+    h.claude("work", ".claude-work", { projects: { [app]: {} } });
+    h.write("app/.mcp.json", { mcpServers: { docs: { command: "docs-mcp" } } });
+    h.skill(".claude/skills", "eli5");
+    h.link(".claude/skills", ".claude-work/skills");
+    h.skill("app/.claude/skills", "eli5");
+    const hooks = { Stop: [{ hooks: [{ type: "command", command: "notify-done" }] }] };
+    const run = (command: ExtensionsCommand, args: string[]) =>
+      runExtensionsCommand(command, args, {
+        homeDir: h.home,
+        cwd: app,
+        registry: h.registry,
+        now: NOW,
+        managedSettings: h.path("managed-settings.json"),
+        mcpjsonStop: h.home,
+      });
+    const refusedOn = async () =>
+      JSON.parse(await run("hooks", ["on", "Stop", "--dry-run", "--json"])).refused.map(
+        (r: { code: string }) => r.code,
+      );
+    // In your user settings, all-hooks-off; in managed settings, managed, as anything there is.
+    h.write(".claude/settings.json", { disableAllHooks: true, hooks });
+    expect(await refusedOn()).toEqual(["all-hooks-off"]);
+    h.write(".claude/settings.json", { hooks });
+    h.write("managed-settings.json", { disableAllHooks: true });
+    expect(await refusedOn()).toEqual(["managed"]);
+    expect(said("Off and on")).toContain(
+      "`on` is refused, as `all-hooks-off`, and the reason names the file that sets it. Set in managed settings, it is refused as `managed`",
+    );
+
+    // space reads the switch: a project copy the Global one hides is on, so it turns off.
+    const inv = await loadInventory(h.inventoryOptions(app, h.path("managed-settings.json")));
+    const hidden = rowsIn(inv, "claude", "skill", "project", app, NOW).find((row) => row.name === "eli5");
+    if (!hidden) throw new Error("no project eli5");
+    expect(tagsOf(inv, hidden, app, NOW)).toContain("hidden by Global copy");
+    expect(toggleVerb(inv, hidden, app, "here")).toBe("off");
+    expect(said("Changing things from the screen")).toContain("It reads the row's switch, not whether the row loads");
+
+    // A .mcp.json server's cell, one account chosen, changes the project's settings: no account named.
+    const cell = JSON.parse(await run("mcp", ["on", "docs", "--account", "work", "--dry-run", "--json"]));
+    expect(cell.question).toBe("Turn on docs in this project?");
+    expect(cell.changes.map((c: { file: string; account: string | null }) => c.account)).toEqual([null]);
+    expect(said("Changing things from the screen")).toContain(
+      "so its cell changes it for the whole project, and the dialog's question names no account: `Turn on docs-search in this project?`",
+    );
   });
 
   it("says each hook event in the words the CLI and the screen use", () => {

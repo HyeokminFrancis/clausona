@@ -53,9 +53,9 @@ const ORDER: Record<ToolName, Record<ItemKind, readonly ScopeId[]>> = {
     hook: ["loaded", "project", "global", "plugins", "managed"],
   },
   codex: {
-    skill: ["loaded", "project", "global", "builtin"],
-    mcp: ["loaded", "project", "global"],
-    hook: ["loaded", "project", "global"],
+    skill: ["loaded", "project", "global", "plugins", "builtin"],
+    mcp: ["loaded", "project", "global", "plugins"],
+    hook: ["loaded", "project", "global", "plugins"],
   },
 };
 
@@ -169,19 +169,6 @@ export function isAccountServer(item: Extension): boolean {
   );
 }
 
-/**
- * The install scope - user, project or local - a plugin's item came from. The sources keep it in
- * the item's id alone, as the second part of its owner (`pluginOwner` in claude-context.ts:
- * `<plugin>|<scope>|<project>|<install path>`). Undefined when the id does not read so.
- */
-function installScope(item: Extension): string | undefined {
-  const plugin = item.location.plugin;
-  const prefix = `${item.kind}:claude:plugin:${plugin}|`;
-  if (plugin === undefined || !item.id.startsWith(prefix)) return undefined;
-  const scope = item.id.slice(prefix.length).split("|", 1)[0];
-  return scope === "user" || scope === "project" || scope === "local" ? scope : undefined;
-}
-
 function dirKey(dir: string | undefined): string {
   return dir === undefined ? "-" : pathKey(dir);
 }
@@ -205,7 +192,7 @@ export function rowKey(item: Extension): string {
   }
   if (loc.tool !== "claude") return item.id;
   if (item.kind === "skill" && loc.scope === "synced") return `skill:claude:synced:-:${item.name}`;
-  const install = loc.scope === "plugin" ? installScope(item) : undefined;
+  const install = loc.scope === "plugin" ? loc.installScope : undefined;
   if (install === undefined) return item.id;
   const where = `${install}:${dirKey(loc.project)}:${loc.plugin}`;
   if (item.kind === "plugin") return `plugin:claude:${where}`;
@@ -296,8 +283,8 @@ export function stateLoads(state: EffectiveState): boolean {
  * and a state that loads (`stateLoads`) - each account's, where it is read per account.
  */
 export function loadsHere(inv: Inventory, item: Extension, project: string | undefined): boolean {
-  // A link to nothing has no SKILL.md for Claude Code or Codex to read.
-  if (!relevantIn(item, project) || item.link?.broken === true) return false;
+  // A link to nothing has no SKILL.md for Claude Code or Codex to read, and Codex refuses some it reads.
+  if (!relevantIn(item, project) || item.link?.broken === true || item.codexError !== undefined) return false;
   const states = accountStates(inv, item, project)?.map((a) => a.state) ?? [stateHere(inv, item, project)];
   return states.some(stateLoads);
 }
@@ -306,7 +293,7 @@ export function loadsHere(inv: Inventory, item: Extension, project: string | und
 function brings(install: Extension, item: Extension): boolean {
   const own = install.location;
   const loc = item.location;
-  if (loc.tool !== own.tool || loc.plugin !== own.plugin || installScope(item) !== installScope(install)) return false;
+  if (loc.tool !== own.tool || loc.plugin !== own.plugin || loc.installScope !== own.installScope) return false;
   // One install of the plugin: the same project (or none), files inside its install path.
   const sameProject = own.project === undefined ? loc.project === undefined : samePath(loc.project, own.project);
   return sameProject && isWithin(loc.file, own.file);

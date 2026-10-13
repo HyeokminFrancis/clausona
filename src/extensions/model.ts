@@ -1,4 +1,5 @@
 import type { ToolName } from "../types.js";
+import type { McpRule, McpTarget } from "./mcp-policy.js";
 
 /**
  * The extensions inventory: every skill, MCP server, hook and plugin that the Claude Code and
@@ -21,8 +22,17 @@ export type Location = {
   project?: string;
   /** `<plugin>@<marketplace>`, for what a plugin brings. */
   plugin?: string;
-  /** For what a plugin brings: the Claude accounts that have the plugin installed. */
+  /**
+   * For what a plugin brings: the Claude accounts that have the plugin installed. For a Global
+   * Claude skill that not every account loads: the accounts whose skills (or commands) folder
+   * is the primary's.
+   */
   accounts?: string[];
+  /**
+   * For a plugin install and what it brings: the scope it is installed at, as
+   * `installed_plugins.json` records it (an install for the home dir reads as `user`).
+   */
+  installScope?: "user" | "project" | "local";
 };
 
 /** Where a hook command sits in its file: hooks[event][group].hooks[index], under "hooks" or at the root. */
@@ -55,10 +65,27 @@ export type Extension = {
    * dir's - so two entries that lead to one folder are one copy. Absent for a broken link.
    */
   realFolder?: string;
+  /**
+   * Codex skills: the skills folder the walk that found it started from, which a skill can sit
+   * folders below. A Claude skill's is the folder its own is in.
+   */
+  skillsDir?: string;
   /** Skills: when the folder appeared (birthtime, else mtime), for the cleanup grace period. */
   createdAt?: number;
   /** Skills: the keys Claude Code may record its use under in `skillUsage`. */
   usageKeys?: string[];
+  /**
+   * Claude skills: set when the SKILL.md has no front matter. Claude Code loads it under its
+   * folder's name, with no description of when to use it.
+   */
+  noFrontMatter?: true;
+  /**
+   * Why Codex does not load this, in its tag's words: a skill whose SKILL.md has `no front
+   * matter` (no block delimited by `---`) or whose `name too long` (over 64 characters), and a
+   * hook in an `invalid hooks file` (more than `hooks` and `description` at its top). Unlike
+   * Claude Code, Codex lists no skill without front matter, so it does not load.
+   */
+  codexError?: "no front matter" | "name too long" | "invalid hooks file";
   /** What is shown about it, already redacted. */
   summary?: Record<string, string>;
   /** Hooks: where the command sits in its file. */
@@ -96,9 +123,30 @@ export type SettingsLayer = "managed" | "local" | "project" | "user";
 
 type SettingsMap = { file: string; layer: SettingsLayer; project?: string; map: Record<string, unknown> };
 
+/** A Claude Code setting that turns a whole kind off: every hook, or the skills that come with it. */
+export type ClaudeFlag = "disableAllHooks" | "disableBundledSkills";
+
 export type StateFacts = {
   claudeSkillOverrides: SettingsMap[];
   claudeEnabledPlugins: SettingsMap[];
+  /** Each settings file's `disableAllHooks` and `disableBundledSkills`, where it sets one to true or false. */
+  claudeFlags: { file: string; layer: SettingsLayer; project?: string; key: ClaudeFlag; value: boolean }[];
+  /**
+   * Each settings file's `allowedMcpServers` and `deniedMcpServers` where it has a list, and
+   * `managedOnly` where a managed one sets `allowManagedMcpServersOnly`.
+   */
+  claudeMcpPolicy: {
+    file: string;
+    layer: SettingsLayer;
+    project?: string;
+    allowed?: McpRule[];
+    denied?: McpRule[];
+    managedOnly?: true;
+  }[];
+  /** managed-mcp.json, while it is there: Claude Code then starts its servers and no other. */
+  claudeManagedMcp?: string;
+  /** Claude MCP server id -> what it starts, which the lists match. Never printed. */
+  mcpTargets: Record<string, McpTarget>;
   /** `.claude.json` → projects[P].disabledMcpServers, per account. */
   claudeMcpDisabled: { file: string; profile: string; project: string; names: string[] }[];
   /** `.mcp.json` approvals, from settings and from an account's project entry. */
@@ -111,7 +159,12 @@ export type StateFacts = {
     disabled: string[];
     enableAll: boolean;
   }[];
-  codexSkillConfig: { file: string; name?: string; path?: string; enabled: boolean }[];
+  /**
+   * `[[skills.config]]` in the user config.toml. `realPath` is `path` with its folder resolved
+   * through every link, when that folder exists: Codex takes the link's path and the real one
+   * alike.
+   */
+  codexSkillConfig: { file: string; name?: string; path?: string; realPath?: string; enabled: boolean }[];
   codexMcpEnabled: { file: string; project?: string; name: string; enabled: boolean }[];
   /**
    * Item id -> valueHash of its raw entry, for MCP servers and hooks: a write checks the entry is
@@ -123,18 +176,53 @@ export type StateFacts = {
    * .codex folder only when it trusts the project.
    */
   codexTrust: { project: string; trusted: boolean }[];
+  /**
+   * Each `[plugins."<plugin>@<marketplace>"]` table in the user config.toml and in a project's:
+   * Codex loads a plugin only where a table names it. `enabled` is absent when the table does not
+   * set it, which leaves the plugin on.
+   */
+  codexPlugins: { file: string; project?: string; plugin: string; enabled?: boolean }[];
+  /**
+   * `plugins."<id>".mcp_servers.<name>.enabled`: a plugin's server switch, in the same files.
+   * With `default`, the server's own `enabled` in the plugin's file, which Codex starts from
+   * and a switch in config.toml overrides.
+   */
+  codexPluginServers: {
+    file: string;
+    project?: string;
+    plugin: string;
+    name: string;
+    enabled: boolean;
+    default?: true;
+  }[];
+  /**
+   * Each Codex hook's trust identity, by item id: the keys Codex records its trust under -
+   * for the user's hooks.json, one per Codex profile, whose path is in the key - and the hash
+   * of its definition that a trust must match. `builtin` for a bundled plugin's cleanup hook,
+   * which Codex runs without a review. A hook Codex never runs, such as a prompt hook, has none.
+   */
+  codexHookTrust: { id: string; keys: string[]; hash: string; builtin?: true }[];
+  /** `[hooks.state."<key>"]` in the user config.toml: one hook's `enabled`, and the hash it was trusted at. */
+  codexHookStates: { file: string; key: string; enabled?: boolean; trustedHash?: string }[];
 };
 
 export function emptyFacts(): StateFacts {
   return {
     claudeSkillOverrides: [],
     claudeEnabledPlugins: [],
+    claudeFlags: [],
+    claudeMcpPolicy: [],
+    mcpTargets: {},
     claudeMcpDisabled: [],
     claudeMcpjson: [],
     codexSkillConfig: [],
     codexMcpEnabled: [],
     fingerprints: {},
     codexTrust: [],
+    codexPlugins: [],
+    codexPluginServers: [],
+    codexHookTrust: [],
+    codexHookStates: [],
   };
 }
 

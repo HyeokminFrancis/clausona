@@ -113,7 +113,16 @@ describe("who may touch the file system", () => {
     expect(importers((module) => module === "extensions/writers/fs")).toEqual(["extensions/apply.ts"]);
   });
 
-  it("has git-tracked.ts alone start a process (git ls-files, which only reads)", () => {
+  it("takes from core/shared-links only inspectSharedLink, which reads a link as doctor does", () => {
+    const shared = (module: string) => module === "core/shared-links";
+    expect(importers(shared)).toEqual(["extensions/sources/claude-context.ts"]);
+    const lines = text("extensions/sources/claude-context.ts")
+      .split(/\r?\n/)
+      .filter((line) => importsIn(line, "extensions/sources/claude-context.ts").some((found) => shared(found.module)));
+    expect(lines).toEqual(['import { inspectSharedLink } from "../../core/shared-links.js";']);
+  });
+
+  it("has git-tracked.ts alone start a process (git ls-files, check-ignore and config, which only read)", () => {
     expect(FILES).toContain("extensions/git-tracked.ts");
     expect(importers((module) => module === "child_process")).toEqual(["extensions/git-tracked.ts"]);
   });
@@ -127,5 +136,52 @@ describe("who may touch the file system", () => {
   it("has the TUI never import the CLI, not even for a type", () => {
     const cli = (module: string) => module === "extensions/cli" || module === "extensions/cli-help";
     expect(importers(cli).filter((file) => file.startsWith("tui/"))).toEqual([]);
+  });
+});
+
+/** Every test file under `dir`, relative to src/. */
+function tests(dir: string): string[] {
+  return readdirSync(path.join(SRC, dir), { recursive: true, encoding: "utf8" })
+    .map((file) => `${dir}/${file.split(path.sep).join("/")}`)
+    .filter((file) => /\.test\.tsx?$/.test(file))
+    .sort();
+}
+
+/** What each call of `name(` in `source` is given: the text between its parentheses. */
+function callArgs(source: string, name: string): string[] {
+  const found: string[] = [];
+  for (const match of source.matchAll(new RegExp(`\\b${name}\\(`, "g"))) {
+    const start = (match.index ?? 0) + match[0].length;
+    let depth = 1;
+    let at = start;
+    for (; at < source.length && depth > 0; at++) {
+      if (source[at] === "(") depth++;
+      else if (source[at] === ")") depth--;
+    }
+    found.push(source.slice(start, at - 1));
+  }
+  return found;
+}
+
+describe("what the tests read", () => {
+  it("stops every parent .mcp.json walk at the test's home, so no test reads the machine's own", () => {
+    const files = [...tests("extensions"), ...tests("tui")];
+    const loose: string[] = [];
+    for (const file of files) {
+      const source = text(file);
+      // A Claude context only reaches the walk through readClaudeMcp.
+      const calls = [
+        "loadInventory",
+        "runExtensionsCommand",
+        ...(source.includes("readClaudeMcp(") ? ["loadClaudeContext"] : []),
+      ];
+      for (const name of calls) {
+        for (const args of callArgs(source, name)) {
+          if (!args.includes("inventoryOptions(") && !args.includes("mcpjsonStop")) loose.push(`${file}: ${name}`);
+        }
+      }
+    }
+    expect(files.length).toBeGreaterThan(20);
+    expect(loose).toEqual([]);
   });
 });

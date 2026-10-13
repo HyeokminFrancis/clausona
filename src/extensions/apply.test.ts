@@ -31,9 +31,9 @@ import {
 } from "./apply.js";
 import { tagsOf } from "./describe.js";
 import { loadInventory } from "./inventory.js";
-import type { Inventory } from "./model.js";
+import type { Extension, Inventory } from "./model.js";
 import { type Plan, type PlanContext, plan } from "./plan.js";
-import { tilde } from "./present.js";
+import { stateHere, tilde } from "./present.js";
 import { hashTree } from "./read.js";
 import { type ItemKind, rowsIn, type ScopeId, type ScopeRow, type ToolName } from "./scopes.js";
 import { TestHome } from "./test-home.js";
@@ -115,12 +115,7 @@ function home(more?: More): { h: TestHome; app: string; web: string } {
 
 // The managed settings are the home's own, so no test reads this machine's.
 function load(h: TestHome, cwd: string): Promise<Inventory> {
-  return loadInventory({
-    homeDir: h.home,
-    registry: h.registry,
-    cwd,
-    managedSettings: h.path("managed-settings.json"),
-  });
+  return loadInventory(h.inventoryOptions(cwd, h.path("managed-settings.json")));
 }
 
 function contextFor(h: TestHome, inv: Inventory, project: string | undefined): PlanContext {
@@ -251,6 +246,7 @@ describe("apply", () => {
     expect(await lastOperation(env)).toEqual({
       operation,
       files: [{ path: manifest.entries[0]?.path, action: "remove" }],
+      kept: [],
     });
     const undone = await undo(env);
     expect(undone).toMatchObject({ operation: { id: operation.id }, skipped: [] });
@@ -304,6 +300,64 @@ describe("apply", () => {
 
     expect(result).toMatchObject({ status: "stopped", done: 0, total: 2, stop: { reason: "changed", file: work } });
     expect(await lastOperation(env)).toBeNull();
+  });
+
+  it("adds a line to a text file as its last, in its own line endings, once, and undo leaves it in", async () => {
+    const { h } = home();
+    const env = writeEnvFor(h.home, clock());
+    const textPlan = (file: string): Plan => ({
+      command: "skills",
+      verb: "off",
+      reach: "here",
+      question: "Turn off eli5 in this project?",
+      done: "Turned off eli5 in this project",
+      changes: [
+        {
+          kind: "text",
+          file,
+          add: "**/.claude/settings.local.json",
+          create: true,
+          lines: [{ file, change: "edit", what: "adds **/.claude/settings.local.json", tracked: false, rows: ["r"] }],
+        },
+      ],
+      unchanged: [],
+      refused: [],
+      notes: [],
+      project: null,
+    });
+    const crlf = h.write("ignore-crlf", "node_modules\r\n.DS_Store");
+    expect(await apply(textPlan(crlf), env)).toMatchObject({ status: "applied", done: 1 });
+    expect(readFileSync(crlf, "utf8")).toBe("node_modules\r\n.DS_Store\r\n**/.claude/settings.local.json\r\n");
+    // There already: nothing to write, and no operation.
+    const before = opDirs(env);
+    expect(await apply(textPlan(crlf), env)).toEqual({ status: "nothing" });
+    expect(opDirs(env)).toEqual(before);
+    // Claude Code never takes the line out, so undo leaves it: a change of that line alone has
+    // nothing to undo.
+    expect(await lastOperation(env)).toBeNull();
+    expect(await undo(env)).toBeNull();
+    expect(readFileSync(crlf, "utf8")).toBe("node_modules\r\n.DS_Store\r\n**/.claude/settings.local.json\r\n");
+    // Made where it is not there, with the folders it needs, and kept on undo with the change it
+    // came with, which goes back.
+    const made = h.path("xdg", "git", "ignore");
+    const local = h.path("repos", "app", ".claude", "settings.local.json");
+    const withFile = textPlan(made);
+    withFile.changes.unshift({
+      kind: "json",
+      file: local,
+      edits: [{ op: "set", path: ["skillOverrides", "eli5"], value: "off" }],
+      expect: [],
+      create: true,
+      lock: false,
+      lines: [{ file: local, change: "create", what: "skillOverrides.eli5 → off", tracked: false, rows: ["r"] }],
+    });
+    await apply(withFile, env);
+    expect(readFileSync(made, "utf8")).toBe("**/.claude/settings.local.json\n");
+    const kept = [{ path: made, line: "**/.claude/settings.local.json" }];
+    expect(await lastOperation(env)).toMatchObject({ files: [{ path: local, action: "remove" }], kept });
+    expect(await undo(env)).toMatchObject({ restored: [local], skipped: [], kept });
+    expect(existsSync(local)).toBe(false);
+    expect(readFileSync(made, "utf8")).toBe("**/.claude/settings.local.json\n");
   });
 
   it("names an operation by its time, command and verb", () => {
@@ -509,6 +563,72 @@ describe("apply: folders and links", () => {
     expect(undone).toMatchObject({ restored: [realpathSync.native(folder)], skipped: [] });
     expect(await hashTree(folder)).toBe(before);
     expect(existsSync(backup)).toBe(false);
+  });
+
+  it("turns a Codex project skill reached through a link off by the path it is listed at", async () => {
+    // Codex 0.159.3 reports such a skill at its real path, and matches a [[skills.config]] path
+    // through links: the listed path, the real one and /tmp for /private/tmp all turn it off
+    // (checked with codex app-server's skills/list, #125). The listed one is what is written.
+    const { h, app } = home((h) => {
+      h.skill("elsewhere", "p-link");
+      h.link("elsewhere/p-link", "repos/app/.agents/skills/p-link");
+    });
+    const env = writeEnvFor(h.home, clock());
+    const config = h.path(".codex", "config.toml");
+    const before = readFileSync(config, "utf8");
+    const listed = path.join(app, ".agents", "skills", "p-link", "SKILL.md");
+    const p = await planNow(h, app, "skills", "off", "here", (inv) => [rowIn(inv, app, "project", "p-link", "codex")]);
+    expect(p.changes).toMatchObject([{ edits: [{ op: "skill-config", selector: { path: listed }, enabled: false }] }]);
+
+    await apply(p, env);
+    expect(readFileSync(config, "utf8")).toBe(
+      `${before}\n[[skills.config]]\npath = ${JSON.stringify(listed)}\nenabled = false\n`,
+    );
+    expect(readFileSync(config, "utf8")).not.toContain(realpathSync.native(h.path("elsewhere")));
+    // Read back as that skill's entry: off here, and on again by taking it out.
+    const again = await planNow(h, app, "skills", "on", "here", (inv) => [
+      rowIn(inv, app, "project", "p-link", "codex"),
+    ]);
+    expect(again.changes).toMatchObject([{ edits: [{ selector: { path: listed }, enabled: null }] }]);
+  });
+
+  it("turns a linked Codex skill that Codex turned off by its real path on, off and on again", async () => {
+    // Codex's own UI writes the real path of a skill reached through a link (#125). Each change
+    // edits or takes out every entry that names the skill, by either path, and adds one only when
+    // none does: one entry never says on while another says off.
+    const { h, app } = home((h) => {
+      h.skill("elsewhere", "p-link");
+      h.link("elsewhere/p-link", "repos/app/.agents/skills/p-link");
+    });
+    const env = writeEnvFor(h.home, clock());
+    const config = h.path(".codex", "config.toml");
+    const real = path.join(realpathSync.native(h.path("elsewhere")), "p-link", "SKILL.md");
+    const listed = path.join(app, ".agents", "skills", "p-link", "SKILL.md");
+    writeFileSync(
+      config,
+      `${readFileSync(config, "utf8")}\n[[skills.config]]\npath = ${JSON.stringify(real)}\nenabled = false\n`,
+    );
+    const pLink: Pick = (inv, project) => [rowIn(inv, project, "project", "p-link", "codex")];
+    const stateNow = async () => {
+      const inv = await load(h, app);
+      return stateHere(inv, pLink(inv, app)[0]?.items[0] as Extension, app).value;
+    };
+    const entries = () => readFileSync(config, "utf8").match(/^path = .*$/gm) ?? [];
+    expect(await stateNow()).toBe("off");
+
+    const on = await planNow(h, app, "skills", "on", "here", pLink);
+    expect(on.changes).toMatchObject([{ edits: [{ op: "skill-config", selector: { path: listed }, enabled: null }] }]);
+    await apply(on, env);
+    expect(entries()).toEqual([]);
+    expect(await stateNow()).toBe("on");
+
+    await apply(await planNow(h, app, "skills", "off", "here", pLink), env);
+    expect(entries()).toEqual([`path = ${JSON.stringify(listed)}`]);
+    expect(await stateNow()).toBe("off");
+
+    await apply(await planNow(h, app, "skills", "on", "here", pLink), env);
+    expect(entries()).toEqual([]);
+    expect(await stateNow()).toBe("on");
   });
 
   it("removes a linked skill's link, never its folder, and makes the link again", async () => {
@@ -793,6 +913,7 @@ describe("undo: what clausona keeps aside goes with its edit", () => {
         { path: keptMine, action: "remove" },
         { path: mine, action: "edit back" },
       ],
+      kept: [],
     });
 
     expect(await undo(env)).toMatchObject({

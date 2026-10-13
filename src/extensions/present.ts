@@ -1,24 +1,13 @@
 import path from "node:path";
 
-import type { EffectiveState, Extension, Inventory } from "./model.js";
-import { isWithin, samePath } from "./read.js";
+import type { EffectiveState, Extension, Inventory, Project } from "./model.js";
+import { isWithin, pathKey, samePath } from "./read.js";
 import { isMcpjsonServer, stateOf } from "./state.js";
 
 /**
  * How the inventory reads on screen, shared by `clausona skills|mcp|hooks ls` and the dashboard:
  * labels for profiles, paths and locations, and the state of an item as either one shows it.
  */
-
-const SCOPE_WORD = {
-  global: "global",
-  account: "account",
-  project: "project",
-  local: "local",
-  plugin: "plugin",
-  synced: "claude.ai",
-  builtin: "built-in",
-  managed: "managed",
-} as const;
 
 /** A profile id without its tool: `claude:work` is `work`. */
 export function shortProfile(id: string): string {
@@ -73,24 +62,41 @@ export function tildeIn(text: string, homeDir: string): string {
 }
 
 /**
- * A project in a word: its folder's name, and `~` for the home dir. A parent dir read for its
- * `.mcp.json` alone is no project, and goes by its path: `~/repos`.
+ * A project in a word: its folder's name, and `~` for the home dir. Where two recorded projects
+ * share a folder name, the folder above it too - `work/app`, `personal/app` - or the path where
+ * even that is one. A parent dir read for its `.mcp.json` alone is no project, and goes by its
+ * path: `~/repos`. The CLI, JSON and the screen all name a project so.
  */
 export function projectName(dir: string, inv: Pick<Inventory, "homeDir" | "projects">): string {
   if (samePath(dir, inv.homeDir)) return "~";
-  return inv.projects.some((p) => samePath(p.path, dir)) ? path.basename(dir) : tilde(dir, inv.homeDir);
+  return projectNames(inv).get(pathKey(dir)) ?? tilde(dir, inv.homeDir);
 }
 
-/** Where an item is defined, in a few words: `project app`, `local work · ~`, `plugin superpowers`. */
-export function whereLabel(item: Extension, inv: Pick<Inventory, "homeDir" | "projects">): string {
-  const loc = item.location;
-  const parts: string[] = [SCOPE_WORD[loc.scope]];
-  if (loc.scope === "plugin" && loc.plugin) parts.push(loc.plugin.split("@")[0] ?? loc.plugin);
-  else if (loc.profile) parts.push(shortProfile(loc.profile));
-  if (loc.project && loc.scope !== "plugin") {
-    parts.push(`${loc.profile ? "· " : ""}${projectName(loc.project, inv)}`);
-  }
-  return parts.join(" ");
+/** How many of each name there are. */
+function counted(names: string[]): (name: string) => number {
+  const counts = new Map<string, number>();
+  for (const name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
+  return (name) => counts.get(name) ?? 0;
+}
+
+/** Each recorded project's name by path key, worked out once per list of projects. */
+const namesCache = new WeakMap<readonly Project[], { homeDir: string; names: Map<string, string> }>();
+
+function projectNames(inv: Pick<Inventory, "homeDir" | "projects">): Map<string, string> {
+  const cached = namesCache.get(inv.projects);
+  if (cached?.homeDir === inv.homeDir) return cached.names;
+  const named = inv.projects.map((p) => ({
+    dir: p.path,
+    name: samePath(p.path, inv.homeDir) ? "~" : path.basename(p.path),
+  }));
+  const shared = counted(named.map((p) => p.name));
+  const longer = named.map((p) =>
+    shared(p.name) > 1 ? { ...p, name: path.join(path.basename(path.dirname(p.dir)), p.name) } : p,
+  );
+  const still = counted(longer.map((p) => p.name));
+  const names = new Map(longer.map((p) => [pathKey(p.dir), still(p.name) > 1 ? tilde(p.dir, inv.homeDir) : p.name]));
+  namesCache.set(inv.projects, { homeDir: inv.homeDir, names });
+  return names;
 }
 
 /**
@@ -110,14 +116,18 @@ export function stateHere(inv: Inventory, item: Extension, project: string | und
 
 export type AccountState = { profile: string; state: EffectiveState };
 
-/** Whether some account's own skills folder has a Claude skill of `name`. */
-function ownSkillNamed(inv: Inventory, name: string): boolean {
+/**
+ * Whether a personal Claude skill of `name` loads in some accounts only: one in an account's own
+ * skills folder, or a Global one that an account whose skills folder is its own does not load.
+ */
+function personalSkillInSome(inv: Inventory, name: string): boolean {
   return inv.items.some(
     (other) =>
       other.kind === "skill" &&
       other.location.tool === "claude" &&
-      other.location.scope === "account" &&
-      other.name === name,
+      other.name === name &&
+      (other.location.scope === "account" ||
+        (other.location.scope === "global" && other.location.accounts !== undefined)),
   );
 }
 
@@ -127,8 +137,8 @@ function ownSkillNamed(inv: Inventory, name: string): boolean {
  *   each account switches, and a local server can hide. Only the accounts that can load it
  *   count: Claude accounts that have recorded the project, and for a plugin's server the ones
  *   with the plugin installed. Codex records projects too, but never loads a Claude server;
- * - a Claude project skill that an account's own same-name skill hides in that account only, in
- *   every Claude account.
+ * - a Claude project skill that a same-name personal skill hides in some accounts only - an
+ *   account's own, or a Global one that not every account loads - in every Claude account.
  * Undefined for any other item, and for such a server when no such account has recorded the
  * project.
  */
@@ -143,7 +153,7 @@ export function accountStates(
   const read = (profiles: string[]) =>
     profiles.map((profile) => ({ profile, state: stateOf(inv, item, here, profile) }));
   if (item.kind === "skill") {
-    return loc.scope === "project" && ownSkillNamed(inv, item.name) ? read(inv.claudeProfiles) : undefined;
+    return loc.scope === "project" && personalSkillInSome(inv, item.name) ? read(inv.claudeProfiles) : undefined;
   }
   if (item.kind !== "mcp") return undefined;
   const accounts = loc.scope === "plugin" && loc.accounts ? loc.accounts : inv.claudeProfiles;

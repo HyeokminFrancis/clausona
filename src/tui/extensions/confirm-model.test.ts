@@ -292,6 +292,48 @@ describe("dialogView: a plan", () => {
     expect(second.endsWith("skills.config eli5 → off")).toBe(true);
   });
 
+  it("says what a .mcp.json server it approves runs, under its line and whole, wrapped to the width", () => {
+    const runs = `npx docs-mcp --config ${at("repos", "app", "docs.json")} --api-key <hidden>`;
+    const plan = planOf({
+      command: "mcp",
+      verb: "on",
+      question: "Turn on docs-search in this project?",
+      changes: [
+        removal(
+          line(at("repos", "app", ".claude", "settings.local.json"), {
+            change: "create",
+            what: "enabledMcpjsonServers + docs-search",
+            runs,
+          }),
+        ),
+      ],
+    });
+    const local = tilded("repos", "app", ".claude", "settings.local.json");
+    // The home dir as ~, as the details write it.
+    const shown = `npx docs-mcp --config ${tilded("repos", "app", "docs.json")} --api-key <hidden>`;
+    expect(texts(dialogOf(plan), 100, 12)).toEqual([
+      "Turn on docs-search in this project?",
+      "",
+      `${local}  enabledMcpjsonServers + docs-search`,
+      `  runs ${shown}`,
+      "",
+      BACKUP_LINE,
+      PRESS_U,
+    ]);
+    // Too long for the width: the rest on the lines below, never cut off.
+    const narrow = texts(dialogOf(plan), 30, 20);
+    const first = narrow.findIndex((text) => text.startsWith("  runs "));
+    const rest = narrow.slice(first + 1);
+    const more = rest.slice(
+      0,
+      rest.findIndex((text) => !text.startsWith("       ")),
+    );
+    const block = [narrow[first] ?? "", ...more];
+    expect(block.length).toBeGreaterThan(2);
+    expect(block.map((text) => text.slice(7)).join(" ")).toBe(shown);
+    expect(narrow.every((text) => text.length <= 30)).toBe(true);
+  });
+
   it("names a copy clausona kept in words, never by its path", () => {
     const kept = (name: string, account: string) =>
       removal(line(path.join(STASH, `${name}.json`), { change: "delete", account, rows: ["github"] }));
@@ -338,6 +380,7 @@ describe("dialogView: undo", () => {
       { path: at("repos", "app", ".claude", "settings.local.json"), action: "remove" },
       { path: at(".claude.json"), action: "edit back" },
     ],
+    kept: [],
   };
 
   it("asks, lists each file and what undo does to it, and says what it leaves alone", () => {
@@ -355,6 +398,21 @@ describe("dialogView: undo", () => {
     expect(view.hints).toEqual([
       { keys: "y", action: "undo" },
       { keys: "n/esc", action: "cancel" },
+    ]);
+  });
+
+  it("says the line it leaves in git's global ignore file, as Claude Code does, where it lists the files", () => {
+    const ignore = at(".config", "git", "ignore");
+    const kept = {
+      ...preview,
+      files: preview.files.slice(0, 1),
+      kept: [{ path: ignore, line: "**/.claude/settings.local.json" }],
+    };
+    const view = dialogView({ type: "undo", preview: kept, top: 0, busy: false }, { width: 100, height: 9, ...OPTS });
+    const local = tilded("repos", "app", ".claude", "settings.local.json");
+    expect(view.lines.map((l) => l.text).slice(2, 4)).toEqual([
+      `${local}  remove`,
+      `${tilded(".config", "git", "ignore").padEnd(local.length)}  keeps **/.claude/settings.local.json, as Claude Code does`,
     ]);
   });
 
@@ -410,6 +468,7 @@ describe("the status after an apply or an undo", () => {
       restored: [],
       removed: [],
       skipped: [],
+      kept: [],
       ...more,
     });
     const json = at(".claude.json");

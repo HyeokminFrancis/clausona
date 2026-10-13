@@ -99,6 +99,24 @@ describe("Claude skills", () => {
     ).toBe("on");
   });
 
+  it("turns the built-in skills off under disableBundledSkills, over skillOverrides, and no other", () => {
+    const api = skill("claude-api", "builtin");
+    const local = `${P}/.claude/settings.local.json`;
+    const i = inv([api, eli5], {
+      claudeSkillOverrides: [{ file: "/u/settings.json", layer: "user", map: { "claude-api": "name-only" } }],
+      claudeFlags: [
+        { file: "/u/settings.json", layer: "user", key: "disableBundledSkills", value: true },
+        { file: local, layer: "local", project: P, key: "disableBundledSkills", value: false },
+      ],
+    });
+    const off = { value: "off", setBy: { file: "/u/settings.json", key: "disableBundledSkills" } };
+    expect(stateOf(i, api, Q)).toEqual(off);
+    expect(stateOf(i, api, undefined)).toEqual(off);
+    // P's local settings turn them back on there, where the override applies again.
+    expect(stateOf(i, api, P).value).toBe("name-only");
+    expect(stateOf(i, eli5, Q)).toEqual({ value: "on" });
+  });
+
   it("follows the plugin for a plugin skill and marks a project skill a global one shadows", () => {
     const fromPlugin = skill("sp:brainstorming", "plugin", { plugin: "sp@m" });
     const local = skill("eli5", "project", { project: P });
@@ -199,6 +217,150 @@ describe("Claude MCP", () => {
     expect(stateOf(disabledForA, fromPlugin, P, "claude:b").value).toBe("on");
     // With no account named, no account's disabledMcpServers entry applies.
     expect(stateOf(disabledForA, fromPlugin, P).value).toBe("on");
+  });
+});
+
+describe("Claude MCP under managed-mcp.json, allowedMcpServers and deniedMcpServers", () => {
+  const userServer = (name: string, profile = "claude:a") =>
+    ext("mcp", `${name}@${profile}`, { tool: "claude", scope: "account", profile, file: `/u/${profile}.json` });
+  const named = (item: Extension, name: string): Extension => ({ ...item, id: `${item.id}:${name}`, name });
+  const gh = named(userServer("gh"), "github");
+  const ghB = named(userServer("gh", "claude:b"), "github");
+  const fs = named(userServer("fs"), "files");
+  const remote = named(userServer("remote"), "remote");
+  const company = ext("mcp", "company", { tool: "claude", scope: "managed", file: "/m/managed-mcp.json" });
+  const items = [gh, ghB, fs, remote, company];
+  const targets: StateFacts["mcpTargets"] = {
+    [gh.id]: { command: "hash-gh", vars: false },
+    [ghB.id]: { command: "hash-gh", vars: false },
+    [fs.id]: { command: "hash-fs", vars: false },
+    [remote.id]: { url: "https://mcp.example.com/api", vars: false },
+    [company.id]: { url: "https://company.example.com/mcp", vars: false },
+  };
+  const off = (file: string, key: string) => ({ value: "off", setBy: { file, key } });
+
+  it("starts only managed-mcp.json's servers while it is there", () => {
+    const i = inv(items, { mcpTargets: targets, claudeManagedMcp: "/m/managed-mcp.json" });
+    for (const project of [P, undefined]) {
+      expect(stateOf(i, gh, project, "claude:a")).toEqual(off("/m/managed-mcp.json", "managed-mcp.json"));
+      expect(stateOf(i, company, project, "claude:a")).toEqual({ value: "on" });
+    }
+    expect(claudeMcpTaken(i, "github", P, "claude:a")).toBeUndefined();
+  });
+
+  it("turns off in every account what a denylist entry matches, by name, command or URL", () => {
+    const i = inv(items, {
+      mcpTargets: targets,
+      claudeMcpPolicy: [
+        { file: "/m/managed.json", layer: "managed", denied: [{ serverName: "files" }] },
+        { file: "/u/settings.json", layer: "user", denied: [{ serverCommand: "hash-gh" }] },
+        {
+          file: `${P}/.claude/settings.json`,
+          layer: "project",
+          project: P,
+          denied: [{ serverUrl: "https://*.example.com/*" }],
+        },
+      ],
+    });
+    expect(stateOf(i, fs, Q, "claude:a")).toEqual(off("/m/managed.json", "deniedMcpServers"));
+    for (const copy of [gh, ghB]) {
+      expect(stateOf(i, copy, Q, copy.location.profile)).toEqual(off("/u/settings.json", "deniedMcpServers"));
+    }
+    // A project's list holds in that project; the denylist reaches managed servers too.
+    expect(stateOf(i, remote, P, "claude:a")).toEqual(off(`${P}/.claude/settings.json`, "deniedMcpServers"));
+    expect(stateOf(i, remote, Q, "claude:a")).toEqual({ value: "on" });
+    expect(stateOf(i, company, P, "claude:a")).toEqual(off(`${P}/.claude/settings.json`, "deniedMcpServers"));
+  });
+
+  it("with an allowlist, keeps on only what an entry admits, a stdio server by command once there is one", () => {
+    const names = inv(items, {
+      mcpTargets: targets,
+      claudeMcpPolicy: [
+        { file: "/m/managed.json", layer: "managed", allowed: [{ serverName: "github" }, { serverName: "remote" }] },
+      ],
+    });
+    expect(stateOf(names, gh, P, "claude:a")).toEqual({ value: "on" });
+    expect(stateOf(names, remote, P, "claude:a")).toEqual({ value: "on" });
+    expect(stateOf(names, fs, P, "claude:a")).toEqual(off("/m/managed.json", "allowedMcpServers"));
+    // managed-mcp.json's own servers need no entry.
+    expect(stateOf(names, company, P, "claude:a")).toEqual({ value: "on" });
+
+    // With a serverCommand entry, a name no longer admits a stdio server; a remote one still by name.
+    const commands = inv(items, {
+      mcpTargets: targets,
+      claudeMcpPolicy: [
+        {
+          file: "/m/managed.json",
+          layer: "managed",
+          allowed: [{ serverName: "github" }, { serverCommand: "hash-fs" }],
+        },
+        { file: "/u/settings.json", layer: "user", allowed: [{ serverName: "remote" }] },
+      ],
+    });
+    expect(stateOf(commands, gh, P, "claude:a")).toEqual(off("/m/managed.json", "allowedMcpServers"));
+    expect(stateOf(commands, fs, P, "claude:a")).toEqual({ value: "on" });
+    // Lists of every file merge: the user's admits remote.
+    expect(stateOf(commands, remote, P, "claude:a")).toEqual({ value: "on" });
+
+    const urls = inv(items, {
+      mcpTargets: targets,
+      claudeMcpPolicy: [
+        {
+          file: "/m/managed.json",
+          layer: "managed",
+          allowed: [{ serverName: "remote" }, { serverUrl: "https://other.example/*" }],
+        },
+      ],
+    });
+    expect(stateOf(urls, remote, P, "claude:a")).toEqual(off("/m/managed.json", "allowedMcpServers"));
+  });
+
+  it("blocks every server but managed-mcp.json's with an empty allowlist, and keeps the managed lists alone under the lock", () => {
+    const empty = inv(items, {
+      mcpTargets: targets,
+      claudeMcpPolicy: [{ file: `${P}/.claude/settings.local.json`, layer: "local", project: P, allowed: [] }],
+    });
+    expect(stateOf(empty, gh, P, "claude:a")).toEqual(off(`${P}/.claude/settings.local.json`, "allowedMcpServers"));
+    expect(stateOf(empty, gh, Q, "claude:a")).toEqual({ value: "on" });
+    expect(stateOf(empty, company, P, "claude:a")).toEqual({ value: "on" });
+    // A managed-mcp.json server whose config reads the user's environment is checked like any other.
+    const fromEnv = inv(items, {
+      mcpTargets: { ...targets, [company.id]: { url: "https://company.example.com/mcp", vars: true } },
+      claudeMcpPolicy: [{ file: "/u/settings.json", layer: "user", allowed: [] }],
+    });
+    expect(stateOf(fromEnv, company, P, "claude:a")).toEqual(off("/u/settings.json", "allowedMcpServers"));
+
+    const locked = inv(items, {
+      mcpTargets: targets,
+      claudeMcpPolicy: [
+        { file: "/m/managed.json", layer: "managed", allowed: [{ serverName: "github" }], managedOnly: true },
+        { file: "/u/settings.json", layer: "user", allowed: [{ serverName: "files" }] },
+      ],
+    });
+    expect(stateOf(locked, gh, P, "claude:a")).toEqual({ value: "on" });
+    expect(stateOf(locked, fs, P, "claude:a")).toEqual(off("/m/managed.json", "allowedMcpServers"));
+  });
+
+  it("lets a copy the lists block hide no other copy", () => {
+    const local = {
+      ...named(
+        ext("mcp", "gh-local", {
+          tool: "claude",
+          scope: "local",
+          profile: "claude:a",
+          project: P,
+          file: "/u/claude:a.json",
+        }),
+        "github",
+      ),
+    };
+    const i = inv([...items, local], {
+      mcpTargets: { ...targets, [local.id]: { command: "hash-local", vars: false } },
+      claudeMcpPolicy: [{ file: "/u/settings.json", layer: "user", denied: [{ serverCommand: "hash-local" }] }],
+    });
+    expect(stateOf(i, local, P, "claude:a")).toEqual(off("/u/settings.json", "deniedMcpServers"));
+    expect(stateOf(i, gh, P, "claude:a")).toEqual({ value: "on" });
+    expect(claudeMcpTaken(i, "github", P, "claude:a")?.id).toBe(gh.id);
   });
 });
 
@@ -350,6 +512,81 @@ describe("Claude plugins and hooks", () => {
   });
 });
 
+describe("Claude hooks under disableAllHooks", () => {
+  const accounts = ["claude:a", "claude:b"];
+  const userHook = ext("hook", "Stop", { tool: "claude", scope: "global", file: "/u/settings.json" });
+  const projectHook = ext("hook", "SessionStart", {
+    tool: "claude",
+    scope: "project",
+    project: P,
+    file: `${P}/.claude/settings.json`,
+  });
+  const managedHook = ext("hook", "PreToolUse", { tool: "claude", scope: "managed", file: "/m/managed.json" });
+  const pluginHook = (plugin: string) =>
+    ext("hook", `PostToolUse ${plugin}`, {
+      tool: "claude",
+      scope: "plugin",
+      plugin,
+      file: `/p/${plugin}/hooks/hooks.json`,
+      accounts,
+    });
+  const [kit, forced] = [pluginHook("kit@m"), pluginHook("forced@m")];
+  const codexHook = ext("hook", "Stop", { tool: "codex", scope: "global", file: "/c/hooks.json" });
+  const enabled: StateFacts["claudeEnabledPlugins"] = [
+    { file: "/m/managed.json", layer: "managed", map: { "forced@m": true } },
+    { file: "/u/settings.json", layer: "user", map: { "kit@m": true } },
+  ];
+  const all = [userHook, projectHook, managedHook, kit, forced, codexHook];
+  const off = (file: string) => ({ value: "off", setBy: { file, key: "disableAllHooks" } });
+
+  it("turns off every hook but the managed ones, and a plugin's that managed settings turn on", () => {
+    const i = inv(all, {
+      claudeEnabledPlugins: enabled,
+      claudeFlags: [{ file: "/u/settings.json", layer: "user", key: "disableAllHooks", value: true }],
+    });
+    for (const project of [P, Q, undefined]) {
+      expect(stateOf(i, userHook, project)).toEqual(off("/u/settings.json"));
+      expect(stateOf(i, kit, project)).toEqual(off("/u/settings.json"));
+      expect(stateOf(i, managedHook, project)).toEqual({ value: "on" });
+      expect(stateOf(i, forced, project).value).toBe("on");
+      expect(stateOf(i, codexHook, project)).toEqual({ value: "on" });
+    }
+    expect(stateOf(i, projectHook, P)).toEqual(off("/u/settings.json"));
+  });
+
+  it("turns off the managed hooks too when managed settings set it", () => {
+    const i = inv(all, {
+      claudeEnabledPlugins: enabled,
+      claudeFlags: [{ file: "/m/managed.json", layer: "managed", key: "disableAllHooks", value: true }],
+    });
+    for (const hook of [userHook, managedHook, kit, forced])
+      expect(stateOf(i, hook, P)).toEqual(off("/m/managed.json"));
+  });
+
+  it("reads it as Claude Code does: the first layer that sets it wins, a project's in that project only", () => {
+    const local = `${P}/.claude/settings.local.json`;
+    const i = inv(all, {
+      claudeFlags: [
+        { file: "/u/settings.json", layer: "user", key: "disableAllHooks", value: true },
+        { file: local, layer: "local", project: P, key: "disableAllHooks", value: false },
+        { file: `${Q}/.claude/settings.json`, layer: "project", project: Q, key: "disableAllHooks", value: true },
+      ],
+    });
+    // P's local settings turn hooks back on there; elsewhere the user's setting holds.
+    expect(stateOf(i, userHook, P)).toEqual({ value: "on" });
+    expect(stateOf(i, userHook, Q)).toEqual(off(`${Q}/.claude/settings.json`));
+    expect(stateOf(i, userHook, undefined)).toEqual(off("/u/settings.json"));
+    // A managed false wins over the user's true.
+    const managedOn = inv(all, {
+      claudeFlags: [
+        { file: "/m/managed.json", layer: "managed", key: "disableAllHooks", value: false },
+        { file: "/u/settings.json", layer: "user", key: "disableAllHooks", value: true },
+      ],
+    });
+    expect(stateOf(managedOn, userHook, P)).toEqual({ value: "on" });
+  });
+});
+
 describe("Codex", () => {
   const repoSkill = ext("skill", "lint", {
     tool: "codex",
@@ -409,6 +646,150 @@ describe("Codex", () => {
   });
 });
 
+describe("Codex plugins", () => {
+  const root = "/c/plugins/cache/m/kit/1.0.0";
+  const at = (file: string) => ({ tool: "codex" as const, scope: "plugin" as const, plugin: "kit@m", file });
+  const kit = ext("plugin", "kit@m", at(root));
+  const plan = ext("skill", "kit:plan", at(`${root}/skills/plan`));
+  const kitdb = ext("mcp", "kitdb", at(`${root}/.mcp.json`));
+  const stop = ext("hook", "Stop", at(`${root}/hooks/hooks.json`));
+  const user = "/c/config.toml";
+  const own = `${P}/.codex/config.toml`;
+
+  it("is off where no [plugins] table names it, on where one does, and off with enabled = false", () => {
+    expect(stateOf(inv([kit]), kit, P)).toEqual({ value: "off" });
+    expect(stateOf(inv([kit], { codexPlugins: [{ file: user, plugin: "kit@m" }] }), kit, P)).toEqual({ value: "on" });
+    const off = inv([kit], { codexPlugins: [{ file: user, plugin: "kit@m", enabled: false }] });
+    expect(stateOf(off, kit, P)).toEqual({ value: "off", setBy: { file: user, key: "plugins.kit@m.enabled" } });
+    expect(stateOf(off, kit, undefined).value).toBe("off");
+  });
+
+  it("takes a trusted project's enabled over the user's, and ignores an untrusted one's", () => {
+    const codexPlugins: StateFacts["codexPlugins"] = [
+      { file: user, plugin: "kit@m", enabled: true },
+      { file: own, project: P, plugin: "kit@m", enabled: false },
+      // A project table that sets no enabled leaves the user's.
+      { file: `${Q}/.codex/config.toml`, project: Q, plugin: "kit@m" },
+    ];
+    const trusted = inv([kit], { codexPlugins, codexTrust: [{ project: P, trusted: true }] });
+    expect(stateOf(trusted, kit, P)).toEqual({ value: "off", setBy: { file: own, key: "plugins.kit@m.enabled" } });
+    expect(stateOf(trusted, kit, Q).value).toBe("on");
+    expect(stateOf(trusted, kit, undefined).value).toBe("on");
+    const untrusted = inv([kit], { codexPlugins, codexTrust: [{ project: P, trusted: false }] });
+    expect(stateOf(untrusted, kit, P)).toEqual({ value: "on", setBy: { file: user, key: "plugins.kit@m.enabled" } });
+  });
+
+  it("gives what a plugin brings its plugin's state, then each thing's own switch", () => {
+    const off = inv([kit, plan, kitdb, stop]);
+    for (const item of [plan, kitdb, stop]) expect(stateOf(off, item, P).value).toBe("off");
+    const on = inv([kit, plan, kitdb, stop], {
+      codexPlugins: [{ file: user, plugin: "kit@m" }],
+      // Codex switches a plugin's skill by its full name, and its server under the plugin's table.
+      codexSkillConfig: [{ file: user, name: "kit:plan", enabled: false }],
+      codexPluginServers: [{ file: user, plugin: "kit@m", name: "kitdb", enabled: false }],
+    });
+    expect(stateOf(on, plan, P)).toEqual({ value: "off", setBy: { file: user, key: "skills.config (name kit:plan)" } });
+    expect(stateOf(on, kitdb, P)).toEqual({
+      value: "off",
+      setBy: { file: user, key: "plugins.kit@m.mcp_servers.kitdb.enabled" },
+    });
+    expect(stateOf(on, stop, P).value).toBe("on");
+  });
+
+  it("reads a plugin server's switch from a trusted project, and never the user server switch of its name", () => {
+    const facts: Partial<StateFacts> = {
+      codexPlugins: [{ file: user, plugin: "kit@m" }],
+      codexPluginServers: [
+        { file: user, plugin: "kit@m", name: "kitdb", enabled: true },
+        { file: own, project: P, plugin: "kit@m", name: "kitdb", enabled: false },
+      ],
+      codexMcpEnabled: [{ file: user, name: "kitdb", enabled: false }],
+      codexTrust: [{ project: P, trusted: true }],
+    };
+    expect(stateOf(inv([kitdb], facts), kitdb, P).value).toBe("off");
+    expect(stateOf(inv([kitdb], facts), kitdb, Q).value).toBe("on");
+  });
+
+  it("starts from a plugin server's own enabled in its file, which a config.toml switch overrides", () => {
+    const file = `${root}/.mcp.json`;
+    const facts: Partial<StateFacts> = {
+      codexPlugins: [{ file: user, plugin: "kit@m" }],
+      codexPluginServers: [{ file, plugin: "kit@m", name: "kitdb", enabled: false, default: true }],
+    };
+    expect(stateOf(inv([kitdb], facts), kitdb, P)).toEqual({
+      value: "off",
+      setBy: { file, key: "mcpServers.kitdb.enabled" },
+    });
+    const back = {
+      ...facts,
+      codexPluginServers: [
+        ...(facts.codexPluginServers ?? []),
+        { file: user, plugin: "kit@m", name: "kitdb", enabled: true },
+      ],
+    };
+    expect(stateOf(inv([kitdb], back), kitdb, P)).toEqual({
+      value: "on",
+      setBy: { file: user, key: "plugins.kit@m.mcp_servers.kitdb.enabled" },
+    });
+  });
+
+  it("keeps a Claude plugin of the same id to Claude's switches, and a Codex one to Codex's", () => {
+    const claudeKit = ext("plugin", "kit@m", { tool: "claude", scope: "plugin", plugin: "kit@m", file: "/k" });
+    const i = inv([kit, claudeKit], {
+      claudeEnabledPlugins: [{ file: "/u/settings.json", layer: "user", map: { "kit@m": true } }],
+    });
+    expect(stateOf(i, claudeKit, P).value).toBe("on");
+    expect(stateOf(i, kit, P).value).toBe("off");
+  });
+});
+
+describe("Codex hooks", () => {
+  const config = "/c/config.toml";
+  const stop = ext("hook", "Stop", { tool: "codex", scope: "global", file: "/c/hooks.json" });
+  const keys = ["/c/hooks.json:stop:0:0", "/w/hooks.json:stop:0:0"];
+  const trust: StateFacts["codexHookTrust"] = [{ id: stop.id, keys, hash: "sha256:now" }];
+  const states = (...entries: StateFacts["codexHookStates"]) =>
+    inv([stop], { codexHookTrust: trust, codexHookStates: entries });
+
+  it("waits for approval until Codex trusts the hook as it is now, in some profile", () => {
+    expect(stateOf(states(), stop, P)).toEqual({ value: "pending-approval" });
+    expect(stateOf(states({ file: config, key: keys[1] ?? "", trustedHash: "sha256:now" }), stop, P)).toEqual({
+      value: "on",
+    });
+    // Trusted at an earlier definition: changed since, so to be reviewed again.
+    expect(stateOf(states({ file: config, key: keys[0] ?? "", trustedHash: "sha256:before" }), stop, P)).toEqual({
+      value: "pending-approval",
+      setBy: { file: config, key: `hooks.state."${keys[0]}".trusted_hash` },
+    });
+  });
+
+  it("is off where every profile's key turns it off, and on where one runs it", () => {
+    const off = states(
+      { file: config, key: keys[0] ?? "", enabled: false },
+      { file: config, key: keys[1] ?? "", enabled: false },
+    );
+    expect(stateOf(off, stop, P)).toEqual({
+      value: "off",
+      setBy: { file: config, key: `hooks.state."${keys[0]}".enabled` },
+    });
+    const one = states(
+      { file: config, key: keys[0] ?? "", enabled: false, trustedHash: "sha256:now" },
+      { file: config, key: keys[1] ?? "", trustedHash: "sha256:now" },
+    );
+    expect(stateOf(one, stop, P).value).toBe("on");
+  });
+
+  it("runs a bundled cleanup hook and a hook with no trust identity, and none of a plugin that is off", () => {
+    const builtin = inv([stop], {
+      codexHookTrust: [{ ...trust[0], id: stop.id, keys, hash: "sha256:now", builtin: true }],
+    });
+    expect(stateOf(builtin, stop, P).value).toBe("on");
+    expect(stateOf(inv([stop]), stop, P).value).toBe("on");
+    const pluginStop = ext("hook", "Stop", { tool: "codex", scope: "plugin", plugin: "kit@m", file: "/k/hooks.json" });
+    expect(stateOf(inv([pluginStop]), pluginStop, P).value).toBe("off");
+  });
+});
+
 describe("isManagedSetting", () => {
   it("is true for a managed settings file the inventory read, and for no other", () => {
     const i = inv([], {
@@ -417,7 +798,13 @@ describe("isManagedSetting", () => {
         { file: "/u/settings.json", layer: "user", map: {} },
       ],
       claudeEnabledPlugins: [{ file: "/m/managed-settings.d/10-a.json", layer: "managed", map: {} }],
+      claudeFlags: [{ file: "/m/managed-settings.d/20-b.json", layer: "managed", key: "disableAllHooks", value: true }],
+      claudeMcpPolicy: [{ file: "/m/managed-settings.d/30-c.json", layer: "managed", denied: [] }],
+      claudeManagedMcp: "/m/managed-mcp.json",
     });
+    expect(isManagedSetting(i, "/m/managed-settings.d/30-c.json")).toBe(true);
+    expect(isManagedSetting(i, "/m/managed-mcp.json")).toBe(true);
+    expect(isManagedSetting(i, "/m/managed-settings.d/20-b.json")).toBe(true);
     expect(isManagedSetting(i, "/m/managed-settings.json")).toBe(true);
     expect(isManagedSetting(i, "/m/managed-settings.d/10-a.json")).toBe(true);
     expect(isManagedSetting(i, "/u/settings.json")).toBe(false);
