@@ -5,6 +5,7 @@ import {
   holdsKey,
   ROUTE_TOOLS,
   type RouteSpec,
+  type RouteTool,
   STRATEGIES,
   type Strategy,
   storedRoute,
@@ -17,18 +18,23 @@ import { checkRouteMembers, membersOf } from "../../lib/route-service.js";
 import type { QuotaSnapshot, Registry } from "../../types.js";
 import { Chrome } from "../components/Chrome.js";
 import { FieldInput } from "../components/FieldInput.js";
+import { keyHintLines } from "../components/KeyHint.js";
 import { color } from "../theme.js";
-import { useTerminalSize } from "../use-width.js";
+import { textLines, useTerminalSize } from "../use-width.js";
 import {
   AccountRows,
   ErrorLines,
   errorLineCount,
   FallbackEntries,
   FallbackPicker,
+  fallbackLines,
   Line,
   NowLine,
+  nowText,
   Radio,
+  radioLines,
   SubLabel,
+  valueWidth,
 } from "./RouteFormRows.js";
 import {
   accountsFor,
@@ -79,12 +85,29 @@ export function formAccounts(registry: Registry): FormAccount[] {
 
 /**
  * The form's lines besides its accounts, when nothing wraps: the chrome's header (5 with its
- * padding) and footer (5), the frame's borders and its other fields' lines (11, the strategy's
- * and the limits' descriptions among them, cut short rather than wrapped), the every-account
- * row, the Now line, and one more, since ink redraws the whole screen once its output is as tall
- * as the terminal. A question, the saving note, the picker and each error take one or more besides.
+ * padding) and footer (5, the key hints one of them), the frame's borders and its other fields'
+ * lines (11, the strategy's and the limits' descriptions among them, cut short rather than
+ * wrapped), the every-account row, the Now line, and one more, since ink redraws the whole screen
+ * once its output is as tall as the terminal. A question, the saving note, the picker and each
+ * error take one or more besides, and so does each line past its first that a row which wraps
+ * takes: the key hints, the radios, the fallback and the Now line in a narrow terminal, and a text
+ * field whose text is longer than its line.
  */
 const FORM_LINES = 24;
+
+/** The columns the chrome's padding takes from the terminal's width. */
+const CHROME_PADDING = 4;
+/** The columns the frame's borders and padding take from the chrome's. */
+const FRAME_PADDING = 4;
+/** The columns a field's name under a label takes: `from` and `exclude` under Patterns, `skip at` under Limits. */
+const SUB_LABEL = 9;
+/** What a text field's text has beside it on its line: its sub-label, and the limit's brackets. */
+const BESIDE: Record<TextField, number> = {
+  name: 0,
+  from: SUB_LABEL,
+  exclude: SUB_LABEL,
+  max: SUB_LABEL + "[".length + "]%".length,
+};
 
 /** The fewest account lines the form shows, however short the terminal. */
 const MIN_ACCOUNT_LINES = 3;
@@ -417,11 +440,45 @@ export function RouteForm(props: RouteFormProps) {
   /** Keys go to the form's question or picker, or nowhere while it saves, rather than to a field. */
   const typing = !asking && picking === null && !saving;
 
-  const { columns = 80, rows } = useTerminalSize();
-  /** Lines in the frame and under it that come and go; the errors as they wrap inside the chrome. */
-  const extra = (asking || saving ? 1 : 0) + (picking !== null ? 1 : 0) + errorLineCount(state.errors, columns - 4);
-  const accountLines = rows === undefined ? undefined : Math.max(MIN_ACCOUNT_LINES, rows - FORM_LINES - extra);
+  const hints = asking
+    ? CONFIRM_HINTS
+    : picking !== null
+      ? PICKER_HINTS
+      : [...(FIELD_HINTS[state.focus] ?? []), ...(recreate ? RECREATE_HINTS : EVERY_FIELD_HINTS)];
+  const toolOptions = ROUTE_TOOLS.map((tool): [RouteTool, string] => [tool, toolLabel(tool)]);
+  const strategyOptions = STRATEGIES.map((strategy): [Strategy, string] => [strategy, strategy]);
+
   const focusOn = (field: FormField) => state.focus === field;
+  /** Where a text field's cursor is: where it was last moved in that field, or else at its end. */
+  const cursorIn = (field: TextField) => (caret?.field === field ? caret.at : state[TEXT_KEYS[field]].length);
+
+  const { columns = 80, rows } = useTerminalSize();
+  /** The chrome's width inside its padding, and a field's value's in the frame. */
+  const inside = columns - CHROME_PADDING;
+  const room = valueWidth(inside - FRAME_PADDING);
+  /**
+   * The lines a text field takes: one for the mask, an example or the limit's default, and those
+   * its text wraps into otherwise, with the cursor's cell after it while the cursor is at its end.
+   */
+  const textFieldLines = (field: TextField) => {
+    const value = state[TEXT_KEYS[field]];
+    if (value === "" || keyShaped(field, value)) return 1;
+    const cell = focusOn(field) && typing && cursorIn(field) >= value.length ? " " : "";
+    return textLines(value + cell, room - BESIDE[field]);
+  };
+  /** The lines the rows that wrap take past their first, at this width. */
+  const wrapped = [
+    keyHintLines(hints, inside),
+    radioLines(toolOptions, room),
+    radioLines(strategyOptions, room),
+    fallbackLines(state.fallback, pool, room),
+    textLines(nowText(preview), inside),
+    ...(Object.keys(TEXT_KEYS) as TextField[]).map(textFieldLines),
+  ].reduce((sum, lines) => sum + lines - 1, 0);
+  /** Lines in the frame and under it that come and go; the errors as they wrap inside the chrome. */
+  const extra =
+    (asking || saving ? 1 : 0) + (picking !== null ? 1 : 0) + errorLineCount(state.errors, inside) + wrapped;
+  const accountLines = rows === undefined ? undefined : Math.max(MIN_ACCOUNT_LINES, rows - FORM_LINES - extra);
 
   function textField(field: TextField, placeholder?: string) {
     const value = state[TEXT_KEYS[field]];
@@ -430,7 +487,7 @@ export function RouteForm(props: RouteFormProps) {
       dispatch({ type: "text", field, value: next });
       setCaret({ field, at });
     };
-    const cursor = caret?.field === field ? caret.at : value.length;
+    const cursor = cursorIn(field);
     if (keyShaped(field, value)) {
       // The input takes the keystrokes and draws nothing, so the value can still be erased.
       return (
@@ -496,22 +553,12 @@ export function RouteForm(props: RouteFormProps) {
       subtitle={original === undefined ? "New route" : `Edit ${original}`}
       question={asking ? "Discard changes? (y/N)" : undefined}
       footer={saving ? "Saving…" : undefined}
-      hints={
-        asking
-          ? CONFIRM_HINTS
-          : picking !== null
-            ? PICKER_HINTS
-            : [...(FIELD_HINTS[state.focus] ?? []), ...(recreate ? RECREATE_HINTS : EVERY_FIELD_HINTS)]
-      }
+      hints={hints}
     >
       <Box flexDirection="column" borderStyle="round" borderColor={color.dim} paddingX={1}>
         <Line {...line("name", "Name")}>{textField("name")}</Line>
         <Line {...line("tool", "Tool")}>
-          <Radio
-            options={ROUTE_TOOLS.map((tool) => [tool, toolLabel(tool)])}
-            selected={state.tool}
-            focused={focusOn("tool")}
-          />
+          <Radio options={toolOptions} selected={state.tool} focused={focusOn("tool")} />
         </Line>
         <AccountRows
           line={line("accounts", "Accounts")}
@@ -524,19 +571,15 @@ export function RouteForm(props: RouteFormProps) {
           lines={accountLines}
         />
         <Line {...line("from", "Patterns")}>
-          {subLabel("from", "from", 9)}
+          {subLabel("from", "from", SUB_LABEL)}
           {textField("from")}
         </Line>
         <Line {...line("exclude", "")}>
-          {subLabel("exclude", "exclude", 9)}
+          {subLabel("exclude", "exclude", SUB_LABEL)}
           {textField("exclude")}
         </Line>
         <Line {...line("strategy", "Strategy")}>
-          <Radio
-            options={STRATEGIES.map((strategy) => [strategy, strategy])}
-            selected={state.strategy}
-            focused={focusOn("strategy")}
-          />
+          <Radio options={strategyOptions} selected={state.strategy} focused={focusOn("strategy")} />
         </Line>
         <Line label="">
           <Text color={color.muted} wrap="truncate-end">
@@ -544,10 +587,15 @@ export function RouteForm(props: RouteFormProps) {
           </Text>
         </Line>
         <Line {...line("max", "Limits")}>
-          {subLabel("max", "skip at", 9)}
-          <Text color={color.muted}>[</Text>
+          {subLabel("max", "skip at", SUB_LABEL)}
+          {/* The brackets keep their columns: a text longer than its line wraps between them. */}
+          <Box flexShrink={0}>
+            <Text color={color.muted}>[</Text>
+          </Box>
           {textField("max", String(limits.maxUsage))}
-          <Text color={color.muted}>]%</Text>
+          <Box flexShrink={0}>
+            <Text color={color.muted}>]%</Text>
+          </Box>
         </Line>
         <Line label="">
           <Text color={color.muted} wrap="truncate-end">

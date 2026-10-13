@@ -5,7 +5,18 @@ import { checkRoutesFile, emptyRoutesFile, type RouteSpec, type RoutesFile } fro
 import { parseRoutesText } from "../../core/routes-store.js";
 import { stripAnsi } from "../../lib/cli-style.js";
 import type { QuotaSnapshot, Registry } from "../../types.js";
-import { DOWN, ENTER, ESC, focusedOn, type Instance, press, renderAt, type, waitForFrame } from "../test-drive.js";
+import {
+  DOWN,
+  ENTER,
+  ESC,
+  focusedOn,
+  type Instance,
+  press,
+  renderAt,
+  type,
+  typeQuickly,
+  waitForFrame,
+} from "../test-drive.js";
 import { windowsOnScreen } from "../test-frames.js";
 import { formAccounts, RouteForm } from "./RouteForm.js";
 import type { RoutesScreenDeps } from "./routes-deps.js";
@@ -235,6 +246,30 @@ describe("RouteForm", () => {
       maxUsage: 80,
     });
     expect(Object.keys(routes(disk))).toEqual(["main", "solo", "daily"]);
+  });
+
+  // Each key a read of its own, a millisecond apart: a field answered the next key from the value
+  // it was drawn with before the last one, and the last one was lost.
+  it("keeps every key typed quickly into its text fields", async () => {
+    const { instance, onDone, disk } = setup();
+    await opened(instance);
+
+    await typeQuickly(instance, "daily");
+    // The first key into an empty pattern field draws a new input in place of its example.
+    await tabTo(instance, "exclude ");
+    await typeQuickly(instance, "side, ops-share");
+    await tabTo(instance, "skip at");
+    await typeQuickly(instance, `${ERASE}${ERASE}65`);
+    await save(instance);
+
+    await vi.waitFor(() => expect(onDone).toHaveBeenCalledWith("daily"));
+    expect(routes(disk).daily).toEqual({
+      tool: "claude",
+      from: ["*"],
+      exclude: ["side", "ops-share"],
+      strategy: "round-robin",
+      maxUsage: 65,
+    });
   });
 
   it("lays out every field, with the subscription accounts of the tool and their quota", async () => {
@@ -1071,6 +1106,79 @@ describe("RouteForm", () => {
       expect(below(narrow.instance, "Strategy")).toMatch(/^\s+uses weekly limits that reset .*…$/);
       expect(below(narrow.instance, "skip at")).toMatch(/^\s+under 80% first; if none, .*…$/);
       expect(lines(text(narrow.instance)).length).toBe(ROWS - 1);
+    });
+
+    // The fallback's keys wrap below 77 columns, and the radios below 60: lines the form's count
+    // took for one each, which made it as tall as the terminal again, redrawn whole on every key.
+    it.each([76, 70, 56])("stays one line short of it at %i columns, its wrapped lines counted", async (columns) => {
+      const ROWS = 34;
+      const quotas = Object.fromEntries(Object.keys(MANY.profiles).map((id) => [id, snap(5, 22)]));
+      const { instance } = setup({ registry: MANY, quotas, rows: ROWS, columns });
+      await opened(instance);
+      await tabTo(instance, "Fallback");
+      const frame = text(instance);
+
+      expect(hintLines(frame)).toHaveLength(2);
+      if (columns < 60) {
+        // Both radios take two lines: what does not fit goes under the first.
+        expect(row(frame, "Tool")).toMatch(/Tool\s+● claude\s+○ codex$/);
+        expect(row(frame, "Strategy")).toMatch(/Strategy\s+● round-robin\s+○ headroom$/);
+        expect(frame).toMatch(/^\s*│\s+○ claude \+ codex\s+│$/m);
+        expect(frame).toMatch(/^\s*│\s+○ expiring\s+│$/m);
+        // Who would be picked wraps whole onto a line of its own, rather than being cut short.
+        expect(frame).toMatch(/^\s*Now: 20 of 20 accounts under 80% · next\s*\n\s*claude:acct-01\s*$/m);
+      }
+      expect(lines(frame).length).toBe(ROWS - 1);
+      for (const line of lines(frame)) expect(line.length).toBeLessThanOrEqual(columns);
+    });
+
+    // `enter save it again` makes the hints longer still: they wrap below 86 columns.
+    it("stays one line short of it once the hints say enter saves a removed route again", async () => {
+      const ROWS = 34;
+      const file: RoutesFile = { version: 1, routes: { wide: { tool: "claude" } } };
+      const { instance, disk } = setup({ registry: MANY, rows: ROWS, columns: 80, file, edit: "wide" });
+      await opened(instance);
+      disk.text = toText({ version: 1, routes: {} });
+      await tabTo(instance, "Fallback");
+      await save(instance);
+
+      const frame = await until(instance, (f) => f.includes("removed in another window"));
+      expect(hintLines(frame)).toEqual([
+        "a add │ x remove │ [ ] reorder │ tab next field │ enter save it again",
+        "│ esc cancel",
+      ]);
+      expect(lines(frame).length).toBe(ROWS - 1);
+    });
+
+    // A field's text wraps once it is longer than its line, and the count took one line for it.
+    it("stays one line short of it with patterns longer than their line", async () => {
+      const ROWS = 34;
+      const { instance } = setup({ registry: MANY, rows: ROWS, columns: 80 });
+      await opened(instance);
+      await tabTo(instance, "from");
+
+      await press(instance, "alice@work.example.com, bob@work.example.com, carol@work.example.com");
+      const frame = text(instance);
+      expect(row(frame, "Patterns")).toMatch(/from\s+alice@work\.example\.com, bob@work\.example\.com,$/);
+      expect(frame).toMatch(/^\s*│\s+carol@work\.example\.com\s+│$/m);
+      expect(lines(frame).length).toBe(ROWS - 1);
+    });
+
+    // The other fields wrap too, in a narrow terminal: the name, and the limit between its brackets.
+    it("stays one line short of it with a name and a limit longer than their lines", async () => {
+      const ROWS = 34;
+      const { instance } = setup({ registry: MANY, rows: ROWS, columns: 50 });
+      await opened(instance);
+
+      await press(instance, "my route for the team and ops on call");
+      expect(row(text(instance), "Name")).toMatch(/Name\s+my route for the team and ops$/);
+      expect(lines(text(instance)).length).toBe(ROWS - 1);
+      await tabTo(instance, "skip at");
+      await retype(instance, 2, "12 34 56 78 90 12 34 56");
+      const frame = text(instance);
+      expect(row(frame, "skip at")).toMatch(/skip at\s+\[12 34 56 78 90 12\]%$/);
+      expect(frame).toMatch(/^\s*│\s+34 56\s+│$/m);
+      expect(lines(frame).length).toBe(ROWS - 1);
     });
 
     it("keeps three accounts on screen however short the terminal", async () => {
