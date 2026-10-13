@@ -1,4 +1,4 @@
-import type { QuotaWindow, QuotaWindows } from "../types.js";
+import type { QuotaWindow, QuotaWindows, ScopedQuotaWindow } from "../types.js";
 
 /** How long a cached snapshot is served without touching the network. */
 export const QUOTA_FRESH_MS = 5 * 60 * 1000;
@@ -54,7 +54,7 @@ function claudeWindow(value: unknown): QuotaWindow | undefined {
   return { usedPercent, resetsAt: toIso(obj.resets_at) };
 }
 
-type ScopedWindow = QuotaWindow & { label: string };
+type ScopedWindow = ScopedQuotaWindow;
 
 /** Every model-scoped weekly limit Claude reports: one entry per model, labelled by its name. */
 function claudeScopedLimits(value: unknown): ScopedWindow[] {
@@ -76,18 +76,33 @@ function claudeScopedLimits(value: unknown): ScopedWindow[] {
   return limits;
 }
 
-/** The binding one of several scoped limits is whichever sits highest; on a tie, the first. */
-function mostUsed(limits: ScopedWindow[]): ScopedWindow | undefined {
+/** Whether `a` resets after `b`; false when either reset is unknown. */
+function resetsLater(a: ScopedWindow, b: ScopedWindow): boolean {
+  return a.resetsAt !== null && b.resetsAt !== null && Date.parse(a.resetsAt) > Date.parse(b.resetsAt);
+}
+
+/**
+ * The binding one of several scoped windows is whichever sits highest. Two windows of one limit
+ * at the same height (Codex's 5-hour and weekly, both full) give the one that resets later, which
+ * holds the model longer; any other tie, the first.
+ */
+export function mostUsedWindow(limits: ScopedWindow[]): ScopedWindow | undefined {
   let best: ScopedWindow | undefined;
   for (const limit of limits) {
-    if (!best || limit.usedPercent > best.usedPercent) best = limit;
+    if (
+      !best ||
+      limit.usedPercent > best.usedPercent ||
+      (limit.usedPercent === best.usedPercent && limit.label === best.label && resetsLater(limit, best))
+    ) {
+      best = limit;
+    }
   }
   return best;
 }
 
 /** `scoped` for the dashboard, and the whole list for routing; no list when there is none. */
 function scopedWindows(limits: ScopedWindow[]): Pick<QuotaWindows, "scoped" | "scopedLimits"> {
-  return limits.length ? { scoped: mostUsed(limits), scopedLimits: limits } : {};
+  return limits.length ? { scoped: mostUsedWindow(limits), scopedLimits: limits } : {};
 }
 
 /** Parses `GET https://api.anthropic.com/api/oauth/usage`. */
@@ -122,6 +137,11 @@ function codexWindow(value: unknown): { window: QuotaWindow; seconds: number } |
 /** Windows at or below a day are the rolling session budget; anything longer is the weekly one. */
 const CODEX_SESSION_MAX_SECONDS = 24 * 60 * 60;
 
+/** Whether a Codex window `seconds` long is the session budget rather than the weekly one. */
+export function isSessionLength(seconds: number): boolean {
+  return seconds > 0 && seconds <= CODEX_SESSION_MAX_SECONDS;
+}
+
 /** Parses `GET https://chatgpt.com/backend-api/codex/usage`. */
 export function parseCodexQuota(raw: unknown): QuotaWindows | null {
   const obj = record(raw);
@@ -133,14 +153,16 @@ export function parseCodexQuota(raw: unknown): QuotaWindows | null {
   for (const key of ["primary_window", "secondary_window"] as const) {
     const parsed = codexWindow(rateLimit?.[key]);
     if (!parsed) continue;
-    if (parsed.seconds > 0 && parsed.seconds <= CODEX_SESSION_MAX_SECONDS) {
+    if (isSessionLength(parsed.seconds)) {
       windows.session = parsed.window;
     } else {
       windows.weekly = parsed.window;
     }
   }
 
-  // Each limit on one model (`GPT-5.3-Codex-Spark`), labelled by its name.
+  // Each limit on one model (`GPT-5.3-Codex-Spark`), labelled by its name. It has the same two
+  // slots as the account's own limit, and can fill both: a 5-hour and a weekly window, or only the
+  // weekly one, as primary. Each window is kept, with its length.
   const scoped: ScopedWindow[] = [];
   if (Array.isArray(obj.additional_rate_limits)) {
     for (const entry of obj.additional_rate_limits) {
@@ -150,10 +172,12 @@ export function parseCodexQuota(raw: unknown): QuotaWindows | null {
       const label = additional.limit_name;
       if (typeof label !== "string" || label === "") continue;
 
-      const parsed = codexWindow(record(additional.rate_limit)?.primary_window);
-      if (!parsed) continue;
-
-      scoped.push({ ...parsed.window, label });
+      const modelLimit = record(additional.rate_limit);
+      for (const key of ["primary_window", "secondary_window"] as const) {
+        const parsed = codexWindow(modelLimit?.[key]);
+        if (!parsed) continue;
+        scoped.push({ ...parsed.window, label, ...(parsed.seconds > 0 ? { windowSeconds: parsed.seconds } : {}) });
+      }
     }
   }
   Object.assign(windows, scopedWindows(scoped));

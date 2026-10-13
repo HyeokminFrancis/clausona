@@ -22,7 +22,9 @@ the help.) A user who would rather look through routes on that screen can run it
 - An account's **usage** is the higher of its 5H and 7D windows: 0% 5H with 99% 7D is 99%.
   That number, and nothing else, is ranked and shown.
 - When the tool's arguments name a model (`claude --model opus`, `codex -m gpt-5.3-codex-spark`,
-  also after `exec`), the account's weekly limit on that model joins the max. A model falls under
+  also after `exec`), the account's limit on that model joins the max: Claude's is weekly, and a
+  Codex one can have a 5-hour and a weekly window, of which the higher counts (named in the note
+  and `usage.window` as `GPT-5.3-Codex-Spark 5H` or `… 7D`). A model falls under
   a limit when the limit's name (`Opus`, `GPT-5.3-Codex-Spark`) is a word of the model's name,
   in any case: `opus`, `claude-opus-4-5`, `opus[1m]` fall under `Opus`; `gpt-5.3-codex` does not
   fall under `GPT-5.3-Codex-Spark`. A run that names no model counts no model's limit, even if
@@ -65,8 +67,10 @@ clausona list --json                       # every profile, with its email and q
   `over-limit` (at or above `maxUsage`) or `skipped`. A skipped one has `skipReason`:
   `signed-out`, `expired`, `no-reading`, `not-registered`, `keeps-own-sessions` or
   `api-not-supported`. Each also has `usage`, `fiveHour`, `sevenDay` and `lastPickedAt`, and
-  `scoped` (`{"label", "usedPercent", "resetsAt"}`, its limit on the `--model` model, or null).
-  `usage.window` is `5H`, `7D` or that limit's label (`Opus`). The top level has `model`.
+  `scoped` (`{"label", "usedPercent", "resetsAt"}`, its limit on the `--model` model, of a Codex
+  limit with two windows the higher, or null). `usage.window` is `5H`, `7D` or the name of that
+  limit: its label for Claude (`Opus`), its label and window for Codex
+  (`GPT-5.3-Codex-Spark 7D`). The top level has `model`.
 
 `route list --json` gives each route's `members`, `freeNow` (`{"free", "members"}`) and `next`
 (as `outcome`), and `problems`: what is wrong with each route in `routes.json` that cannot be

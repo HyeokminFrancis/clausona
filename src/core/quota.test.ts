@@ -58,6 +58,43 @@ const CODEX_PAYLOAD = {
   ],
 };
 
+/**
+ * A model limit with both of its slots filled: a 5-hour primary and a weekly secondary. Codex
+ * types a model limit's `rate_limit` as it types the account's own (RateLimitStatusDetails in
+ * openai/codex), draws both windows on /status, and users report GPT-5.3-Codex-Spark with a
+ * 5-hour and a weekly limit. Not captured live: built to that type, window fields only.
+ */
+const codexModelLimit = (
+  fiveHour: number | null,
+  weekly: number | null,
+  lengths: { fiveHour?: number; weekly?: number } = { fiveHour: 18000, weekly: 604800 },
+) => ({
+  limit_name: "GPT-5.3-Codex-Spark",
+  metered_feature: "codex_bengalfox",
+  rate_limit: {
+    allowed: true,
+    limit_reached: false,
+    primary_window:
+      fiveHour === null
+        ? null
+        : {
+            used_percent: fiveHour,
+            limit_window_seconds: lengths.fiveHour,
+            reset_after_seconds: 3600,
+            reset_at: 1788488223,
+          },
+    secondary_window:
+      weekly === null
+        ? null
+        : {
+            used_percent: weekly,
+            limit_window_seconds: lengths.weekly,
+            reset_after_seconds: 530735,
+            reset_at: 1789001823,
+          },
+  },
+});
+
 describe("parseClaudeQuota", () => {
   it("maps the five-hour and seven-day windows", () => {
     const quota = parseClaudeQuota(CLAUDE_PAYLOAD);
@@ -105,6 +142,25 @@ describe("parseClaudeQuota", () => {
       { usedPercent: 77, resetsAt: "2026-09-04T19:59:59.000Z", label: "Fable" },
       { usedPercent: 20, resetsAt: "2026-09-05T00:00:00.000Z", label: "Opus" },
     ]);
+    expect(quota?.scoped?.label).toBe("Fable");
+  });
+
+  it("keeps the first of two limits on different models as high, whichever resets later", () => {
+    const quota = parseClaudeQuota({
+      ...CLAUDE_PAYLOAD,
+      limits: [
+        ...CLAUDE_PAYLOAD.limits,
+        {
+          kind: "weekly_scoped",
+          group: "weekly",
+          percent: 77,
+          severity: "warning",
+          resets_at: "2026-09-05T00:00:00Z",
+          scope: { model: { display_name: "Opus" }, surface: null },
+        },
+      ],
+    });
+
     expect(quota?.scoped?.label).toBe("Fable");
   });
 
@@ -157,7 +213,47 @@ describe("parseCodexQuota", () => {
       usedPercent: 40,
       resetsAt: "2026-09-10T00:57:03.000Z",
       label: "GPT-5.3-Codex-Spark",
+      windowSeconds: 604800,
     });
+  });
+
+  // [5-hour window, weekly window] → the one the dashboard shows: whichever is higher stops the
+  // model first, as an account's own 5H and 7D do; of two as high, the weekly one, which resets
+  // later and so holds the model longer. Either slot can also come alone.
+  it.each([
+    [90, 30, { usedPercent: 90, resetsAt: "2026-09-04T02:17:03.000Z", windowSeconds: 18000 }],
+    [10, 95, { usedPercent: 95, resetsAt: "2026-09-10T00:57:03.000Z", windowSeconds: 604800 }],
+    [100, 100, { usedPercent: 100, resetsAt: "2026-09-10T00:57:03.000Z", windowSeconds: 604800 }],
+    [null, 70, { usedPercent: 70, resetsAt: "2026-09-10T00:57:03.000Z", windowSeconds: 604800 }],
+  ] as const)("reads both windows of a model limit (5h %o, weekly %o) and shows the higher", (five, week, shown) => {
+    const quota = parseCodexQuota({ ...CODEX_PAYLOAD, additional_rate_limits: [codexModelLimit(five, week)] });
+
+    expect(quota?.scoped).toEqual({ ...shown, label: "GPT-5.3-Codex-Spark" });
+  });
+
+  it("keeps each window of a model limit with its length, for routing", () => {
+    const quota = parseCodexQuota({ ...CODEX_PAYLOAD, additional_rate_limits: [codexModelLimit(20, 85)] });
+
+    expect(quota?.scopedLimits).toEqual([
+      { usedPercent: 20, resetsAt: "2026-09-04T02:17:03.000Z", label: "GPT-5.3-Codex-Spark", windowSeconds: 18000 },
+      { usedPercent: 85, resetsAt: "2026-09-10T00:57:03.000Z", label: "GPT-5.3-Codex-Spark", windowSeconds: 604800 },
+    ]);
+    // The account's own windows are read as before.
+    expect(quota?.weekly?.usedPercent).toBe(12);
+    expect(quota?.session).toBeUndefined();
+  });
+
+  it("keeps a model limit's windows without a length, and still shows the higher", () => {
+    const quota = parseCodexQuota({
+      ...CODEX_PAYLOAD,
+      additional_rate_limits: [codexModelLimit(20, 85, {})],
+    });
+
+    expect(quota?.scopedLimits?.map((limit) => [limit.usedPercent, limit.windowSeconds])).toEqual([
+      [20, undefined],
+      [85, undefined],
+    ]);
+    expect(quota?.scoped?.usedPercent).toBe(85);
   });
 
   it("keeps every additional rate limit, for routing", () => {
