@@ -108,6 +108,16 @@ describe("strategies", () => {
     expect(order).toEqual(["claude:b", "claude:c", "claude:a", "claude:b"]);
   });
 
+  it("round-robin puts a member never picked ahead of one picked, whatever its usage", () => {
+    // a has the highest usage of the three, and goes first as the only one never picked.
+    const lastPicked = { "claude:b": inHours(-3), "claude:c": inHours(-1) };
+    expect(rank({ strategy: "round-robin" }, quotas, { lastPicked }).outcome).toMatchObject({ id: "claude:a" });
+    // Two never picked: the lower usage of those two, not b, who was picked longest ago.
+    expect(
+      rank({ strategy: "round-robin" }, quotas, { lastPicked: { "claude:b": inHours(-3) } }).outcome,
+    ).toMatchObject({ id: "claude:c" });
+  });
+
   it("expiring picks a weekly window that resets within 24 hours", () => {
     const soon = { ...quotas, "claude:a": snap(20, 70, { weekly: { usedPercent: 70, resetsAt: inHours(10) } }) };
     expect(rank({ strategy: "expiring" }, soon).outcome).toEqual({
@@ -145,6 +155,28 @@ describe("stages", () => {
       stage: "fallback",
       reason: "first fallback under 80%",
     });
+  });
+
+  it("takes the fallback in the order it is listed, not by name or usage", () => {
+    const ranking = rank(
+      { from: ["a"], fallback: ["c", "b"] },
+      { "claude:a": snap(90, 0), "claude:b": snap(10, 10), "claude:c": snap(50, 50) },
+    );
+    expect(ranking.outcome).toMatchObject({ id: "claude:c", stage: "fallback" });
+  });
+
+  it("takes a glob fallback's matches in name order", () => {
+    const ranking = rank(
+      { from: ["a"], fallback: ["*"] },
+      { "claude:a": snap(90, 0), "claude:b": snap(50, 50), "claude:c": snap(10, 10) },
+      { members: [C, B, A] },
+    );
+    expect(ranking.rows.map((row) => [row.id, row.role])).toEqual([
+      ["claude:a", "pool"],
+      ["claude:b", "fallback"],
+      ["claude:c", "fallback"],
+    ]);
+    expect(ranking.outcome).toMatchObject({ id: "claude:b", stage: "fallback" });
   });
 
   it("uses the member with the most left when everyone is over the cut", () => {
@@ -186,7 +218,6 @@ describe("stages", () => {
     expect(rank({}, fullOrOut).outcome).toEqual({ kind: "none", soonest: { id: "claude:a", at: inHours(5) } });
   });
 
-  // Review Focus 4: a pool member also listed as a fallback is one member, in the pool.
   it("ranks a member listed in both the pool and the fallback once, in the pool", () => {
     const ranking = rank(
       { from: ["*"], fallback: ["b"] },
@@ -212,7 +243,7 @@ describe("skips", () => {
     expect(ranking.outcome).toEqual({ kind: "none", soonest: undefined });
   });
 
-  // Review Focus 5: a removed profile named exactly does not stop the rest from being picked.
+  // A route can name a profile that has since been removed.
   it("shows a name that is not registered and picks from the rest", () => {
     const ranking = rank(
       { from: ["gone", "*"] },
@@ -296,7 +327,6 @@ describe("all routes", () => {
     expect(ranking.rows.map((row) => row.id)).toEqual(["claude:work"]);
   });
 
-  // Review Focus 4
   it("matches a bare name in whichever tool has it, and shows an unknown name once", () => {
     const ranking = rankRoute({
       route: withDefaults({ tool: "all", from: ["gone", "work"] }),
@@ -370,5 +400,24 @@ describe("blockingReset", () => {
       { members: [A] },
     );
     expect(blockingReset(ranking.rows[0], 95)).toBe(inHours(30));
+  });
+
+  it("is null when a window at or above the limit has no reset time", () => {
+    const ranking = rank(
+      {},
+      {
+        "claude:a": snap(97, 98, {
+          session: { usedPercent: 97, resetsAt: inHours(2) },
+          weekly: { usedPercent: 98, resetsAt: null },
+        }),
+      },
+      { members: [A] },
+    );
+    expect(blockingReset(ranking.rows[0], 95)).toBeNull();
+  });
+
+  it("is null when no window is at or above the limit", () => {
+    const ranking = rank({}, { "claude:a": snap(94, 50) }, { members: [A] });
+    expect(blockingReset(ranking.rows[0], 95)).toBeNull();
   });
 });

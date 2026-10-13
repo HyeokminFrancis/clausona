@@ -63,7 +63,7 @@ describe("readRunArgs", () => {
     });
   });
 
-  // Review Focus 3: after `--` everything is the tool's, even what looks like ours.
+  // After `--` everything is the tool's, even what looks like ours.
   it("drops one -- and passes everything after it through", () => {
     expect(readRunArgs(["--route", "main", "--", "--route", "x"])).toEqual({
       options: { route: "main" },
@@ -85,6 +85,33 @@ describe("readRunArgs", () => {
       "--strategy must be one of round-robin, headroom, expiring.",
     );
     expect(() => readRunArgs(["--from", " , "])).toThrow("--from needs at least one pattern.");
+
+    // A key typed into an option's slot, or after an option missing its value, is not repeated.
+    const key = ["sk", "ant", "y".repeat(24)].join("-");
+    // Each case is named, never shown: its arguments hold the key.
+    const refusal = (name: string, args: string[]) => {
+      try {
+        readRunArgs(args);
+      } catch (error) {
+        return (error as Error).message;
+      }
+      throw new Error(`${name} was read, not refused`);
+    };
+    const cases: Array<[string, string[]]> = [
+      ["the next option after one missing its value", ["--route", "--from", key]],
+      ["a repeated option", ["--route", key, "--route", key]],
+      ["a repeated inline option", [`--route=${key}`, `--route=${key}`]],
+      ["--max-usage", ["--max-usage", key]],
+      ["an inline --max-usage", [`--max-usage=${key}`]],
+      ["--strategy", ["--strategy", key]],
+      ["a repeated --max-usage", ["--max-usage", "70", "--max-usage", key]],
+    ];
+    for (const [name, args] of cases) {
+      const message = refusal(name, args);
+      expect(message).toMatch(/^--[a-z-]+ /);
+      expect(message).not.toContain(key);
+      expect(message).not.toContain("sk-");
+    }
   });
 });
 

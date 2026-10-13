@@ -1,3 +1,4 @@
+import { foldProfileName } from "./core/profile-name.js";
 import type { QuotaTarget } from "./core/quota-store.js";
 import {
   applyOverrides,
@@ -10,6 +11,7 @@ import {
   type Route,
   type RouteOverrides,
   type RouteSpec,
+  type RoutesFile,
   type RouteTool,
   storedRoute,
   withDefaults,
@@ -222,11 +224,17 @@ export function newRouteFrom(tool: RouteTool, overrides: RouteOverrides): RouteS
   return applyOverrides(newRouteSpec(tool), overrides);
 }
 
+/** Refuses a name a route already has, pointing at the command that changes that route. */
+function refuseTakenName(file: RoutesFile, name: string): void {
+  if (storedRoute(file, name)) {
+    throw new Error(`Route '${name}' already exists. Change it with clausona route set ${name} …`);
+  }
+}
+
 /** Writes a new route, refusing a name someone created meanwhile. */
 export async function createRoute(name: string, spec: RouteSpec, deps: RouteDeps): Promise<void> {
   await updateRoutes((file) => {
-    if (storedRoute(file, name))
-      throw new Error(`Route '${name}' already exists. Change it with clausona route set ${name} …`);
+    refuseTakenName(file, name);
     file.routes[name] = spec;
     return file;
   }, deps.paths);
@@ -252,9 +260,7 @@ async function addRoute(args: string[], deps: RouteDeps): Promise<string> {
   const options = toRoutingOptions(read.values);
   const tool = parseRouteTool(read.values.get("--tool")) ?? inferRouteTool(options.from ?? []) ?? "claude";
   const registry = await registryOrThrow(deps);
-  if (storedRoute(await readRoutes(deps.paths), name)) {
-    throw new Error(`Route '${name}' already exists. Change it with clausona route set ${name} …`);
-  }
+  refuseTakenName(await readRoutes(deps.paths), name);
   const spec = newRouteFrom(tool, options);
   checkRouteMembers(name, spec, registry);
   await createRoute(name, spec, deps);
@@ -293,7 +299,8 @@ async function setRoute(args: string[], deps: RouteDeps): Promise<string> {
     if (!current) throw new UnknownRouteError(name, Object.keys(file.routes).sort());
     const next = applyOverrides(current, options);
     if (add.length || drop.length) {
-      const fold = (value: string) => value.normalize("NFKC").toLowerCase();
+      // Entries compare as profile names do: `Work` and `work` are one entry.
+      const same = (a: string, b: string) => foldProfileName(a) === foldProfileName(b);
       const from = next.from ?? ["*"];
       // The message below quotes the from list and the dropped entry, so both are checked first:
       // a key given to --from or --drop is refused without being repeated.
@@ -306,14 +313,14 @@ async function setRoute(args: string[], deps: RouteDeps): Promise<string> {
       ];
       if (problems.length) throw new Error(problems.join("\n"));
       for (const entry of drop) {
-        if (!from.some((pattern) => fold(pattern) === fold(entry))) {
+        if (!from.some((pattern) => same(pattern, entry))) {
           throw new Error(
             `'${entry}' is not in ${name}'s from list (${from.join(", ")}). To leave an account out of a pattern, use --exclude ${entry}.`,
           );
         }
       }
-      const kept = from.filter((pattern) => !drop.some((entry) => fold(entry) === fold(pattern)));
-      next.from = [...kept, ...add.filter((entry) => !kept.some((pattern) => fold(pattern) === fold(entry)))];
+      const kept = from.filter((pattern) => !drop.some((entry) => same(entry, pattern)));
+      next.from = [...kept, ...add.filter((entry) => !kept.some((pattern) => same(pattern, entry)))];
       // Said here, in the words of the options given: the file's own check would point at
       // leaving `from` out of routes.json, which `route set` cannot do.
       if (next.from.length === 0) {
