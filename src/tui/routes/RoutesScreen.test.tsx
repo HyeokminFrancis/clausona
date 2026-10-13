@@ -1170,6 +1170,65 @@ describe("ranked as a run of one model", () => {
     expect(opus.list[2]).toMatch(/^▸ wide\s+all\s+2\/5$/);
   });
 
+  // No run ranks both tools' accounts for one model: were a label reported by both, each tool's
+  // accounts would be ranked for it in turn.
+  it("ranks an all route by a label both tools report once for each tool", async () => {
+    const quotas = {
+      ...QUOTAS,
+      "claude:work": limited(snap(12, 34), limit("Opus", 10)),
+      "codex:x": limited(snap(30, 10), limit("Opus", 20, WEEK)),
+    };
+    const { instance } = setup({ collect: async () => quotas });
+    await ranked(instance);
+    await press(instance, DOWN);
+    await press(instance, DOWN);
+    expect(panes(text(instance)).detail).toContain("Model limits: Opus · m to rank by one");
+
+    await press(instance, "m");
+    const claude = panes(text(instance));
+    expect(claude.detail).toContain("Model     ranked as --tool claude --model opus");
+    // Each ranked by its own tool's limit on the model.
+    expect(row(claude.detail, "claude:work")).toMatch(/12%\s+34%\s+10%/);
+    expect(claude.detail.some((line) => line.includes("codex:"))).toBe(false);
+
+    await press(instance, "m");
+    const codex = panes(text(instance));
+    expect(codex.detail).toContain("Model     ranked as --tool codex --model opus");
+    expect(row(codex.detail, "codex:x")).toMatch(/30%\s+10%\s+7D\s+20%/);
+    expect(codex.detail.some((line) => line.includes("claude:"))).toBe(false);
+
+    await press(instance, "m");
+    expect(text(instance)).not.toContain("--model");
+  });
+
+  // Ranked by Opus, `over 80%` needs more room than Sonnet's `next`; a model's view has a column
+  // more than the one with no model, which is fitted on its own.
+  it("keeps the cells' form as m moves from one model to another, and the view with no model's own", async () => {
+    const quotas = {
+      ...QUOTAS,
+      "claude:side": snap(40, 40),
+      "claude:team": limited(snap(5, 22), limit("Opus", 95), limit("Sonnet", 10)),
+      "claude:work": limited(snap(12, 34), limit("Opus", 10), limit("Sonnet", 20)),
+    };
+    const gauges = (frame: string) => /[\u2588\u2591]/.test(frame);
+    const { instance } = setup({ collect: async () => quotas, columns: 108 });
+    const none = await ranked(instance);
+    await press(instance, "m");
+    const opus = text(instance);
+    expect(opus).toContain("ranked as --model opus");
+    expect(row(lines(opus), "claude:team")).toMatch(/95%\s+over 80%$/);
+    await press(instance, "m");
+    const sonnet = text(instance);
+    expect(sonnet).toContain("ranked as --model sonnet");
+    expect(sonnet).not.toContain("over 80%");
+    // Opus's table fits only percentages here, so Sonnet's shows them too.
+    expect([gauges(opus), gauges(sonnet)]).toEqual([false, false]);
+    // The view with no model keeps its gauges, and is as it was once m has gone round.
+    expect(gauges(none)).toBe(true);
+    await press(instance, "m");
+    expect(text(instance)).toBe(none);
+  });
+
   it("cuts the model's name before the cells lose their reset times", async () => {
     // Reset times from the real clock, which the cells count from: each reads a whole number of hours.
     const inHours = (hours: number) => new Date(Date.now() + (hours + 0.5) * 3_600_000).toISOString();

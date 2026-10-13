@@ -439,7 +439,10 @@ way `clausona route explain <route> --model opus` does. The model's limit gets a
 and 7D, the account an Opus run would get is marked next, and the count in the list is of the
 accounts free for that run. The settings say `ranked as --model opus`. Press `m` again for the
 next model, and after the last one the route is ranked as a run that names no model. Moving to
-another route does that too.
+another route does that too. From one model to the next, the cells keep their form: if the table
+for any of the models is too wide for gauges, all of them show percentages. The table with no model
+is fitted on its own, as it is before you press `m`, so the cells can change form when `m` goes to
+the first model or back to none.
 
 On an `all` route, a run that names a model names its tool too, so only the accounts of the tool
 that reports the limit are ranked: for Opus, the Claude Code accounts, as
@@ -903,7 +906,9 @@ run as `spend could not be read`, and never holds up the others. That includes t
 `command:` key source that has not answered within the reading's 5 seconds, such as a vault
 waiting to be unlocked, is stopped, with everything it started. So is one that clausona is
 waiting on when you press Ctrl-C, and clausona then exits as it always has. Unlike an account's, its last
-numbers are not used in its place.
+numbers are not used in its place. On macOS and Linux, a job a key command leaves running in the
+background when it is read for spend is stopped when the command exits; an agent that runs in a
+session of its own, as gpg-agent and ssh-agent do, is left running.
 
 ### Periods
 

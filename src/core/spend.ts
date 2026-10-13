@@ -92,19 +92,21 @@ const LITELLM_PERIODS: Record<string, BudgetPeriod> = {
  * `GET /key/info` of a LiteLLM proxy, called with the key itself and no `key` parameter:
  * `{ info: { spend, max_budget, budget_duration, budget_reset_at, … } }`. Without a duration the
  * spend is a running total and `max_budget` a limit that never renews; with one, LiteLLM sets the
- * spend back to 0 at `budget_reset_at`. Null when there is no spend in it. The response names the
- * key too, which is never read.
+ * spend back to 0 at `budget_reset_at`, whether or not the key has a `max_budget`. Null when there
+ * is no spend in it. The response names the key too, which is never read.
  */
 export function parseLiteLlmKeyInfo(raw: unknown): SpendReading | null {
   const info = record(record(raw)?.info);
   const spend = dollars(info?.spend);
   if (!info || spend === null) return null;
   const reading: SpendReading = { totalUsd: spend };
+  const duration = typeof info.budget_duration === "string" ? info.budget_duration.trim().toLowerCase() : "";
+  const resetsAt = duration ? toIso(info.budget_reset_at) : null;
+  if (resetsAt) reading.totalResetsAt = resetsAt;
   const max = dollars(info.max_budget);
   if (max !== null) {
-    const duration = typeof info.budget_duration === "string" ? info.budget_duration.trim().toLowerCase() : "";
     const per = Object.hasOwn(LITELLM_PERIODS, duration) ? LITELLM_PERIODS[duration] : undefined;
-    reading.limit = { usd: max, resetsAt: duration ? toIso(info.budget_reset_at) : null, ...(per ? { per } : {}) };
+    reading.limit = { usd: max, resetsAt, ...(per ? { per } : {}) };
   }
   return reading;
 }
@@ -195,17 +197,29 @@ export async function readSpend(
 // ─── Usage ──────────────────────────────────────────────────────────
 
 /**
- * Whether the provider set its count back to 0 since the last reading: the total fell, or the
- * reset time it reports has moved on (LiteLLM moves budget_reset_at in the job that zeroes the
- * spend). The second catches a reset after which the spend has already climbed past the last
- * reading. A reset time that has merely passed is not one: LiteLLM's job runs every ten minutes
- * or so, and a reading in between still holds the old total.
+ * When a reading says the provider sets its count back to 0. A reading an older clausona stored
+ * has the time only on its limit, where it is the same time: an upgrade neither misses a reset nor
+ * sees one that was not.
  */
-function providerReset(reading: SpendReading, previous: SpendReading): boolean {
+function countResetsAt(reading: SpendReading): number {
+  const at = reading.totalResetsAt ?? reading.limit?.resetsAt;
+  return at ? Date.parse(at) : Number.NaN;
+}
+
+/**
+ * Whether the provider set its count back to 0 since the last reading, taken at `now`: the total
+ * fell, or the reset time it reports has moved on from one that has passed (LiteLLM moves
+ * budget_reset_at in the job that zeroes the spend). The second catches a reset after which the
+ * spend has already climbed past the last reading. A reset time that has merely passed is not one:
+ * LiteLLM's job runs every ten minutes or so, and a reading in between still holds the old total.
+ * Nor is one moved before it passed: LiteLLM moves it without zeroing the spend when the key's
+ * budget_duration is sent again, as its admin UI does when a key is edited.
+ */
+function providerReset(reading: SpendReading, previous: SpendReading, now: number): boolean {
   if (reading.totalUsd < previous.totalUsd) return true;
-  const was = previous.limit?.resetsAt ? Date.parse(previous.limit.resetsAt) : Number.NaN;
-  const is = reading.limit?.resetsAt ? Date.parse(reading.limit.resetsAt) : Number.NaN;
-  return !Number.isNaN(was) && !Number.isNaN(is) && is > was;
+  const was = countResetsAt(previous);
+  const is = countResetsAt(reading);
+  return !Number.isNaN(was) && !Number.isNaN(is) && is > was && was <= now;
 }
 
 /**
@@ -217,7 +231,7 @@ function providerReset(reading: SpendReading, previous: SpendReading): boolean {
  */
 export function withBaselines(reading: SpendReading, previous: SpendReading | undefined, now: number): SpendReading {
   if (reading.periods) return reading;
-  const reset = previous !== undefined && providerReset(reading, previous);
+  const reset = previous !== undefined && providerReset(reading, previous, now);
   const baselines: NonNullable<SpendReading["baselines"]> = {};
   for (const per of BUDGET_PERIODS) {
     const start = periodStart(now, per);
