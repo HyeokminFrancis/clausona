@@ -8,6 +8,7 @@ import {
   type SettingsLayer,
   SKILL_VISIBILITY,
   type SkillVisibility,
+  type StateFacts,
 } from "./model.js";
 import { isWithin, pathKey, samePath } from "./read.js";
 
@@ -19,6 +20,12 @@ export const STASH_KEY = "stash";
 
 /** The `setBy.key` of a server managed-mcp.json keeps from starting: the file's name, as no key holds it. */
 export const MANAGED_MCP_KEY = "managed-mcp.json";
+
+/**
+ * The `setBy.key` of a Codex item in a place where Codex refuses a config.toml - the user's, or
+ * a trusted project's - and so loads none of its config: the file `setBy.file` names.
+ */
+export const CODEX_REFUSED_KEY = "config refused";
 
 /** Claude Code reads settings in this order; the first that sets a key wins. */
 const PRECEDENCE: readonly SettingsLayer[] = ["managed", "local", "project", "user"];
@@ -434,18 +441,44 @@ export function isManagedSetting(inv: Inventory, file: string): boolean {
 /**
  * Whether Codex trusts `project`, as Codex 0.159.3 decides it (`decision_for_dir`): the first of
  * the project's folders (codexTrustFolders) - its own, its project root, its repository's root -
- * that a [projects."<key>"] table with a trust_level samePaths decides, trusted only with
+ * that a [projects."<key>"] table with a trust_level names (codexTrustLevel), trusted only with
  * trust_level = "trusted". So a linked worktree of a trusted repo, and a folder inside one, are
  * trusted, unless a nearer table says otherwise. Codex ignores the `.codex/` folder of any other
  * project, one it has no record of too.
  */
 export function codexTrusted(inv: Inventory, project: string | undefined): boolean {
+  return codexTrustedIn(inv.facts, project);
+}
+
+/** `codexTrusted` from the facts alone, for a source that reads on what Codex trusts. */
+export function codexTrustedIn(facts: StateFacts, project: string | undefined): boolean {
   if (project === undefined) return false;
-  for (const folder of inv.facts.codexTrustFolders[pathKey(project)] ?? [project]) {
-    const set = inv.facts.codexTrust.filter((t) => t.trusted !== undefined && samePath(t.project, folder));
-    if (set.length > 0) return set.some((t) => t.trusted === true);
+  for (const folder of facts.codexTrustFolders[pathKey(project)] ?? [project]) {
+    const trusted = codexTrustLevel(facts.codexTrust, folder);
+    if (trusted !== undefined) return trusted;
   }
   return false;
+}
+
+/** ASCII letters made lower case, and no other: Rust's `to_ascii_lowercase`. */
+function asciiLower(text: string): string {
+  return text.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+/**
+ * The trust a `[projects."<key>"]` table with a trust_level gives `folder`, as Codex 0.159.3 looks
+ * it up (`project_trust_for_lookup_key`): by the key's very string, resolved or folded no further,
+ * and on Windows in any case of its ASCII letters - the exact key first, else the first in order
+ * of those that fold alike. Undefined where no key names it.
+ */
+function codexTrustLevel(entries: StateFacts["codexTrust"], folder: string): boolean | undefined {
+  const fold = process.platform === "win32" ? asciiLower : (text: string) => text;
+  const lookup = fold(folder);
+  const set = entries.filter((t) => t.trusted !== undefined);
+  const exact = set.find((t) => t.project === lookup);
+  if (exact) return exact.trusted;
+  const folded = set.filter((t) => fold(t.project) === lookup).sort((a, b) => (a.project < b.project ? -1 : 1));
+  return folded[0]?.trusted;
 }
 
 /**
@@ -569,10 +602,16 @@ export function codexPluginState(inv: Inventory, plugin: string, project: string
  * skill's (an account's own same-name skill). For what any account can see (a `.mcp.json` or
  * plugin server, a project skill), callers pass `profile`: without one, every account's
  * approvals are merged and no account's own switch or copy applies. A stashed item is off
- * everywhere, whatever the switches say.
+ * everywhere, whatever the switches say, and a Codex item where Codex refuses a config.toml.
  */
 export function stateOf(inv: Inventory, item: Extension, project?: string, profile?: string): EffectiveState {
   if (item.stashed) return { value: "off", setBy: { file: item.stashed.file, key: STASH_KEY } };
+  if (item.location.tool === "codex") {
+    const refused = inv.facts.codexConfigRefused.find(
+      (r) => r.project === undefined || (project !== undefined && samePath(r.project, project)),
+    );
+    if (refused) return { value: "off", setBy: { file: refused.file, key: CODEX_REFUSED_KEY } };
+  }
   switch (item.kind) {
     case "skill":
       return item.location.tool === "claude"

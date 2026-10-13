@@ -6,6 +6,7 @@ import { parse, TomlDate } from "smol-toml";
 import type { Collector, Location, StateFacts } from "../model.js";
 import { isRecord, readText, realPath } from "../read.js";
 import { addHooks } from "./claude-hooks.js";
+import { codexSkipsMatcher } from "./codex-matcher.js";
 
 /**
  * Codex's hook trust, as Codex 0.159.3 keeps it (codex-rs/hooks, engine/discovery.rs). Codex runs
@@ -95,6 +96,8 @@ export function addCodexHookTrust(
       if (!isRecord(group) || !Array.isArray(group.hooks)) return;
       const raw = typeof group.matcher === "string" ? group.matcher : undefined;
       const matcher = WITH_MATCHER.has(event) ? raw : undefined;
+      // Codex skips a group whose matcher it cannot compile, and lists none of its hooks.
+      if (matcher !== undefined && codexSkipsMatcher(matcher)) return;
       group.hooks.forEach((hook, h) => {
         const handler = normalized(event, hook);
         if (handler === undefined) return;
@@ -143,12 +146,39 @@ const optional = (value: unknown, is: (v: unknown) => boolean) => value === unde
 /** A field with a default, which serde reads absent or of its type, not null. */
 const defaulted = (value: unknown, is: (v: unknown) => boolean) => value === undefined || is(value);
 const isString = (value: unknown) => typeof value === "string";
-const isCount = (value: unknown) =>
-  (typeof value === "number" && Number.isInteger(value) && value >= 0) || (typeof value === "bigint" && value >= 0n);
+/** A table or an object, as serde reads a map or a struct: no number kept as text, no date. */
+const isTable = (value: unknown): value is Record<string, unknown> =>
+  isRecord(value) && !(value instanceof SerdeNumber) && !(value instanceof TomlDate);
+/** The most a hook's timeout or limit can be: Codex hashes it as a TOML integer, an i64. */
+const MAX_COUNT = 2n ** 63n - 1n;
+/**
+ * A whole number serde reads as a u64 or usize, as Codex's arbitrary-precision serde_json and
+ * the TOML parser keep it: one written as an integer - `1e3`, `30.0` or a TOML float is a number
+ * kept as text, which no u64 is read from - and not past an i64, beyond which Codex cannot hash
+ * the hook. A plain JavaScript number, read without its text, is taken as it reads.
+ */
+const isCount = (value: unknown) => {
+  if (value instanceof SerdeNumber) return /^\d+$/.test(value.text) && BigInt(value.text) <= MAX_COUNT;
+  if (typeof value === "bigint") return value >= 0n && value <= MAX_COUNT;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+};
 /** A value TOML can hold, as Codex checks an MCP hook's input: no null anywhere in it. */
 const inToml = (value: unknown): boolean =>
   value !== null &&
-  (Array.isArray(value) ? value.every(inToml) : !isRecord(value) || Object.values(value).every(inToml));
+  (Array.isArray(value) ? value.every(inToml) : !isTable(value) || Object.values(value).every(inToml));
+
+/**
+ * Whether serde reads a config.toml's `[hooks.state]` as Codex 0.159.3's `HookStateToml` map, as
+ * config/read showed, or Codex refuses the whole file: a table of tables, `enabled` a boolean and
+ * `trusted_hash` a string where given. A key it does not know in an entry is fine.
+ */
+export function codexReadsHookStates(state: unknown): boolean {
+  if (state === undefined) return true;
+  if (!isTable(state)) return false;
+  return Object.values(state).every(
+    (s) => isTable(s) && optional(s.enabled, (v) => typeof v === "boolean") && optional(s.trusted_hash, isString),
+  );
+}
 
 /**
  * Whether serde reads every group and hook of the known events in `events` into Codex 0.159.3's
@@ -167,12 +197,12 @@ export function codexReadsHookEvents(events: Record<string, unknown>): boolean {
 }
 
 function readsGroup(group: unknown): boolean {
-  if (!isRecord(group) || !optional(group.matcher, isString)) return false;
+  if (!isTable(group) || !optional(group.matcher, isString)) return false;
   return defaulted(group.hooks, (hooks) => Array.isArray(hooks) && hooks.every(readsHook));
 }
 
 function readsHook(hook: unknown): boolean {
-  if (!isRecord(hook)) return false;
+  if (!isTable(hook)) return false;
   const common = optional(hook.timeout, isCount) && optional(hook.statusMessage, isString);
   switch (hook.type) {
     case "command":
@@ -188,7 +218,7 @@ function readsHook(hook: unknown): boolean {
         common &&
         isString(hook.server) &&
         isString(hook.tool) &&
-        defaulted(hook.input, (input) => isRecord(input) && inToml(input))
+        defaulted(hook.input, (input) => isTable(input) && inToml(input))
       );
     case "prompt":
     case "agent":
@@ -234,9 +264,12 @@ export function addConfigHooks(
  * hook whose command is empty ("skipping empty hook command"), and an MCP tool hook whose server
  * or tool is ("server and tool must not be empty"). The last two are the command and MCP tool
  * hooks of a known event that have no trust identity: normalized() reads what Codex runs on this
- * platform, and gives none to those alone. One in a file Codex refuses keeps that reason. A copy
- * clausona keeps aside is in no hooks file, so has no trust identity either: it is off, and none
- * of these.
+ * platform, and gives none to those alone. A hook on an event Codex does not know - its twelve,
+ * by their exact names - is none of these but an `unknown event`; one in a group whose matcher
+ * Codex cannot compile (codexSkipsMatcher), on an event that reads it, has an `invalid
+ * matcher`, as Codex skips the group before it looks at a hook. One in a file Codex refuses
+ * keeps that reason. A copy clausona keeps aside is in no hooks file, so has no trust identity
+ * either: it is off, and none of these.
  */
 export function markUnsupportedHooks(out: Collector): void {
   const trusted = new Set(out.facts.codexHookTrust.map((t) => t.id));
@@ -245,7 +278,12 @@ export function markUnsupportedHooks(out: Collector): void {
     const type = item.summary?.type;
     const event = item.hook?.event ?? "";
     const sessionEndTool = type === "mcp_tool" && event === "SessionEnd";
-    if (type === "prompt" || type === "agent" || sessionEndTool) item.codexError = "not supported";
+    // Codex reads the twelve events it knows, by their exact names, and leaves any other alone.
+    const matcher = item.hook?.matcher;
+    if (!Object.hasOwn(EVENTS, event)) item.codexError = "unknown event";
+    else if (WITH_MATCHER.has(event) && matcher !== undefined && codexSkipsMatcher(matcher)) {
+      item.codexError = "invalid matcher";
+    } else if (type === "prompt" || type === "agent" || sessionEndTool) item.codexError = "not supported";
     else if (Object.hasOwn(EVENTS, event) && !trusted.has(item.id)) {
       if (type === "command") item.codexError = "empty command";
       if (type === "mcp_tool") item.codexError = "empty tool";
@@ -323,7 +361,7 @@ function count(value: unknown): number | undefined {
  * hash writes as `{"$serde_json::private::Number": text}`. Codex 0.159.3's hooks/list gave the
  * hashes this text matches.
  */
-class SerdeNumber {
+export class SerdeNumber {
   readonly text: string;
   constructor(text: string) {
     this.text = text;
@@ -453,9 +491,18 @@ export async function exactJsonFile(file: string): Promise<Record<string, unknow
  */
 export async function exactConfigHooks(file: string): Promise<unknown> {
   const text = await readText(file, []);
+  const config = text === undefined ? undefined : exactToml(text);
+  return isRecord(config) ? config.hooks : undefined;
+}
+
+/**
+ * A config.toml's text as Codex reads its numbers: each integer, and each float, a SerdeNumber of
+ * the text serde_json gives it, so a check can tell `30` from `30.0`. Undefined where it does not
+ * parse.
+ */
+export function exactToml(text: string): Record<string, unknown> | undefined {
   try {
-    const config = text === undefined ? undefined : parse(text, { integersAsBigInt: true });
-    return config === undefined ? undefined : exactTomlNumbers(config.hooks);
+    return exactTomlNumbers(parse(text, { integersAsBigInt: true })) as Record<string, unknown>;
   } catch {
     return undefined;
   }

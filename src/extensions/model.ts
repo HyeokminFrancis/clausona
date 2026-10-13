@@ -85,7 +85,9 @@ export type Extension = {
    * `name too long` (over 64 characters) or with `no description`, a hook in an `invalid hooks
    * file` (more than `hooks` and `description` at its top), and one Codex does not run at all,
    * `not supported` (a prompt or agent hook, an MCP tool hook when a session ends), with an
-   * `empty command`, or an MCP tool hook with an `empty tool` (or server). A hook in a linked
+   * `empty command`, an MCP tool hook with an `empty tool` (or server), a hook on an
+   * `unknown event`, one of none of Codex's twelve, or in a group with an `invalid matcher`, a
+   * pattern Codex cannot compile. A hook in a linked
    * worktree's own `.codex` folder is `main checkout's runs`: Codex runs the main checkout's
    * hooks there in its place. Unlike Claude Code, Codex lists no skill without front matter, or
    * without a description, so it does not load.
@@ -99,7 +101,9 @@ export type Extension = {
     | "invalid hooks file"
     | "not supported"
     | "empty command"
-    | "empty tool";
+    | "empty tool"
+    | "unknown event"
+    | "invalid matcher";
   /** What is shown about it, already redacted. */
   summary?: Record<string, string>;
   /** Hooks: where the command sits in its file. */
@@ -240,6 +244,13 @@ export type StateFacts = {
   codexHookTrust: { id: string; keys: string[]; hash: string; builtin?: true }[];
   /** `[hooks.state."<key>"]` in the user config.toml: one hook's `enabled`, and the hash it was trusted at. */
   codexHookStates: { file: string; key: string; enabled?: boolean; trustedHash?: string }[];
+  /**
+   * Each config.toml Codex refuses whole - one it cannot parse, or with a value of the wrong type
+   * in a section clausona reads: then Codex loads no config at all, and so no skill, server or
+   * hook. The user config.toml has no `project`, and its refusal holds in every project; a trusted
+   * project's holds in that project, where Codex checks it merged over the user's.
+   */
+  codexConfigRefused: { file: string; project?: string }[];
 };
 
 export function emptyFacts(): StateFacts {
@@ -262,6 +273,7 @@ export function emptyFacts(): StateFacts {
     codexPluginServers: [],
     codexHookTrust: [],
     codexHookStates: [],
+    codexConfigRefused: [],
   };
 }
 

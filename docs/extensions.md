@@ -227,7 +227,7 @@ The `state` of an item in JSON is one of these:
 
 | State | Meaning |
 |---|---|
-| `on` | The switch is on. It loads unless a tag says `hidden by …` or `broken link`, or, for a Codex skill, `no front matter`, `invalid front matter`, `name too long` or `no description`, or, for a Codex hook, `invalid hooks file`, `not supported`, `empty command` or `empty tool`. |
+| `on` | The switch is on. It loads unless a tag says `hidden by …` or `broken link`, or, for a Codex skill, `no front matter`, `invalid front matter`, `name too long` or `no description`, or, for a Codex hook, `invalid hooks file`, `not supported`, `empty command`, `empty tool`, `unknown event` or `invalid matcher`. |
 | `off` | It is turned off. |
 | `name-only` | A Claude skill set to `name-only` in `skillOverrides`. The details say "Shows as name only". |
 | `user-invocable-only` | A Claude skill set to `user-invocable-only` in `skillOverrides`. The details say "Shows as only when you call it". |
@@ -238,7 +238,8 @@ The `state` of an item in JSON is one of these:
 `state` is the switch's value and nothing more. A row loads here when its state is `on`,
 `name-only` or `user-invocable-only` and no tag says `hidden by …` or `broken link`, or, for a
 Codex skill, `no front matter`, `invalid front matter`, `name too long` or `no description`, or,
-for a Codex hook, `invalid hooks file`, `not supported`, `empty command` or `empty tool`.
+for a Codex hook, `invalid hooks file`, `not supported`, `empty command`, `empty tool`,
+`unknown event` or `invalid matcher`.
 A hidden copy, a broken link and a file Codex skips keep their own `state`; only the tags say
 they do not load. A `mixed` row loads in the accounts whose `stateByAccount` value is `on`,
 except where another copy wins there, which its details say. A row read per account says it
@@ -308,6 +309,10 @@ The switches are read from these places:
   server a project's `config.toml` defines is `off` while Codex does not trust the project, as
   Codex leaves that file out: a same-name server of your own loads there instead. Its details
   say so, with the `Trust` line a switch there gets.
+  Where Codex trusts the project, it merges such a server over your own of the same name, key
+  by key: the project's `command` with your `args`, and `env` from both, the project's winning
+  where both set a key; a list such as `args` is the project's whole when it sets one. Runs,
+  the details and the JSON `summary` show that merged server, which is what Codex starts.
 - Codex's trust: Codex looks for a `[projects."<folder>"]` with a `trust_level` in its
   `config.toml` in three places, and the first it finds decides. First the project's folder,
   then its project root: the nearest folder at or above it with a `.git`, or with one of the
@@ -315,8 +320,10 @@ The switches are read from these places:
   worktree is the main checkout. So a worktree of a trusted repository, and a folder inside one,
   are trusted, unless their own entry says `untrusted`. Each folder matches by its real path or
   as you reached it; git names a worktree's main checkout by its real path, as Codex records a
-  trust. On Windows a key matches in any case, and the real path is Codex's spelling of it: long
-  names, and `\\?\UNC\` kept for a network share or a mapped drive.
+  trust. A key matches only as written: a trailing slash, a `..`, forward slashes on Windows or
+  another case of a letter elsewhere make it name no folder, as in Codex. On Windows a key
+  matches in any case of its ASCII letters, and no others (`É` is not `é`), and the real path is
+  Codex's spelling of it: long names, and `\\?\UNC\` kept for a network share or a mapped drive.
 - Codex plugins and what they bring: a `[plugins."<plugin>@<marketplace>"]` table in Codex's or
   the project's `config.toml` turns a plugin on, and `enabled = false` in it turns it off. A
   plugin no table names is off. A plugin's skill is switched by its full name in
@@ -339,16 +346,30 @@ The switches are read from these places:
   folder out. Their details say so, and why: `Trust  Codex does not trust this project, so it
   ignores its .codex folder.` Codex reads a hooks file only when it holds `hooks` and, at most,
   a `description` at its top, and every hook in it is one it can read: a known `type`, a string
-  `command`, `server` and `tool`, a whole-number `timeout`, and so on. The hooks of any other
+  `command`, `server` and `tool`, a `timeout` or `additionalContextLimit` written as a whole
+  number (`30`, not `30.0` or `3e1`, which Codex's JSON reading keeps as text), and so on. In a
+  `config.toml` a float there makes Codex refuse the whole file, and so does a `[hooks.state]`
+  entry that is no table, or whose `enabled` is no boolean or `trusted_hash` no string. The
+  hooks of any other
   file are tagged `invalid hooks file`, and so are all of a plugin manifest's inline hooks when
-  one of them is unreadable. A plugin whose `hooks` lists hook files and hooks together has none. Codex runs no prompt or
-  agent hook yet, nor an MCP tool hook when a session ends: those are tagged `not supported`. It
-  skips a command hook whose command is empty, or only spaces, and an MCP tool hook whose server
-  or tool is, and runs the rest of its file: those are tagged `empty command` and `empty tool`.
-  Codex also runs the hooks a `config.toml` holds, as
-  `[[hooks.<Event>]]` tables, beside that folder's `hooks.json`: Codex's own and a trusted
-  project's. Their key holds the `config.toml`'s path. clausona lists them and their trust, and
-  leaves changing them to `/hooks` in Codex (`codex-config-hook`).
+  one of them is unreadable. Codex drops those without a word; clausona also warns, naming the
+  plugin. A plugin whose `hooks` lists hook files and hooks together has
+  none. Codex runs no prompt or agent hook yet, nor an MCP tool hook when a session ends: those
+  are tagged `not supported`. It skips a command hook whose command is empty, or only spaces,
+  and an MCP tool hook whose server or tool is, and runs the rest of its file: those are tagged
+  `empty command` and `empty tool`. It reads its twelve events by their exact names and leaves
+  any other alone, its hooks unread, so a hook on such an event is tagged `unknown event`. On
+  the events that take a matcher, Codex compiles one that is not `*`, empty or plain names
+  (letters, digits, `_` and `|`) as a Rust regex, and skips the whole group when it cannot:
+  its hooks are tagged `invalid matcher`. Rust's regex is not JavaScript's: it has no
+  lookaround (`(?=…)`) or backreferences, and takes `(?i)` and `\pL`. clausona checks the
+  matcher as Rust's parser does, so it tags only what Codex skips for sure; a matcher Rust
+  parses and then cannot compile, such as an unknown `\p{…}` name or one past its size limit,
+  is not tagged. Codex
+  also runs the hooks a `config.toml` holds, as `[[hooks.<Event>]]` tables, beside that folder's
+  `hooks.json`: Codex's own and a trusted project's. Their key holds the `config.toml`'s path.
+  clausona lists them and their trust, and leaves changing them to `/hooks` in Codex
+  (`codex-config-hook`).
 - Codex hooks in a linked git worktree: Codex runs the main checkout's hooks there, not the
   worktree's. It reads the `hooks.json` and the `config.toml` `[hooks]` of the `.codex` folder at
   the same place in the main checkout, and keys their trust by their paths there. The rest of the
@@ -367,8 +388,9 @@ A row can carry several tags. They are listed most important first: `broken link
 `off`, `off here` or `off in N of M accounts`, then `not here`, then `pending approval`, then
 `hidden by … copy`, then `unused`, then `no front matter`, then `invalid front matter`, then
 `name too long`, then `no description`, then `main checkout's runs`, then `invalid hooks file`,
-then `not supported`, then `empty command`, then `empty tool`. The NOTE column shows the first;
-JSON `tags` has them all.
+then `not supported`, then `empty command`, then `empty tool`, then `unknown event`, then
+`invalid matcher`. The NOTE
+column shows the first; JSON `tags` has them all.
 
 | Tag | When |
 |---|---|
@@ -383,7 +405,7 @@ JSON `tags` has them all.
 | `hidden by Parent folders copy` | In every account that has it, a same-name `.mcp.json` copy in a parent folder wins. |
 | `unused` | A Claude skill the rule below calls unused. |
 | `no front matter` | A skill whose `SKILL.md` has no front matter. Claude Code loads it under its folder's name, with no description, so it has only the skill's first non-empty line to tell when to use it: a quiet note, the skill still loads. Codex skips it, with no front matter between `---` lines, so a Codex one is not in Loaded. For Codex, a `SKILL.md` that starts with a byte order mark has none either. |
-| `invalid front matter` | A Codex skill whose front matter is not YAML Codex reads: say, a quoted description with more text after its closing quote, a description line that runs on to the next line unindented, or a description written as a list. Codex skips it, so it is not in Loaded. A description with a `: ` in it is fine: Codex quotes it and reads it again, and so does clausona. |
+| `invalid front matter` | A Codex skill whose front matter is not YAML Codex reads: say, a quoted description with more text after its closing quote, a description line that runs on to the next line unindented, or a description written as a list. Codex skips it, so it is not in Loaded. A description with a `: ` in it is fine: Codex quotes it and reads it again, and so does clausona. Tags, anchors and aliases, `?` keys, flow collections over several lines and `---` or `...` markers are read as Codex reads them, so a `description: !` or a second document counts. A few rare forms, such as a `%TAG` directive, are not checked, and read as fine. |
 | `name too long` | A Codex skill whose name is over 64 characters. Codex skips it, so it is not in Loaded. |
 | `no description` | A Codex skill whose front matter has no `description`, or one that is empty or only spaces. Codex skips it, so it is not in Loaded. |
 | `main checkout's runs` | A Codex hook in a linked git worktree's own `.codex` folder. Codex runs the main checkout's hooks there instead, so it is not in Loaded. Its details name the main checkout's file. |
@@ -391,6 +413,8 @@ JSON `tags` has them all.
 | `not supported` | A Codex hook of a kind Codex does not run: a prompt or an agent hook, or an MCP tool hook on `SessionEnd`. Codex skips it, whatever its trust, so it is not in Loaded. |
 | `empty command` | A Codex command hook whose command is empty or only spaces. Codex skips it, and runs the rest of its file, so it is not in Loaded. |
 | `empty tool` | A Codex MCP tool hook whose server or tool is empty or only spaces. Codex skips it, and runs the rest of its file, so it is not in Loaded. |
+| `unknown event` | A Codex hook on an event that is none of Codex's twelve, such as `Notification` or a `stop` in lower case. Codex leaves the event alone, so the hook is not in Loaded. |
+| `invalid matcher` | A Codex hook whose group's matcher is not a regex Codex can compile, such as `(?=Bash)` or `Bash(`, on an event that takes a matcher. Codex skips the group, so the hook is not in Loaded. |
 
 The three `hidden by` tags are the forms of `hidden by <scope> copy`, which names the scope of
 the copy that wins. [Which copy wins](#which-copy-wins) says which copy that is.
@@ -704,10 +728,40 @@ further."
 
 When a file cannot be read, the text output ends with "Could not read every file, so this
 list may miss what they hold:" and each file, with a position or a reason and never what it
-holds. JSON lists them in `warnings`. The exit code stays 0. A Codex `config.toml` with an
-integer too large for 64 bits is one of them, and so is one with a hook under `[hooks]` Codex
-cannot read: Codex refuses the whole file, and so clausona reads none of it. A larger integer
-that fits in 64 bits reads as Codex reads it.
+holds. JSON lists them in `warnings`. The exit code stays 0.
+
+A Codex `config.toml` that Codex refuses is one of them, and clausona reads none of it. Codex
+refuses one that is not valid TOML, one with an integer too large for 64 bits (a larger one that
+fits reads as Codex reads it), and one with a value of the wrong type in its typed config. Then
+Codex loads none of its config, and no skill, server, hook or plugin either, so every Codex row
+is off: Loaded says "off everywhere (Codex cannot read ~/.codex/config.toml)". clausona checks
+the sections it reads, against Codex's types:
+
+- `mcp_servers`: a server's fields, and its transport (a `command` or else a `url`, with nothing
+  the other takes);
+- `[[skills.config]]`: each entry's `enabled`, `name` and `path`;
+- `hooks` and `[hooks.state]`;
+- `plugins` and their servers' `enabled`;
+- `projects` and each `trust_level` (`trusted` or `untrusted`, as written).
+
+A trusted project's `config.toml` is checked merged over yours, as Codex merges them. So a
+switch for a server you do not define is a server with no transport, which Codex refuses too.
+When Codex refuses a trusted project's file, it loads no config in that project, yours
+included: the warning says so, and every Codex row is off in that project ("off here (Codex
+cannot read this project's .codex/config.toml)"). An untrusted project's file Codex leaves alone,
+one that is not valid TOML too.
+
+In a linked worktree Codex checks the worktree's own `config.toml` with the main checkout's
+`[hooks]` (and `[hooks.state]`) in place of the worktree's, and nothing else of the main
+checkout's file, so clausona checks that. A wrong type in the worktree's own `[hooks]` refuses
+nothing, since Codex drops those hooks there. One in the main checkout's `[hooks]`, or a main
+checkout's file that is not valid TOML, refuses the worktree's config, and the warning and
+Loaded name the main checkout's file. The rest of that file, such as a server switch clausona
+wrote there, counts in the main checkout alone, and is checked from there.
+
+clausona does not check the
+sections it does not read. A wrong type there makes Codex refuse the file all the same, and
+clausona reads the file as fine.
 
 ## Changing things
 
@@ -1104,6 +1158,15 @@ the CLI's words. In the table `<tool>` is the tool's name and `<scope>` a scope'
 | `bundled-off` | `disableBundledSkills` in `<file>` turns off the skills that come with Claude Code. | Change it there. | Change it there. |
 | `codex-config-hook` | It is written in `<file>`, where clausona does not change hooks. | Use `/hooks` in Codex, or edit the file. | Use `/hooks` in Codex, or edit the file. |
 | `codex-worktree-hook` | Codex runs the hooks in `<file>` in this worktree. | Change them there. | Change them there. |
+| `codex-skips-hook` | `<why>`. | Change it in `<file>`. | Change it in `<file>`. |
+
+`codex-skips-hook` is `on` for a Codex hook tagged `invalid hooks file`, `not supported`,
+`empty command`, `empty tool`, `unknown event` or `invalid matcher`. Codex skips it whatever
+its switch, so `<why>` says why, as its details do: say, `Codex skips a hook whose command is
+empty`. It is also `on` for a Codex hook that a `config.toml` Codex cannot read keeps off. Codex
+then loads no config at all, so `/hooks` cannot help: `<why>` says
+`Codex cannot read <file>, so it loads no config here` (`anywhere`, for yours), and `<file>` is
+that `config.toml`.
 
 On the screen, `stash-gone` on one account's server, in a row other accounts share, says
 `Press d and choose only work in the dialog.` instead, since `d` on the row would delete the

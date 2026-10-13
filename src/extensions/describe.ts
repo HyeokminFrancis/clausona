@@ -28,6 +28,7 @@ import {
   type ToolName,
 } from "./scopes.js";
 import {
+  CODEX_REFUSED_KEY,
   codexTrusted,
   codexWorktreeRuns,
   isMcpjsonServer,
@@ -46,7 +47,8 @@ import {
 /**
  * One of the verbatim tags: off, off here, off in N of M accounts, not here, unused, broken
  * link, pending approval, hidden by … copy, no front matter, invalid front matter, name too long,
- * no description, invalid hooks file, not supported, empty command, empty tool.
+ * no description, invalid hooks file, not supported, empty command, empty tool, unknown event,
+ * invalid matcher.
  */
 export type Tag = string;
 
@@ -117,13 +119,15 @@ const CODEX_SKIPS: Record<NonNullable<Extension["codexError"]>, string> = {
   "not supported": "Codex does not run an MCP tool hook when a session ends",
   "empty command": "Codex skips a hook whose command is empty",
   "empty tool": "Codex skips an MCP tool hook whose server or tool is empty",
+  "unknown event": "Codex knows no event of that name, and runs no hook on it",
+  "invalid matcher": "Codex skips the hooks of a matcher that is not a regex it can compile",
 };
 
 /**
  * Why Codex does not load `item`, which has a `codexError`: for a hook it does not run, of which
  * kind, and for a worktree's own, which file Codex runs the hooks of instead.
  */
-function codexSkip(inv: Inventory, item: Extension, error: NonNullable<Extension["codexError"]>): string {
+export function codexSkip(inv: Inventory, item: Extension, error: NonNullable<Extension["codexError"]>): string {
   const type = item.summary?.type;
   if (error === "not supported" && (type === "prompt" || type === "agent")) {
     return `Codex does not run ${type} hooks yet`;
@@ -297,7 +301,7 @@ export function usageCells(
 
 /**
  * Whether a setting was read from a project's own place: its `.claude/settings*.json`, an
- * account's `.claude.json` entry for it, or its `.codex/config.toml`. Told from the facts the
+ * account's `.claude.json` entry for it, or its `.codex/config.toml` - one Codex refuses too. Told from the facts the
  * sources recorded with a project, not from where the file is: in the home dir every file is
  * under the project, `~/.claude/settings.json` too, and that one is the user's.
  */
@@ -314,7 +318,8 @@ function isProjectSetting(inv: Inventory, file: string): boolean {
     facts.claudeMcpjson.some(at) ||
     facts.codexMcpEnabled.some(at) ||
     facts.codexPlugins.some(at) ||
-    facts.codexPluginServers.some(at)
+    facts.codexPluginServers.some(at) ||
+    facts.codexConfigRefused.some(at)
   );
 }
 
@@ -326,12 +331,12 @@ function scopeLabel(item: Extension, project: string | undefined): string {
  * Every tag that applies, most important first: broken link > off > off here > off in N of M
  * accounts > not here > pending approval > hidden by … > unused > no front matter > invalid
  * front matter > name too long > no description > main checkout's runs > invalid hooks file >
- * not supported > empty command > empty tool. A row that is not here has no state here, so no
- * tag of one. `no front matter` is a quiet note for a Claude skill, which Claude Code loads all
- * the same; for a Codex skill, which Codex skips, it, `invalid front matter`, `name too long` and
- * `no description` are why it is not in Loaded, and `main checkout's runs`, `invalid hooks file`,
- * `not supported`, `empty command` and `empty tool` why a Codex hook does not run, which its
- * details say.
+ * not supported > empty command > empty tool > unknown event > invalid matcher. A row that is not here has no
+ * state here, so no tag of one. `no front matter` is a quiet note for a Claude skill, which
+ * Claude Code loads all the same; for a Codex skill, which Codex skips, it, `invalid front
+ * matter`, `name too long` and `no description` are why it is not in Loaded, and `main
+ * checkout's runs`, `invalid hooks file`, `not supported`, `empty command`, `empty tool`,
+ * `unknown event` and `invalid matcher` why a Codex hook does not run, which its details say.
  */
 export function tagsOf(inv: Inventory, row: ScopeRow, project: string | undefined, now: number): Tag[] {
   const item = firstOf(row);
@@ -485,7 +490,8 @@ const WHOLE_KIND: ReadonlySet<string> = new Set(["disableAllHooks", "disableBund
 /**
  * Where a state is set, in words: the file (`settingPlace`), and for a setting that turns a whole
  * kind off, or a list of servers, the setting too - "disableAllHooks in ~/.claude/settings.json",
- * "not in allowedMcpServers in …", "only the servers in …/managed-mcp.json start". A list's
+ * "not in allowedMcpServers in …", "only the servers in …/managed-mcp.json start", "Codex
+ * cannot read this project's .codex/config.toml". A list's
  * match that read a variable says so, since Claude Code reads it in its own environment:
  * "deniedMcpServers in …, with ${TOOLS} as your shell and settings set it".
  */
@@ -498,6 +504,12 @@ function setByWords(
   const place = settingPlace(inv, item, project, setBy.file);
   if (setBy.key === "allowedMcpServers") return `not in allowedMcpServers in ${place}${readWords(setBy.reads)}`;
   if (setBy.key === MANAGED_MCP_KEY) return `only the servers in ${place} start`;
+  if (setBy.key === CODEX_REFUSED_KEY) {
+    // A linked worktree's can be its main checkout's file, which is no file of this project.
+    const here = viewFrom(item, project);
+    const inside = here !== undefined && isWithin(setBy.file, here);
+    return `Codex cannot read ${inside ? place : tilde(setBy.file, inv.homeDir)}`;
+  }
   return WHOLE_KIND.has(setBy.key) ? `${setBy.key} in ${place}${readWords(setBy.reads)}` : place;
 }
 
@@ -606,7 +618,9 @@ function loadedLines(inv: Inventory, row: ScopeRow, project: string | undefined)
   }
   if (state.value === "off") {
     const untrusted = UNTRUSTED_OFF[item.kind];
-    if (state.setBy?.key !== STASH_KEY && untrusted !== undefined && untrustedOwn(inv, item)) {
+    // A config.toml Codex refuses keeps all of it out, whatever it trusts.
+    const kept = state.setBy?.key === STASH_KEY || state.setBy?.key === CODEX_REFUSED_KEY;
+    if (!kept && untrusted !== undefined && untrustedOwn(inv, item)) {
       return [{ label: "Loaded", text: untrusted, tone: "warning" }];
     }
     if (!state.setBy) return [{ label: "Loaded", text: "off: no settings file turns it on", tone: "warning" }];

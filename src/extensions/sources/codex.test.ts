@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { valueHash } from "../hash.js";
 import { loadInventory } from "../inventory.js";
-import { type Collector, emptyFacts } from "../model.js";
+import { type Collector, emptyFacts, type Warning } from "../model.js";
 import { stateOf } from "../state.js";
 import { TestHome } from "../test-home.js";
 import { codexProjectRecords, loadCodexContext, readCodex } from "./codex.js";
@@ -598,7 +598,7 @@ describe("readCodex", () => {
             ],
           },
         ],
-        // An event Codex does not know is no empty command.
+        // An event Codex does not know: no empty command, but an unknown event.
         Unknown: [{ hooks: [{ type: "command", command: "echo who" }] }],
       },
     });
@@ -615,8 +615,65 @@ describe("readCodex", () => {
         ["Stop#0.1", "empty command"],
         ["Stop#0.2", undefined],
         ["Stop#config.toml:0.0", "empty command"],
-        ["Unknown#0.0", undefined],
+        ["Unknown#0.0", "unknown event"],
       ].sort(),
+    );
+  });
+
+  it("marks the hooks of a group whose matcher Codex cannot compile, on an event that reads it", async () => {
+    const h = new TestHome();
+    homes.push(h);
+    // Codex 0.159.3's hooks/list: "invalid matcher" for (?=Bash), Bash( and [, and fine, names
+    // and stop listed, under the keys pre_tool_use:2:0, pre_tool_use:3:0 and stop:0:0.
+    h.write(".codex/hooks.json", {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: "(?=Bash)",
+            hooks: [
+              { type: "command", command: "ahead" },
+              { type: "prompt", prompt: "p" },
+            ],
+          },
+          { matcher: "Bash(", hooks: [{ type: "command", command: "open" }] },
+          { matcher: "(?i)bash|^Read$", hooks: [{ type: "command", command: "fine" }] },
+          { matcher: "Bash|Read", hooks: [{ type: "command", command: "names" }] },
+        ],
+        // Stop reads no matcher; SessionStart does.
+        Stop: [{ matcher: "(", hooks: [{ type: "command", command: "stop" }] }],
+        SessionStart: [{ matcher: "[", hooks: [{ type: "command", command: "start" }] }],
+      },
+    });
+    h.codex(
+      "personal",
+      ".codex",
+      '[[hooks.PreToolUse]]\nmatcher = "(?=Bash)"\n[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "toml"\n',
+    );
+    const out: Collector = { items: [], facts: emptyFacts(), warnings: [] };
+    const ctx = await loadCodexContext(h.registry, h.home, out.warnings);
+    if (!ctx) throw new Error("no codex context");
+    await readCodex(ctx, [], out);
+    const place = (id: string) => id.slice(id.indexOf(":-:") + 3);
+    expect(
+      out.items
+        .filter((i) => i.kind === "hook")
+        .map((i) => [place(i.id), i.codexError])
+        .sort(),
+    ).toEqual(
+      [
+        ["PreToolUse#0.0", "invalid matcher"],
+        ["PreToolUse#0.1", "invalid matcher"],
+        ["PreToolUse#1.0", "invalid matcher"],
+        ["PreToolUse#2.0", undefined],
+        ["PreToolUse#3.0", undefined],
+        ["PreToolUse#config.toml:0.0", "invalid matcher"],
+        ["SessionStart#0.0", "invalid matcher"],
+        ["Stop#0.0", undefined],
+      ].sort(),
+    );
+    // Codex lists none of a skipped group's hooks, so they have no trust to look up.
+    expect(out.facts.codexHookTrust.map((t) => place(t.id)).sort()).toEqual(
+      ["PreToolUse#2.0", "PreToolUse#3.0", "Stop#0.0"].sort(),
     );
   });
 
@@ -688,6 +745,87 @@ describe("readCodex", () => {
     // A prompt hook's fields are Codex's to ignore: that file reads, and its prompt is not supported.
     expect(out.items.find((i) => i.summary?.type === "prompt")?.codexError).toBe("not supported");
     expect(out.facts.codexHookTrust.map((t) => t.id)).toEqual([expect.stringContaining("fine@m")]);
+    // Codex says nothing of the manifest; clausona names the plugin whose inline hooks it drops.
+    expect(out.warnings.map((w) => [path.relative(h.home, w.file).split(path.sep).join("/"), w.message])).toEqual([
+      [
+        `${inl}/.codex-plugin/plugin.json`,
+        "has an inline hook Codex cannot read, so Codex drops every inline hook of plugin inl@m",
+      ],
+    ]);
+  });
+
+  it("reads a hook's timeout and context limit as serde does: a whole number written as one", async () => {
+    // Codex 0.159.3's hooks/list, one hooks.json each: "invalid type: map, expected u64" for a
+    // number its serde keeps as text (1e3, 1E3, 30.0, 3e1, 1e0), the same past u64; 0 and -0 read.
+    const read = async (field: string, value: string) => {
+      const h = new TestHome();
+      homes.push(h);
+      h.codex("personal", ".codex");
+      h.write(
+        ".codex/hooks.json",
+        `{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "good"}, {"type": "command", "command": "x", "${field}": ${value}}]}]}}`,
+      );
+      const out: Collector = { items: [], facts: emptyFacts(), warnings: [] };
+      const ctx = await loadCodexContext(h.registry, h.home, out.warnings);
+      if (!ctx) throw new Error("no codex context");
+      await readCodex(ctx, [], out);
+      return out.items.find((i) => i.summary?.command === "good")?.codexError ?? "read";
+    };
+    const forms = ["1e3", "1E3", "30.0", "3e1", "1e0", "18446744073709551616", "0", "-0", "30"];
+    const verdicts = await Promise.all(forms.map((n) => read("timeout", n)));
+    expect(verdicts).toEqual([...Array(6).fill("invalid hooks file"), "read", "read", "read"]);
+    expect(await read("additionalContextLimit", "1e3")).toBe("invalid hooks file");
+    expect(await read("additionalContextLimit", "2500.0")).toBe("invalid hooks file");
+    expect(await read("additionalContextLimit", "2500")).toBe("read");
+  });
+
+  it("refuses a config.toml whose hook has a timeout that is no whole number, as Codex does", async () => {
+    // Codex 0.159.3's config/read: "invalid type: floating point `30.0`, expected u64", and the
+    // same for 1e3 (a float in TOML) and -1; 30 reads.
+    for (const [timeout, refused] of [
+      ["30.0", true],
+      ["1e3", true],
+      ["-1", true],
+      ["30", false],
+    ] as const) {
+      const h = new TestHome();
+      homes.push(h);
+      h.codex(
+        "personal",
+        ".codex",
+        `[mcp_servers.x]\ncommand = "x"\n\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "c"\ntimeout = ${timeout}\n`,
+      );
+      const warnings: Warning[] = [];
+      const ctx = await loadCodexContext(h.registry, h.home, warnings);
+      expect([timeout, ctx?.config === undefined, warnings.map((w) => w.message)]).toEqual([
+        timeout,
+        refused,
+        refused ? ["has a hook Codex cannot read, so Codex refuses the whole file"] : [],
+      ]);
+    }
+  });
+
+  it("refuses a config.toml whose [hooks.state] Codex cannot read, as Codex refuses the whole file", async () => {
+    // Codex 0.159.3's config/read: "expected a boolean", "expected a string", "expected struct
+    // HookStateToml", "expected a map" - and a key it does not know in an entry, read.
+    for (const [state, refused] of [
+      ['[hooks.state."k"]\nenabled = "yes"\n', true],
+      ['[hooks.state."k"]\ntrusted_hash = 5\n', true],
+      ["[hooks.state]\nk = 5\n", true],
+      ["[hooks]\nstate = 5\n", true],
+      ['[hooks.state."k"]\nfoo = 1\nenabled = false\n', false],
+    ] as const) {
+      const h = new TestHome();
+      homes.push(h);
+      h.codex("personal", ".codex", `[mcp_servers.x]\ncommand = "x"\n\n${state}`);
+      const warnings: Warning[] = [];
+      const ctx = await loadCodexContext(h.registry, h.home, warnings);
+      expect([state, ctx?.config === undefined, warnings.map((w) => w.message)]).toEqual([
+        state,
+        refused,
+        refused ? ["has a hook Codex cannot read, so Codex refuses the whole file"] : [],
+      ]);
+    }
   });
 
   it("refuses a config.toml with a hook Codex cannot read, as Codex refuses the whole file", async () => {
@@ -784,6 +922,140 @@ describe("readCodex", () => {
     expect(past.warnings.map((w) => w.message)).toEqual([
       "has an integer too large for 64 bits, so Codex refuses the whole file",
     ]);
+  });
+
+  it("refuses a config.toml with a value of the wrong type in a section clausona reads, as Codex does", async () => {
+    // Codex 0.159.3's config/read, one config.toml each: "invalid configuration" for the first
+    // ones, read for the last.
+    const cases: [string, string | undefined][] = [
+      ["[mcp_servers.x]\ncommand = 5\n", "an MCP server"],
+      ['[mcp_servers.x]\ncommand = "x"\nargs = "x"\n', "an MCP server"],
+      ['[mcp_servers.x]\ncommand = "x"\nenv = { A = 5 }\n', "an MCP server"],
+      ['[mcp_servers.x]\ncommand = "x"\nurl = "http://x"\n', "an MCP server"],
+      ["[mcp_servers.x]\nenabled = false\n", "an MCP server"],
+      ['[mcp_servers.x]\nurl = "http://x"\nargs = ["a"]\n', "an MCP server"],
+      ['[mcp_servers.x]\ncommand = "x"\ntool_timeout_sec = -1.0\n', "an MCP server"],
+      ['[mcp_servers.x]\ncommand = "x"\nstartup_timeout_ms = 1.5\n', "an MCP server"],
+      ["mcp_servers = 5\n", "an MCP server"],
+      ['[[skills.config]]\nname = "a"\nenabled = "yes"\n', "a skills.config entry"],
+      ['[[skills.config]]\nname = "a"\n', "a skills.config entry"],
+      ["skills = 5\n", "a skills.config entry"],
+      ['[plugins."a@b"]\nenabled = "yes"\n', "a plugin"],
+      ['[plugins."a@b".mcp_servers.s]\nenabled = "no"\n', "a plugin"],
+      ['[projects."/x"]\ntrust_level = "maybe"\n', "a projects entry"],
+      ['[projects."/x"]\ntrust_level = "Trusted"\n', "a projects entry"],
+      ["hooks = 5\n", "a hook"],
+      // "cannot convert float seconds to Duration: value is negative"; a negative zero is no less than 0.
+      ['[mcp_servers.x]\ncommand = "x"\nstartup_timeout_sec = -1e-12\n', "an MCP server"],
+      ['[mcp_servers.x]\ncommand = "x"\nstartup_timeout_sec = -0.0\n', undefined],
+      ['[mcp_servers.x]\ncommand = "x"\ntool_timeout_sec = -0.0\n', undefined],
+      ['[mcp_servers.x]\ncommand = "x"\nstartup_timeout_sec = -0\n', undefined],
+      ['[mcp_servers.x]\ncommand = "x"\nstartup_timeout_ms = -0\n', undefined],
+      ['[mcp_servers.x]\ncommand = "x"\nfoo = 1\nstartup_timeout_sec = 5\n', undefined],
+      ['[[skills.config]]\npath = "rel/SKILL.md"\nenabled = false\n', undefined],
+      ['[projects."/x"]\nfoo = 1\n', undefined],
+    ];
+    for (const [text, problem] of cases) {
+      const h = new TestHome();
+      homes.push(h);
+      h.codex("personal", ".codex", text);
+      const warnings: Warning[] = [];
+      const ctx = await loadCodexContext(h.registry, h.home, warnings);
+      const message = problem && `has ${problem} Codex cannot read, so Codex refuses the whole file`;
+      expect([text, ctx?.config === undefined, warnings.map((w) => w.message)]).toEqual([
+        text,
+        problem !== undefined,
+        message ? [message] : [],
+      ]);
+    }
+  });
+
+  it("checks a trusted project's config.toml merged over the user's, as Codex does, and an untrusted one's not", async () => {
+    const h = new TestHome();
+    homes.push(h);
+    const projects = ["repos/bad", "repos/orphan", "repos/switch", "repos/untrusted"].map((p) => h.project(p));
+    const trusted = projects
+      .slice(0, 3)
+      .map((p) => `[projects."${p.replaceAll("\\", "\\\\")}"]\ntrust_level = "trusted"\n`);
+    h.codex("personal", ".codex", `${trusted.join("\n")}\n[mcp_servers.good]\ncommand = "good"\n`);
+    // Codex 0.159.3's config/read from each: "invalid type: integer `5`", "invalid transport" (a
+    // switch for a server the user does not define), read, and ignored.
+    h.write("repos/bad/.codex/config.toml", "[mcp_servers.p]\ncommand = 5\n");
+    h.write("repos/orphan/.codex/config.toml", "[mcp_servers.other]\nenabled = false\n");
+    h.write("repos/switch/.codex/config.toml", "[mcp_servers.good]\nenabled = false\n");
+    h.write("repos/untrusted/.codex/config.toml", "[mcp_servers.p]\ncommand = 5\n");
+    const out: Collector = { items: [], facts: emptyFacts(), warnings: [] };
+    const ctx = await loadCodexContext(h.registry, h.home, out.warnings);
+    if (!ctx) throw new Error("no codex context");
+    await readCodex(
+      ctx,
+      projects.map((p) => ({ path: p, tools: ["codex"], profiles: [] })),
+      out,
+    );
+    const said = "has an MCP server Codex cannot read, so Codex loads no config in this project";
+    expect(out.warnings.map((w) => [path.basename(path.dirname(path.dirname(w.file))), w.message]).sort()).toEqual([
+      ["bad", said],
+      ["orphan", said],
+    ]);
+    // The switch of a server the user defines still counts.
+    expect(out.facts.codexMcpEnabled.map((e) => [e.name, e.enabled])).toEqual([["good", false]]);
+  });
+
+  it("records where Codex refuses a config.toml: the user's everywhere, a trusted project's there", async () => {
+    const h = new TestHome();
+    homes.push(h);
+    const projects = ["repos/types", "repos/syntax", "repos/big", "repos/fine", "repos/untrusted"].map((p) =>
+      h.project(p),
+    );
+    const trusted = projects
+      .slice(0, 4)
+      .map((p) => `[projects."${p.replaceAll("\\", "\\\\")}"]\ntrust_level = "trusted"\n`);
+    h.codex("personal", ".codex", trusted.join("\n"));
+    // Codex 0.159.3 from each: config/read and skills/list fail for the first three ("invalid
+    // type", "Error parsing project config file", "u64 value was too large"); the last two read.
+    h.write("repos/types/.codex/config.toml", "[mcp_servers.p]\ncommand = 5\n");
+    h.write("repos/syntax/.codex/config.toml", "[mcp_servers.p\n");
+    h.write(
+      "repos/big/.codex/config.toml",
+      '[mcp_servers.p]\ncommand = "p"\nstartup_timeout_ms = 9223372036854775808\n',
+    );
+    h.write("repos/fine/.codex/config.toml", '[mcp_servers.p]\ncommand = "p"\n');
+    h.write("repos/untrusted/.codex/config.toml", "[mcp_servers.p\n");
+    const out: Collector = { items: [], facts: emptyFacts(), warnings: [] };
+    const ctx = await loadCodexContext(h.registry, h.home, out.warnings);
+    if (!ctx) throw new Error("no codex context");
+    await readCodex(
+      ctx,
+      projects.map((p) => ({ path: p, tools: ["codex"], profiles: [] })),
+      out,
+    );
+    const name = (file: string) => path.basename(path.dirname(path.dirname(file)));
+    expect(
+      out.facts.codexConfigRefused.map((r) => [name(r.file), r.project && path.basename(r.project)]).sort(),
+    ).toEqual([
+      ["big", "big"],
+      ["syntax", "syntax"],
+      ["types", "types"],
+    ]);
+    const says = Object.fromEntries(out.warnings.map((w) => [name(w.file), w.message]));
+    expect(says.types).toBe("has an MCP server Codex cannot read, so Codex loads no config in this project");
+    expect(says.syntax).toMatch(
+      /^is not valid TOML( at line \d+, column \d+)?, so Codex loads no config in this project$/,
+    );
+    expect(says.big).toBe("has an integer too large for 64 bits, so Codex loads no config in this project");
+    expect(says.untrusted).toMatch(/^is not valid TOML( at line \d+, column \d+)?$/);
+    expect(
+      out.items.filter((i) => i.kind === "mcp").map((i) => i.location.project && path.basename(i.location.project)),
+    ).toEqual(["fine"]);
+    // A user config.toml Codex refuses keeps all of its config out, in every project.
+    const user = new TestHome();
+    homes.push(user);
+    user.codex("personal", ".codex", "[mcp_servers.x\n");
+    const userOut: Collector = { items: [], facts: emptyFacts(), warnings: [] };
+    const userCtx = await loadCodexContext(user.registry, user.home, userOut.warnings);
+    if (!userCtx) throw new Error("no codex context");
+    await readCodex(userCtx, [], userOut);
+    expect(userOut.facts.codexConfigRefused).toEqual([{ file: userCtx.configFile }]);
   });
 
   it("warns for a config.toml that does not parse and reads the rest", async () => {
