@@ -8,6 +8,7 @@ import {
   toolsOf,
   withDefaults,
 } from "../core/route-config.js";
+import type { RouteRules, SkippedRule, Slots } from "../core/route-rules.js";
 import {
   blockingReset,
   FULL,
@@ -37,8 +38,11 @@ import {
  * two-column indent, tables that shed columns rather than wrap a row, and settings in a box.
  */
 
-/** How the route a run used was found. PR 2 adds `dir:<path>`, `default` and `active`. */
-export type ResolvedBy = "flag" | "inline";
+/**
+ * How the route a run used was found: named (`--route`), unsaved (`--from`), a dir rule (with its
+ * directory as stored), the tool's default, or none, so the tool's active profile ran.
+ */
+export type ResolvedBy = "flag" | "inline" | `dir:${string}` | "default" | "active";
 
 export function usageText(usage?: Usage): string {
   if (!usage) return "—";
@@ -500,17 +504,20 @@ function warningLines(warnings: string[], width: number): string[] {
 }
 
 /**
- * `route list`: one row per route, then the warnings. No routes at all is the empty state; only
- * routes that cannot be used is their warnings alone.
+ * `route list`: one row per route, then the dir rules and defaults (`rules`), then the warnings.
+ * No routes and no rules at all is the empty state; with no routes, what there is is shown alone.
  */
 export function renderRouteTable(
   rows: RouteListRow[],
   warnings: string[],
-  options: { width?: number; now?: number } = {},
+  options: { width?: number; now?: number; rules?: RuleRow[] } = {},
 ): string {
   const width = options.width ?? terminalWidth();
+  const rules = options.rules?.length ? ruleTableLines(options.rules, width) : [];
   if (rows.length === 0) {
-    return warnings.length ? ["", ...warningLines(warnings, width), ""].join("\n") : renderRoutesEmpty();
+    if (rules.length === 0 && warnings.length === 0) return renderRoutesEmpty();
+    const notes = warningLines(warnings, width);
+    return ["", ...rules, ...(rules.length && notes.length ? [""] : []), ...notes, ""].join("\n");
   }
   const now = options.now ?? Date.now();
   const cells = rows.map(({ name, route, ranking: given }): Record<RouteColumn, Cell> => {
@@ -533,7 +540,98 @@ export function renderRouteTable(
     }),
   );
   const notes = warningLines(warnings, width);
-  return ["", ...fitTable(layouts, width), ...(notes.length ? ["", ...notes] : []), ""].join("\n");
+  return [
+    "",
+    ...fitTable(layouts, width),
+    ...(rules.length ? ["", ...rules] : []),
+    ...(notes.length ? ["", ...notes] : []),
+    "",
+  ].join("\n");
+}
+
+// ─── Dir rules and defaults ─────────────────────────────────────────
+
+/**
+ * A row of the rules table: a dir rule, labelled with its directory as stored, or the defaults.
+ * Each slot's route, and whether it can be used there (a slot that cannot be read shows `?`).
+ */
+export type RuleRow = {
+  label: string;
+  isDefault?: boolean;
+  slots: Partial<Record<ToolName, { route: string; usable: boolean }>>;
+};
+
+function slotCell(slot: RuleRow["slots"][ToolName]): Cell {
+  if (!slot) return [["—", dim]];
+  return [[slot.route, slot.usable ? undefined : yellow]];
+}
+
+/** The rules as `route list`, `route dir` and `route default` show them; the defaults come last. */
+function ruleTableLines(rows: RuleRow[], width: number): string[] {
+  const table: Table = {
+    columns: [{ label: "DIRECTORY" }, { label: "CLAUDE" }, { label: "CODEX" }],
+    rows: rows.map((row) => ({
+      cells: [
+        [[row.label, row.isDefault ? secondary : undefined]],
+        slotCell(row.slots.claude),
+        slotCell(row.slots.codex),
+      ],
+    })),
+  };
+  return fitTable([table], width);
+}
+
+/** `route dir` and `route default` with nothing after them: the rules, or how to make one. */
+export function renderRules(rows: RuleRow[], warnings: string[], options: { width?: number } = {}): string {
+  const width = options.width ?? terminalWidth();
+  const notes = warningLines(warnings, width);
+  if (rows.length === 0) {
+    const example = (command: string, text: string) => `    ${accent(command.padEnd(37))}${dim(text)}`;
+    return [
+      "",
+      `  ${bold("No dir rules or defaults yet.")}`,
+      "",
+      "  Without them, clausona run claude runs the active profile.",
+      "",
+      example("clausona route dir ~/work work", "in ~/work and below, take route work"),
+      example("clausona route default main", "everywhere else, take route main"),
+      ...(notes.length ? ["", ...notes] : []),
+      "",
+    ].join("\n");
+  }
+  return ["", ...ruleTableLines(rows, width), ...(notes.length ? ["", ...notes] : []), ""].join("\n");
+}
+
+/** What `clausona run <tool>` does in a directory, as `route explain` with no name lists it. */
+export type RunHere = { tool: ToolName; uses: string; because: string; routed: boolean };
+
+/**
+ * `route explain` with no name: for the directory `dir`, what each tool's run would do and which
+ * rule says so, the rules passed over, then each route's own explain (`details`).
+ */
+export function renderRunsHere(
+  dir: string,
+  runs: RunHere[],
+  details: string[],
+  options: { width?: number; warnings?: string[] } = {},
+): string {
+  const width = options.width ?? terminalWidth();
+  const table: Table = {
+    columns: [{ label: "RUN" }, { label: "USES" }, { label: "BECAUSE" }],
+    rows: runs.map((run) => ({
+      cells: [
+        [[`clausona run ${run.tool}`]],
+        [[run.uses, run.routed ? accent : undefined]],
+        [[run.because, secondary]],
+      ],
+    })),
+  };
+  const notes = warningLines(options.warnings ?? [], width);
+  const summary = ["", `  In ${dir}`, "", ...fitTable([table], width), ...(notes.length ? ["", ...notes] : [])];
+  // Each explain is set off by one blank line, as it is printed alone.
+  return [...summary, ...details.flatMap((detail) => ["", detail.replace(/^\n/, "").replace(/\n$/, "")]), ""].join(
+    "\n",
+  );
 }
 
 // ─── route explain / add / set ──────────────────────────────────────
@@ -726,17 +824,53 @@ function pickedWhy(ranking: Ranking): string {
   return "most room";
 }
 
+/** The rule a run took its route from, after the route's name: `(dir rule ~/work)`, `(default)`. */
+function ruleNote(resolvedBy: ResolvedBy | undefined): string {
+  if (resolvedBy === "default") return " (default)";
+  if (resolvedBy?.startsWith("dir:")) return ` (dir rule ${resolvedBy.slice("dir:".length)})`;
+  return "";
+}
+
 /** The one line a routed run says on stderr before it launches. */
-export function renderNote(name: string | undefined, ranking: Ranking): string {
+export function renderNote(name: string | undefined, ranking: Ranking, resolvedBy?: ResolvedBy): string {
   const { outcome } = ranking;
   if (outcome.kind !== "picked") return "";
   const usage = ranking.rows.find((row) => row.id === outcome.id)?.usage;
-  const parts = [routeLabel(name), pickedWhy(ranking)];
+  const parts = [`${routeLabel(name)}${ruleNote(resolvedBy)}`, pickedWhy(ranking)];
   if (usage) {
     const percent = wholeQuotaPercent(usage.percent, ranking.route.maxUsage);
     parts.push(`${percent}% of ${usage.window} used${usage.stale ? ", last reading" : ""}`);
   }
   return `  ${accent("▸")} ${bold(outcome.id)}  ${dim(parts.join(", "))}`;
+}
+
+/** A rule a run passed over: which rule, and why. */
+export function skippedText(skip: SkippedRule): string {
+  const rule = skip.dir === undefined ? `the ${skip.tool} default` : `the dir rule for ${skip.dir}`;
+  return `Skipped ${rule}: ${skip.why}.`;
+}
+
+/** A rule a run passed over, on stderr before the note. */
+export function renderSkippedRule(skip: SkippedRule): string {
+  return `  ${warnIcon} ${skippedText(skip)}`;
+}
+
+/**
+ * routes.json could not be read for a run that names no route, which then runs the active
+ * profile: one line, with the problem and the way out.
+ */
+export function renderRulesUnread(filePath: string, problem: string, newer: boolean): string {
+  const fix = newer ? "" : " Fix it with clausona route edit.";
+  return `  ${warnIcon} ${filePath} cannot be used, so no dir rule or default applies: ${problem}.${fix}`;
+}
+
+/**
+ * routes.json holds dir rules or defaults that cannot be read, for a run that names no route: one
+ * line, pointing at the command that lists them.
+ */
+export function renderRulesProblems(filePath: string, count: number): string {
+  const what = count === 1 ? "a dir rule or default" : `${count} dir rules or defaults`;
+  return `  ${warnIcon} ${filePath} has ${what} that cannot be read: clausona route list says why.`;
 }
 
 /** A reset nobody knows sorts after every known one. */
@@ -966,6 +1100,36 @@ export function explainJson(name: string | undefined, resolvedBy: ResolvedBy, ra
     excluded: ranking.excluded.map((entry) => ({ profile: entry.id, matchedBy: entry.pattern })),
     emptyPatterns: [...ranking.emptyPatterns],
     emptyExcludes: [...ranking.emptyExcludes],
+  };
+}
+
+const skippedJson = (skipped: SkippedRule[]) =>
+  skipped.map((skip) => ({ rule: skip.dir === undefined ? "default" : `dir:${skip.dir}`, reason: skip.why }));
+
+/**
+ * One tool's entry in `route explain --json` with no name: the explain of the route its run would
+ * take here, or the active profile when it would take none. `skipped` are the rules passed over.
+ */
+export function runHereJson(
+  tool: ToolName,
+  taken: { name: string | undefined; resolvedBy: ResolvedBy; ranking: Ranking } | { active: string | null },
+  skipped: SkippedRule[],
+): object {
+  if ("active" in taken) {
+    return { tool, route: null, resolvedBy: "active", profile: taken.active, skipped: skippedJson(skipped) };
+  }
+  return { tool, ...explainJson(taken.name, taken.resolvedBy, taken.ranking), skipped: skippedJson(skipped) };
+}
+
+/** `route list --json`'s `dirs` and `defaults`: the routes each slot names, as routes.json holds them. */
+export function rulesJson(rules: RouteRules): { dirs: object; defaults: object } {
+  const slotsJson = (slots: Slots) =>
+    Object.fromEntries(
+      Object.entries(slots).flatMap(([tool, slot]) => (slot && "route" in slot ? [[tool, slot.route]] : [])),
+    );
+  return {
+    dirs: Object.fromEntries(rules.dirs.map((rule) => [rule.dir, slotsJson(rule.slots)])),
+    defaults: slotsJson(rules.defaults),
   };
 }
 

@@ -1,8 +1,8 @@
-import { holdsKey, type RouteTool, toolsOf, withDefaults } from "../core/route-config.js";
-import { type LoadedRoutes, writeRefusal } from "../core/routes-store.js";
+import { holdsKey, type ProfileNames, type RouteTool, toolsOf, withDefaults } from "../core/route-config.js";
+import { type LoadedRoutes, loadRoutes, RoutesFileError, refusalOf } from "../core/routes-store.js";
 import { posixQuote } from "../core/shell.js";
 import { createRoute, newRouteFrom } from "../route-commands.js";
-import type { Registry } from "../types.js";
+import type { Registry, ToolName } from "../types.js";
 import { accent, bold, dim } from "./cli-style.js";
 import {
   CREDENTIAL_AS_NAME_ERROR,
@@ -16,6 +16,9 @@ import {
   renderNoAccount,
   renderNote,
   renderNothingToCreate,
+  renderRulesProblems,
+  renderRulesUnread,
+  renderSkippedRule,
   takesNobody,
 } from "./route-render.js";
 import {
@@ -25,10 +28,12 @@ import {
   NoAccountError,
   namesOf,
   otherToolTaking,
+  pathsFor,
   type ResolvedRoute,
   type RouteDeps,
   rankRouteNow,
   resolveRoute,
+  routeByRules,
   routesFor,
   UnknownRouteError,
 } from "./route-service.js";
@@ -106,9 +111,10 @@ async function offerToCreate(
   loaded: LoadedRoutes,
 ): Promise<ResolvedRoute> {
   if (!io.interactive) throw error;
-  // Writing it would be refused while another route cannot be used: said now, before any quota
-  // is read or a question asked that a yes could not make good.
-  if (loaded.broken.length > 0) throw writeRefusal(loaded.filePath, loaded.broken);
+  // Writing it would be refused while another route, a dir rule or a default cannot be used:
+  // said now, before any quota is read or a question asked that a yes could not make good.
+  const refusal = refusalOf(loaded.filePath, loaded.file, loaded.broken);
+  if (refusal) throw refusal;
   const { route: _name, ...overrides } = run.options;
   const tool = run.tool ?? inferRouteTool(overrides.from ?? []) ?? "claude";
   checkArgsHaveTool(error.routeName, tool, run);
@@ -135,9 +141,41 @@ async function offerToCreate(
 }
 
 /**
+ * The route a run of `tool` that names none takes from routes.json's dir rules and defaults, or
+ * null for the active profile. Each rule passed over is said on stderr; so is a routes.json that
+ * cannot be read at all, which then stops nothing: the run goes on as if it had no rules.
+ */
+async function ruleRoute(
+  tool: ToolName,
+  io: RouteIo,
+  deps: RouteDeps,
+  names: ProfileNames,
+): Promise<ResolvedRoute | null> {
+  let loaded: LoadedRoutes;
+  try {
+    loaded = await loadRoutes(deps.paths, names);
+  } catch (error) {
+    const problem =
+      error instanceof RoutesFileError
+        ? error.problems.join("; ")
+        : error instanceof Error
+          ? error.message
+          : String(error);
+    io.say(renderRulesUnread(deps.paths.routesPath, problem, error instanceof RoutesFileError && error.newer));
+    return null;
+  }
+  const { resolved, skipped, problems } = routeByRules(loaded, tool, deps.cwd, pathsFor(deps), names);
+  // A rule whose directory cannot be read never comes up below, yet may have been meant for here.
+  if (problems.length) io.say(renderRulesProblems(loaded.filePath, problems.length));
+  for (const skip of skipped) io.say(renderSkippedRule(skip));
+  return resolved;
+}
+
+/**
  * `clausona run` without a named profile. Picks through the route the arguments name (or an
  * unsaved one from --from), records the pick, says on stderr what it picked, and launches it.
- * With only a tool and no route, it runs that tool's active profile.
+ * With only a tool, the route comes from the dir rule for the current directory, else the tool's
+ * default; with neither, it runs that tool's active profile.
  */
 export async function runRouted(
   args: string[],
@@ -156,8 +194,8 @@ export async function runRouted(
   const run = readRunArgs(args);
   let resolved: ResolvedRoute | null = null;
   let unknown: UnknownRouteError | undefined;
-  // Read only for a named route, and refused only for that route's problems: a run on the
-  // active profile, or on an unsaved route, goes ahead whatever routes.json holds.
+  // Read here only for a named route, and refused only for that route's problems: an unsaved
+  // route goes ahead whatever routes.json holds, and a run on dir rules reads it below.
   const names = namesOf(registry);
   const loaded = await routesFor(run.options.route, deps.paths, names);
   try {
@@ -185,7 +223,7 @@ export async function runRouted(
         "Name a route, a tool or a profile: clausona run --route <name> …, clausona run claude …, or clausona run <profile> ….",
       );
     }
-    // `run claude claude:b` would launch the active profile with `claude:b` as its prompt. Only a
+    // `run claude claude:b` would launch another account with `claude:b` as its prompt. Only a
     // word that names a registered profile exactly; any other word is the tool's.
     const [word] = run.toolArgs;
     if (word !== undefined && !run.sawSeparator && namesProfile(word, registry, run.tool)) {
@@ -194,12 +232,15 @@ export async function runRouted(
         `${id} is a profile. Run it by name: clausona run ${id} …, or put it after -- to pass it to ${run.tool}: clausona run ${run.tool} -- ${word}`,
       );
     }
-    const active = registry.activeProfiles[run.tool];
-    if (!active || !registry.profiles[active]) {
-      throw new Error(`No active ${run.tool} profile. Run \`clausona use\`, or name one: clausona run <profile>.`);
+    resolved = await ruleRoute(run.tool, io, deps, names);
+    if (!resolved) {
+      const active = registry.activeProfiles[run.tool];
+      if (!active || !registry.profiles[active]) {
+        throw new Error(`No active ${run.tool} profile. Run \`clausona use\`, or name one: clausona run <profile>.`);
+      }
+      io.say(`  ${accent("▸")} ${bold(active)}  ${dim("active profile (no route)")}`);
+      return launch(active, run.toolArgs);
     }
-    io.say(`  ${accent("▸")} ${bold(active)}  ${dim("active profile (no route)")}`);
-    return launch(active, run.toolArgs);
   }
 
   checkArgsHaveTool(resolved.name, resolved.onlyTool ?? resolved.route.tool, run);
@@ -215,6 +256,6 @@ export async function runRouted(
       renderNoAccount(resolved.name, ranking, { now: deps.clock(), onlyTool: resolved.onlyTool, overrides, resume }),
     );
   }
-  io.say(renderNote(resolved.name, ranking));
+  io.say(renderNote(resolved.name, ranking, resolved.resolvedBy));
   return launch(ranking.outcome.id, run.toolArgs);
 }

@@ -44,6 +44,7 @@ import {
   describeUnconfirmedCredential,
   describeUnverifiedLogin,
   renderDoctor,
+  renderDoctorRoutes,
   renderList,
   renderUsageSummary,
   unconfirmedCredentialHint,
@@ -103,7 +104,7 @@ import {
   updateProfileEnv,
   updateProfileSecret,
 } from "./lib/service.js";
-import { runRouteCommand } from "./route-commands.js";
+import { routeDoctor, runRouteCommand } from "./route-commands.js";
 import { CLAUDE_ENV_CATALOG, validateEnvEntry } from "./tools/claude-env-catalog.js";
 import { ALL_TOOLS, getAdapter } from "./tools/registry.js";
 import type { Profile, Registry, SecretSource, ToolName } from "./types.js";
@@ -737,6 +738,12 @@ function subcommandHelpText(command: string, args: string[] = []): string | unde
         `    ${dim("A subscription profile: its account file and its stored login. Run")}`,
         `    ${dim("`clausona login <profile>` for what that reports.")}`,
         "",
+        `    ${dim("Then ~/.clausona/routes.json, when there is one: routes that cannot be used,")}`,
+        `    ${dim("names that are not registered, patterns that match nobody, and dir rules and")}`,
+        `    ${dim("defaults that name a route that is missing or for the other tool. These are")}`,
+        `    ${dim("warnings, listed after every profile; --json leaves them out (`clausona route")}`,
+        `    ${dim("list --json` has them).")}`,
+        "",
         `  ${bold("API PROFILES")}`,
         `    ${dim("An API profile has no account file and no stored login, so neither is")}`,
         `    ${dim("checked for it and neither is reported missing. These are, instead:")}`,
@@ -961,7 +968,12 @@ function subcommandHelpText(command: string, args: string[] = []): string | unde
         `    ${dim("1. a named profile always runs, whatever its quota")}`,
         `    ${dim("2. --route <name>, with the options above applied for this run")}`,
         `    ${dim("3. --from: an unsaved route")}`,
-        `    ${dim("4. claude / codex alone: that tool's active profile")}`,
+        `    ${dim("4. claude / codex alone: the route of the deepest dir rule here (clausona route dir)")}`,
+        `    ${dim("5. then that tool's default route (clausona route default)")}`,
+        `    ${dim("6. then that tool's active profile")}`,
+        `    ${dim("A rule whose route is gone or for the other tool is skipped, said on stderr. A routes.json")}`,
+        `    ${dim("that cannot be read skips them all, with one line on stderr, and runs the active profile.")}`,
+        `    ${dim("clausona route explain says which of these a run here takes.")}`,
         `    ${dim("Routing options go before the tool's own arguments; a -- ends them.")}`,
         `    ${dim("A profile right after claude, codex or routing options is an error; after a -- it goes to the tool.")}`,
         `    ${dim("A routed run says on stderr which profile it picked, and why.")}`,
@@ -1250,7 +1262,11 @@ export async function runCommand(command: string, args: string[]) {
       const keysStored = Object.values(registry?.profiles ?? {}).some(
         (profile) => profile.kind === "api" && profile.api?.secret?.source === "keychain",
       );
-      const rendered = renderDoctor(results);
+      // routes.json's warnings come after every profile, as one more section; --json leaves them
+      // out, since its list holds profiles only (`route list --json` has them).
+      const routes = await routeDoctor();
+      const section = renderDoctorRoutes(routes.shown, routes.warnings);
+      const rendered = `${renderDoctor(results)}${section ? `${section}\n\n` : ""}`;
       return keysStored ? `${rendered}  ${dim(`Stored API keys are kept in ${secretStoreName()}.`)}\n` : rendered;
     }
 
