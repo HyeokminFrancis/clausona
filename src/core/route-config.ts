@@ -1,5 +1,5 @@
 import type { ToolName } from "../types.js";
-import { carriesCredentialToken, looksLikeCredential } from "./credential-token.js";
+import { carriesCredentialToken, looksLikeCredential, MAX_NAME_LENGTH } from "./credential-token.js";
 import { splitToolPrefix } from "./route-patterns.js";
 
 /**
@@ -124,15 +124,35 @@ function isLimit(value: unknown): boolean {
 }
 
 /**
+ * 'sk-' where a token starts: at the start, or after anything that cannot be part of a key, a
+ * name, an email or a glob - a space, `=`, a quote, a bracket, `;`, `/`. A short key, such as a
+ * gateway's `sk-1234`, is caught by nothing else once it is glued to what comes before it
+ * (`KEY=sk-…`, `"sk-…"`). Not after `.`, `@`, `+`, `*` or `?`: `team.sk-dev` is a profile name,
+ * `*@sk-gaming.com` and `me+sk-team@corp.com` email patterns and `*sk-*` a glob, and a routes.json
+ * holding one must read.
+ */
+const SK_TOKEN = /(?:^|[^A-Za-z0-9_\-.@+*?])sk-/i;
+
+/**
+ * The same after those five too, for text longer than a name. No name, email or glob a route holds
+ * is that long, and the rule before the length ceiling went word by word refused all such text:
+ * `KEY.sk-1234` in a long prompt stays refused.
+ */
+const SK_TOKEN_IN_LONG_TEXT = /(?:^|[^A-Za-z0-9_-])sk-/i;
+
+/**
  * Whether text holds something shaped like a key, so that it is neither stored nor quoted back:
- * the whole of it, or a piece of it between spaces, commas and colons, starts like one or carries
- * one anywhere. Pieces as well as the whole: `claude:<key>` does not start with 'sk-', and a
- * shorter key behind a prefix or a space stays under the length ceiling. A key anywhere: a vendor
+ * it carries one anywhere, 'sk-' starts a token of it, or a word of it, between spaces, commas
+ * and colons, is longer than a name. The length ceiling goes word by word, because a sentence is
+ * longer than any name without being a key; a word is not cut more finely, since a long base64
+ * key cut at its `/` or `+` would fall under the ceiling piece by piece. A key anywhere: a vendor
  * token (`hf_…`, `AIza…`, `ghp_…`) is short and does not start with 'sk-', so only
- * carriesCredentialToken sees it. Route names, patterns and the TUI's route form all ask this.
+ * carriesCredentialToken sees it. Route names, patterns, the TUI's route form and the target of
+ * `clausona run` all ask this.
  */
 export function holdsKey(text: string): boolean {
-  return [text, ...text.split(/[\s,:]+/)].some((piece) => looksLikeCredential(piece) || carriesCredentialToken(piece));
+  const skToken = text.length > MAX_NAME_LENGTH ? SK_TOKEN_IN_LONG_TEXT : SK_TOKEN;
+  return carriesCredentialToken(text) || skToken.test(text) || text.split(/[\s,:]+/).some(looksLikeCredential);
 }
 
 export function checkRouteName(name: string): string | null {

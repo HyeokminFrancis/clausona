@@ -108,6 +108,14 @@ describe("runTarget", () => {
     expect(() => runTarget("don't stop", REGISTRY)).toThrow(/clausona run claude 'don'\\''t stop'$/);
   });
 
+  it("gives a prompt longer than a name the same hint", () => {
+    const prompt = "please fix the failing test in the routing module and run the whole suite";
+    expect(() => runTarget(prompt, REGISTRY)).toThrow(
+      `'${prompt}' is not a profile or a tool. To pass a prompt, name the tool: clausona run claude '${prompt}'`,
+    );
+    expect(() => runTarget(`todo: ${prompt}`, REGISTRY)).toThrow(/^'todo: please fix .* is not a profile or a tool\./);
+  });
+
   it("keeps saying a well-formed name is not found", () => {
     expect(() => runTarget("nobody", REGISTRY)).toThrow("Profile 'nobody' not found.");
     expect(() => runTarget("claude:nobody", REGISTRY)).toThrow("Profile 'claude:nobody' not found.");
@@ -119,6 +127,13 @@ describe("runTarget", () => {
       ["sk", "ant", "y".repeat(24)].join("-"),
       `use ${["ghp", "Ab".repeat(18)].join("_")} now`,
       `run ${["sk", "ant", "y".repeat(8)].join("-")}`,
+      // Longer than a name, as a prompt is: the key still counts, word by word and anywhere.
+      `please run the whole suite with ${["sk", "ant", "y".repeat(24)].join("-")} and report back`,
+      `please run the whole suite as ${["ghp", "Ab".repeat(18)].join("_")} and report back`,
+      "x".repeat(70),
+      // A short key glued to what comes before it, as a gateway's master key can be.
+      `set ANTHROPIC_AUTH_TOKEN=${["sk", "1234"].join("-")} in .env, then restart the gateway and run the tests`,
+      `put "${["sk", "1234"].join("-")}" into the gateway config, then restart it and run the whole suite`,
     ]) {
       const error = (() => {
         try {
@@ -374,6 +389,47 @@ describe("runRouted", () => {
     await runRouted(["claude", "-p", "hi"], s.launch, s.io, s.deps);
     expect(s.launches).toEqual([["claude:a", ["-p", "hi"]]]);
     expect(s.notes).toEqual(["  ▸ claude:a  active profile (no route)"]);
+  });
+
+  it("refuses a profile right after the tool word, naming both ways on", async () => {
+    for (const [args, message] of [
+      [
+        ["claude", "claude:b"],
+        "claude:b is a profile. Run it by name: clausona run claude:b …, or put it after -- to pass it to claude: clausona run claude -- claude:b",
+      ],
+      [
+        ["claude", "solo", "-p", "hi"],
+        "claude:solo is a profile. Run it by name: clausona run claude:solo …, or put it after -- to pass it to claude: clausona run claude -- solo",
+      ],
+      [
+        ["claude", "codex:x"],
+        "codex:x is a profile. Run it by name: clausona run codex:x …, or put it after -- to pass it to claude: clausona run claude -- codex:x",
+      ],
+    ] as const) {
+      const s = setup({ registry: BOTH, quotas: BOTH_QUOTAS });
+      await expect(runRouted([...args], s.launch, s.io, s.deps)).rejects.toThrow(message);
+      expect(s.launches).toEqual([]);
+      expect(s.notes).toEqual([]);
+    }
+  });
+
+  it("passes the word after the tool word to the tool when it names no profile exactly, or follows --", async () => {
+    const s = setup({ registry: BOTH, quotas: BOTH_QUOTAS });
+    // `y` is only a codex profile; `Solo` differs from `solo` in case.
+    for (const args of [
+      ["claude", "--", "claude:b"],
+      ["claude", "y"],
+      ["claude", "Solo"],
+      ["claude", "hello"],
+    ]) {
+      await runRouted(args, s.launch, s.io, s.deps);
+    }
+    expect(s.launches).toEqual([
+      ["claude:a", ["claude:b"]],
+      ["claude:a", ["y"]],
+      ["claude:a", ["Solo"]],
+      ["claude:a", ["hello"]],
+    ]);
   });
 
   it("says so when the tool has no active profile, and launches nothing", async () => {

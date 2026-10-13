@@ -14,6 +14,8 @@ import {
 
 // Built from pieces so the source never holds a key-shaped string.
 const keyShaped = () => ["sk", "ant", "x".repeat(24)].join("-");
+/** A short key, as a self-hosted gateway or a LiteLLM master key can be. */
+const shortKey = () => ["sk", "1234"].join("-");
 
 describe("withDefaults", () => {
   it("fills every field a spec leaves out", () => {
@@ -59,11 +61,75 @@ describe("holdsKey", () => {
     ["a key after a pattern", () => `me@example.com, ${keyShaped()}`],
     ["a piece that starts like a key", () => "team sk-x"],
     ["a vendor token", () => ["hf", "Ab".repeat(17)].join("_")],
+    ["a word longer than a name", () => "x".repeat(65)],
+    ["a key in a sentence longer than a name", () => `please use ${keyShaped()} for every test in the module`],
+    [
+      "a short key after KEY= in a sentence longer than a name",
+      () => `set ANTHROPIC_AUTH_TOKEN=${shortKey()} in .env, then restart the gateway and run the tests`,
+    ],
+    [
+      "a short key in quotes in a sentence longer than a name",
+      () => `put "${shortKey()}" into the gateway config, then restart it and run the whole suite`,
+    ],
   ])("finds %s", (_what, text) => {
     expect(holdsKey(text())).toBe(true);
   });
 
-  it.each(["main", "*@work.example.com", "claude:team", ""])("finds nothing in %j", (text) => {
+  // A short key, such as a gateway's, glued to what comes before it: nothing but where 'sk-' starts
+  // gives it away, in a sentence of any length.
+  it.each([
+    "=",
+    '"',
+    "'",
+    "`",
+    "(",
+    "[",
+    "<",
+    "{",
+    ";",
+    ",",
+    ":",
+    "/",
+    "|",
+    "\n",
+  ])("finds a short key right after %j, in short and long sentences", (before) => {
+    for (const text of [
+      `set KEY${before}${shortKey()} ok`,
+      `please read the config, set KEY${before}${shortKey()} and run the whole suite before you report back`,
+      `please read the config, set KEY${before}${shortKey().toUpperCase()} and run the whole suite before you report`,
+    ]) {
+      expect(holdsKey(text)).toBe(true);
+    }
+  });
+
+  // Names, emails and globs hold these, and none of them is longer than a name: past that, the key
+  // after one is refused, as all such text was before the ceiling went word by word.
+  it.each([".", "@", "+", "*", "?"])("finds a short key right after %j in text longer than a name", (before) => {
+    for (const text of [
+      `please read the config, set KEY${before}${shortKey()} and run the whole suite before you report back`,
+      `please read the config, set KEY${before}${shortKey().toUpperCase()} and run the whole suite before you report`,
+    ]) {
+      expect(holdsKey(text)).toBe(true);
+    }
+  });
+
+  it.each([
+    "main",
+    "*@work.example.com",
+    "claude:team",
+    "",
+    // Longer than a name, and every word of it shorter than one.
+    "please fix the failing test in the routing module and run the whole suite",
+    // 'sk-' inside a word does not start a key.
+    "run the task-queue tests, then the risk-free and desk-lamp ones",
+    // Nor inside a name, an email or a glob.
+    "*@sk-gaming.com",
+    "claude:*@mail.sk-telecom.co.kr",
+    "team.sk-dev",
+    "*sk-*",
+    "eu.sk-team",
+    "me+sk-team@corp.com",
+  ])("finds nothing in %j", (text) => {
     expect(holdsKey(text)).toBe(false);
   });
 });
@@ -105,6 +171,12 @@ describe("checkPattern", () => {
     "claude:*@example.com",
     "jiyoung_lee",
     "*@corp.example.com",
+    // A domain, a plus tag, a name and a glob with 'sk-' inside them are not keys.
+    "*@sk-gaming.com",
+    "me+sk-team@corp.com",
+    "team.sk-dev",
+    "claude:team.sk-dev",
+    "*sk-*",
   ])("accepts %s on a claude route", (pattern) => {
     expect(checkPattern(pattern, "claude")).toBeNull();
   });
@@ -301,6 +373,17 @@ describe("checkRoutesFile", () => {
       ok: true,
       file: { version: 1, routes: { main: { tool: "claude", maxUsage: 80 }, odd: { tool: "codex", maxUsage: 90 } } },
     });
+  });
+
+  // A company domain that starts with 'sk-' is an email pattern like any other, and a file that
+  // holds one keeps reading.
+  it("reads a route named and matching with 'sk-' inside a name or a domain", () => {
+    const raw = {
+      version: 1,
+      routes: { "eu.sk-team": { tool: "claude", from: ["*@sk-gaming.com", "team.sk-dev"], exclude: ["*sk-*"] } },
+    };
+    expect(checkRouteName("eu.sk-team")).toBeNull();
+    expect(checkRoutesFile(raw)).toEqual({ ok: true, file: raw });
   });
 
   it("reads a missing routes object as none", () => {

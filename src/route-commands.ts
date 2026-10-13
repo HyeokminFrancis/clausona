@@ -185,6 +185,7 @@ export function routeHelp(sub?: string): string {
     `    ${dim("clausona route pick <name> --json        take a turn; call it once per worker you start")}`,
     `    ${dim("clausona run <profile> [--] ...          launch on the picked profile")}`,
     `    ${dim("add and set never ask; run asks one Y/n only for an unknown route in a terminal.")}`,
+    `    ${dim("Without a terminal, run exits 1 on an unknown route and creates nothing.")}`,
     `    ${dim("Create and change routes with add / set / remove, not by editing routes.json.")}`,
     `    ${dim("Before creating or changing a route for the user, show them its members (explain).")}`,
     "",
@@ -342,6 +343,12 @@ async function renameRoute(args: string[], deps: RouteDeps): Promise<string> {
     throw new Error(`${usage("rename")}\nRun \`clausona route rename --help\` for usage.`);
   const from = routeNameArg(oldArg, "rename");
   const to = routeNameArg(newArg, "rename");
+  if (from === to) {
+    // Not "already exists": the name it is taken by is its own, and there is nothing to write.
+    const file = await readRoutes(deps.paths);
+    if (!storedRoute(file, from)) throw new UnknownRouteError(from, Object.keys(file.routes).sort());
+    return success(dim(`Route ${from} already has that name. Nothing was changed.`));
+  }
   await updateRoutes((file) => {
     const spec = storedRoute(file, from);
     if (!spec) throw new UnknownRouteError(from, Object.keys(file.routes).sort());

@@ -296,7 +296,7 @@ describe("renderRouteDetail", () => {
     );
     const text = plain(renderRouteDetail("main", r, at(120)));
     expect(text).toContain("  │  Strategy   expiring (weekly limit resetting within 24h first)");
-    expect(text).toMatch(/▸ claude:team\s+85% 1h\s+10% 2d\s+picked: most room left \(all over 80%\)$/m);
+    expect(text).toMatch(/▸ claude:team\s+85% 1h\s+10% 2d\s+picked: most room left \(none under 80%\)$/m);
     expect(text).toMatch(/^ {4}claude:work\s+90% 1h\s+10% 2d\s+over 80%$/m);
 
     // At 99% too: past the cut, only a window at 100% holds an account back.
@@ -305,8 +305,19 @@ describe("renderRouteDetail", () => {
       { "claude:team": quota(99, 10), "claude:work": quota(100, 10) },
     );
     expect(plain(renderRouteDetail("main", full, at(120)))).toMatch(
-      /▸ claude:team\s+99% 1h\s+10% 2d\s+picked: most room left \(all over 50%\)$/m,
+      /▸ claude:team\s+99% 1h\s+10% 2d\s+picked: most room left \(none under 50%\)$/m,
     );
+  });
+
+  // Both are over the cut, but only one can still be picked when nobody is under it.
+  it("says at 100% for a member no stage can pick, and over the cut for one past it", () => {
+    const r = rank(
+      { tool: "claude", from: ["team", "work", "side"], strategy: "headroom" },
+      { "claude:team": quota(10, 10), "claude:work": quota(85, 10), "claude:side": quota(100, 40) },
+    );
+    const text = plain(renderRouteDetail("main", r, at(120)));
+    expect(text).toMatch(/^ {4}claude:work\s+85% 1h\s+10% 2d\s+over 80%$/m);
+    expect(text).toMatch(/^ {4}claude:side\s+100% 1h\s+40% 2d\s+at 100%$/m);
   });
 
   it("says when nobody can be picked, and that a run would exit 75", () => {
@@ -416,7 +427,7 @@ describe("renderRouteDetail", () => {
     const resumed = rank({ tool: "claude" }, resumedQuotas, { members: loners, resume: true });
     const long = renderRouteDetail("main", resumed, at(80));
     expect(plain(long)).toContain("keeps its own sessions, so it cannot resume a shared one");
-    expect(plain(long)).toContain("picked: most room left (all over 80%)");
+    expect(plain(long)).toContain("picked: most room left (none under 80%)");
     expect(widest(long)).toBeLessThanOrEqual(80);
 
     // Wider still with a fallback mark: the words are cut, the row still does not wrap.
@@ -444,7 +455,7 @@ describe("renderNote", () => {
   it("says the stage when the pool had nobody, and an unsaved route", () => {
     const r = ranking({ "claude:team": snap(85, 0), "claude:work": snap(90, 0), "claude:old": snap(0, 99) });
     expect(plain(renderNote(undefined, r))).toBe(
-      "  ▸ claude:team  inline route, most room left (all over 80%), 85% of 5H used",
+      "  ▸ claude:team  inline route, most room left (none under 80%), 85% of 5H used",
     );
     const fallback = rank(
       { tool: "claude", from: ["team"], fallback: ["work"] },
@@ -463,6 +474,11 @@ describe("renderNote", () => {
     );
     const later = rank({ tool: "claude", from: ["work"], strategy: "expiring" }, quotas);
     expect(plain(renderNote("main", later))).toBe("  ▸ claude:work  route main, most room, 5% of 5H used");
+    const past = rank(
+      { tool: "claude", from: ["team"], strategy: "expiring" },
+      { "claude:team": quota(10, 30, 1, -1) },
+    );
+    expect(plain(renderNote("main", past))).toBe("  ▸ claude:team  route main, weekly limit has reset, 30% of 7D used");
   });
 
   it("says when the usage is the last reading", () => {
@@ -481,10 +497,22 @@ describe("renderNote", () => {
   it("never says 100% of an account it picked under 100", () => {
     const r = rank({ tool: "claude", from: ["team"] }, { "claude:team": quota(99.6, 40) });
     expect(plain(renderNote("main", r))).toBe(
-      "  ▸ claude:team  route main, most room left (all over 80%), 99% of 5H used",
+      "  ▸ claude:team  route main, most room left (none under 80%), 99% of 5H used",
     );
     expect(usageText({ percent: 99.6, window: "5H", stale: false })).toBe("99% 5H");
     expect(plain(renderRouteDetail("main", r, at(120)))).toMatch(/^ {2}▸ claude:team\s+99% 1h\s+40% 2d/m);
+  });
+
+  // 79.6 is under a cut of 80 and was picked first, reading 80% beside an account at 80 over it.
+  it("never reads the cut for an account under it, in the note, the table and the preview", () => {
+    const spec: RouteSpec = { tool: "claude", from: ["team", "work"], strategy: "headroom" };
+    const r = rank(spec, { "claude:team": quota(10, 79.6), "claude:work": quota(80, 10) });
+    expect(plain(renderNote("main", r))).toBe("  ▸ claude:team  route main, most room, 79% of 7D used");
+    const text = plain(renderRouteDetail("main", r, at(120)));
+    expect(text).toMatch(/^ {2}▸ claude:team\s+10% 1h\s+79% 2d\s+picked next$/m);
+    expect(text).toMatch(/^ {4}claude:work\s+80% 1h\s+10% 2d\s+over 80%$/m);
+    const preview = plain(renderNewRoutePreview("main", spec, r, { width: 120 }));
+    expect(preview).toContain("claude:team 79%   claude:work 80% (over)");
   });
 });
 
@@ -511,6 +539,12 @@ describe("renderNoAccount", () => {
     // Soonest first; the skipped last.
     expect(text.indexOf("claude:side")).toBeLessThan(text.indexOf("claude:personal"));
     expect(text.indexOf("claude:personal")).toBeLessThan(text.indexOf("claude:old"));
+  });
+
+  // The same reading reads the same here as in explain: 79.6 is under the cut of 80.
+  it("never reads the cut for a window under it", () => {
+    const held = rank({ tool: "claude", from: ["side"] }, { "claude:side": quota(100, 79.6, 1, 72) });
+    expect(plain(renderNoAccount("main", held, at(120)))).toMatch(/^ {4}claude:side\s+100% 1h\s+79% 3d\s+in 1h/m);
   });
 
   // Offline, nothing was read, so nobody is "over" anything.
@@ -756,7 +790,7 @@ describe("JSON", () => {
     expect(pickJson("main", most)).toMatchObject({
       profile: "claude:team",
       stage: "overflow",
-      reason: "most room left (all over 80%)",
+      reason: "most room left (none under 80%)",
     });
   });
 

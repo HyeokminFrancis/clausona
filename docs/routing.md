@@ -65,6 +65,10 @@ The strategy only decides among pool members under the cut.
 | `headroom` | The lowest usage. | One run at a time, always on the account with the most room |
 | `expiring` | Among accounts whose weekly limit resets within 24 hours, the lowest usage. With none, the same as `headroom`. | Spending weekly quota before it resets unused |
 
+An older reading can carry a weekly reset time that has already passed. `expiring` counts that
+account too, since its week is over, and the run's note says `weekly limit has reset` instead of
+`weekly limit resets within 24h`.
+
 Round-robin keeps one record, `~/.clausona/route-picks.json`, with the time each account was
 last picked. The time belongs to the account, not to a route. A pick on one route counts as that
 account's turn on every route it is in.
@@ -403,6 +407,18 @@ instead:
 To run that account, name it alone: `clausona run claude:work`. After a `--` the name is the
 tool's, like any other argument.
 
+The same goes for a profile right after the tool word. `clausona run claude claude:work` would
+start the active profile with `claude:work` as its prompt, so clausona stops and names both ways
+on:
+
+```
+  ✘ claude:work is a profile. Run it by name: clausona run claude:work …, or put it after -- to pass it to claude: clausona run claude -- claude:work
+```
+
+Only a word that is exactly a registered profile's name stops the run. Any other word is the
+tool's first argument. So a profile named like one of the tool's own commands, such as `exec`,
+needs the `--` in front of the command: `clausona run codex -- exec …`.
+
 A first argument that is neither a profile nor a tool, such as a prompt typed without the tool,
 is refused with the fix:
 
@@ -518,10 +534,15 @@ $ clausona route explain main
 
 The box is the route with every default filled in. Under it comes every account, with its 5H
 and 7D use and the time until each resets. The `▸` and "picked next" mark the account a run
-would get now. "over 80%" is an account at or above the cut, and a skipped account says why in
-grey. At the bottom are the entries nothing was ranked for, such as an account the exclude list
-took out or a name that is not registered. `LAST PICKED` appears on round-robin routes, the one
-strategy that reads it.
+would get now. "over 80%" is an account at or above the cut, which can still be picked when
+nobody is under it. "at 100%" is one at its limit, which no stage picks. A skipped account says
+why in grey. At the bottom are the entries nothing was ranked for, such as an account the
+exclude list took out or a name that is not registered. `LAST PICKED` appears on round-robin
+routes, the one strategy that reads it.
+
+Percentages are rounded to whole numbers, except that one under the cut never reads as the cut.
+An account at 79.6% of a window can be picked under an 80% cut, so it reads 79%, here, in the
+run's note and on the Routes screen. One under 100% never reads 100% either.
 
 `explain` launches nothing and records nothing. It exits 0 even when nobody could be picked, and
 says so under the table:
@@ -551,22 +572,22 @@ $ clausona run --route solo --max-usage 30 -- -p "run the tests"
   ▸ claude:team  route solo, fallback, 22% of 7D used
 ```
 
-When every account is at the cut or over it, the one with the most left is picked, and that says
-so too:
+When no account is under the cut, the one with the most left is picked, and that says so too. The
+others may be at the cut, over it, or skipped, so the reason says "none under", not "all over":
 
 ```
 $ clausona route explain main
   …
     ACCOUNT            5H        7D       LAST PICKED
     ─────────────────────────────────────────────────
-  ▸ claude:team       85% 1h    22% 3d    never        picked: most room left (all over 80%)
+  ▸ claude:team       85% 1h    22% 3d    never        picked: most room left (none under 80%)
     claude:side       88% 1h    40% 3d                 over 80%
     claude:work       12% 3h    91% 4d                 over 80%
 ```
 
 ```
 $ clausona run --route main -- -p "run the tests"
-  ▸ claude:team  route main, most room left (all over 80%), 85% of 5H used
+  ▸ claude:team  route main, most room left (none under 80%), 85% of 5H used
 ```
 
 ## For scripts and agents
@@ -612,8 +633,8 @@ Without a terminal an unknown `--route` creates nothing.
 }
 ```
 
-`stage` is `pool`, `fallback` or `overflow`. `overflow` is the third stage: every account was at the
-cut or over it, and the one with the most left was picked. `route` is null for an unsaved route.
+`stage` is `pool`, `fallback` or `overflow`. `overflow` is the third stage: no account was under
+the cut, and the one with the most left was picked. `route` is null for an unsaved route.
 
 When nobody can be picked, the JSON is still printed on stdout, and the exit code is 75:
 

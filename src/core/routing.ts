@@ -46,8 +46,8 @@ export type Row = {
 /**
  * The stage that found the pick, as `--json` names it (`stage`): `pool`, an account of the pool
  * under the cut, by the strategy; `fallback`, the first fallback account under the cut; and
- * `overflow`, when everyone was at the cut or over it and the one with the most left, still under
- * 100%, was taken.
+ * `overflow`, when nobody was under the cut and the one with the most left, still under 100%, was
+ * taken.
  */
 export type Stage = "pool" | "fallback" | "overflow";
 
@@ -115,11 +115,17 @@ function byStrategy(route: Route, candidates: Row[], now: number): { row: Row; r
     return { row, reason: "next in turn" };
   }
   if (route.strategy === "expiring") {
+    const resetAt = (row: Row) => (row.sevenDay?.resetsAt ? Date.parse(row.sevenDay.resetsAt) : Number.NaN);
     const soon = candidates.filter((row) => {
-      const at = row.sevenDay?.resetsAt ? Date.parse(row.sevenDay.resetsAt) : Number.NaN;
+      const at = resetAt(row);
       return !Number.isNaN(at) && at - now <= EXPIRING_WITHIN_MS;
     });
-    if (soon.length > 0) return { row: [...soon].sort(byUsage)[0], reason: "weekly limit resets within 24h" };
+    if (soon.length > 0) {
+      const row = [...soon].sort(byUsage)[0];
+      // A reset already past is an older reading's: that week is over, which is as good a reason to
+      // take the account, but not the same one.
+      return { row, reason: resetAt(row) <= now ? "weekly limit has reset" : "weekly limit resets within 24h" };
+    }
     return { row: [...candidates].sort(byUsage)[0], reason: "lowest usage (no weekly reset within 24h)" };
   }
   return { row: [...candidates].sort(byUsage)[0], reason: "lowest usage" };
@@ -145,8 +151,11 @@ function soonestReset(rows: Row[], limit: number): { id: string; at: string } | 
   return best;
 }
 
-/** Why the overflow stage took its account; route-render.ts shows the same words. */
-export const mostLeftReason = (route: Route) => `most room left (all over ${route.maxUsage}%)`;
+/**
+ * Why the overflow stage took its account; route-render.ts shows the same words. "None under", not
+ * "all over": some may be skipped (signed out, no reading) rather than over, or sit at the cut.
+ */
+export const mostLeftReason = (route: Route) => `most room left (none under ${route.maxUsage}%)`;
 
 function decide(route: Route, rows: Row[], now: number): Outcome {
   const pool = under(

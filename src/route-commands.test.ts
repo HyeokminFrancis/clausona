@@ -128,6 +128,14 @@ describe("route help", () => {
     expect(overview).toMatch(/\(no arguments\)\s+In a terminal, open the Routes screen of the dashboard/);
   });
 
+  it("says in route's and run's help what an unknown route does without a terminal", async () => {
+    const { run } = setup();
+    expect(await run("--help")).toContain("Without a terminal, run exits 1 on an unknown route and creates nothing.");
+    expect(stripAnsi(await runCommand("run", ["--help"]))).toContain(
+      "Without a terminal, an unknown --route exits 1 and creates nothing.",
+    );
+  });
+
   it("says a run's --exclude adds to the route's list, and route set's replaces it", async () => {
     const { run } = setup();
     expect(await run("set", "--help")).toMatch(/--exclude <patterns>\s+Replace the route's exclude list/);
@@ -136,9 +144,9 @@ describe("route help", () => {
     );
   });
 
-  it("says in run's help that a profile does not go with routing options", async () => {
+  it("says in run's help that a profile does not go after a tool word or routing options", async () => {
     expect(stripAnsi(await runCommand("run", ["--help"]))).toContain(
-      "A profile after routing options is an error; after a -- it goes to the tool.",
+      "A profile right after claude, codex or routing options is an error; after a -- it goes to the tool.",
     );
   });
 });
@@ -405,6 +413,16 @@ describe("route set, rename, remove", () => {
     const before = file().routes;
     await expect(run("rename", "main", "other")).rejects.toThrow(/^Route 'other' already exists\.$/);
     expect(file().routes).toEqual(before);
+  });
+
+  it("says a rename to the route's own name changes nothing, and writes nothing", async () => {
+    const { run, file, deps } = setup();
+    await run("add", "main");
+    const before = readFileSync(deps.paths.routesPath, "utf8");
+    expect(await run("rename", "main", "main")).toBe("  ✔ Route main already has that name. Nothing was changed.");
+    expect(readFileSync(deps.paths.routesPath, "utf8")).toBe(before);
+    expect(Object.keys(file().routes)).toEqual(["main"]);
+    await expect(run("rename", "gone", "gone")).rejects.toThrow(/^Route 'gone' does not exist\./);
   });
 
   // Every object has these, so a lookup that is not of own keys finds one in every routes.json.
