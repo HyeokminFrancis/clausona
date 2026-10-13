@@ -6,7 +6,7 @@ import type { BrokenRoute, RoutesFile } from "../../core/route-config.js";
 import type { PathSystem } from "../../core/route-rules.js";
 import { RoutesFileError } from "../../core/routes-store.js";
 import { stripAnsi } from "../../lib/cli-style.js";
-import type { QuotaSnapshot, Registry } from "../../types.js";
+import type { QuotaSnapshot, Registry, ScopedQuotaWindow } from "../../types.js";
 import { DOWN, ENTER, ESC, type Instance, press, renderAt, type, typeSlowly, waitForFrame } from "../test-drive.js";
 import { RoutesScreen } from "./RoutesScreen.js";
 import type { RoutesListDeps, RoutesScreenDeps } from "./routes-deps.js";
@@ -1006,5 +1006,242 @@ describe("API profiles and their budgets", () => {
 
     await until(instance, (f) => !f.includes("New route"));
     expect(file().routes.paid).toMatchObject({ tool: "claude", from: ["*", "gw"] });
+  });
+});
+
+describe("ranked as a run of one model", () => {
+  const UP = "\u001B[A";
+  const WEEK = 7 * 24 * 60 * 60;
+  const FIVE_HOURS = 5 * 60 * 60;
+  /** A limit on one model, as Claude reports it; a Codex one says how long its window is. */
+  const limit = (label: string, usedPercent: number, windowSeconds?: number): ScopedQuotaWindow => ({
+    label,
+    usedPercent,
+    resetsAt: null,
+    ...(windowSeconds ? { windowSeconds } : {}),
+  });
+  const limited = (snapshot: QuotaSnapshot, ...limits: ScopedQuotaWindow[]): QuotaSnapshot => ({
+    ...snapshot,
+    scopedLimits: limits,
+  });
+  // claude:team's 7D is the lowest of route main, but its Opus limit is nearly used up.
+  const OPUS: Record<string, QuotaSnapshot> = {
+    ...QUOTAS,
+    "claude:team": limited(snap(5, 22), limit("Opus", 95)),
+    "claude:work": limited(snap(12, 34), limit("Opus", 10), limit("Sonnet", 20)),
+  };
+
+  it("ranks the selected route as a run of the model m picks: one over that model's limit is not next", async () => {
+    const { instance } = setup({ collect: async () => OPUS });
+    const before = panes(await ranked(instance));
+    expect(row(before.detail, "ACCOUNT")).toMatch(/ACCOUNT\s+5H\s+7D$/);
+    expect(row(before.detail, "claude:team")).toMatch(/^▸ claude:team\s.*5%.*22%\s+next$/);
+    expect(before.list[0]).toMatch(/^▸ main\s+claude\s+2\/4$/);
+
+    await press(instance, "m");
+    const { list, detail } = panes(text(instance));
+    expect(detail).toContain("Model     ranked as --model opus");
+    expect(row(detail, "ACCOUNT")).toMatch(/ACCOUNT\s+5H\s+7D\s+OPUS$/);
+    expect(row(detail, "claude:work")).toMatch(/^▸ claude:work\s.*12%.*34%\s+10%\s+next$/);
+    expect(row(detail, "claude:team")).toMatch(/^claude:team\s.*5%.*22%\s+95%\s+over 80%$/);
+    // No limit on Opus reported: a dash, as in `route explain --model opus`.
+    expect(row(detail, "claude:side")).toMatch(/^claude:side\s.*88%.*40%\s+—\s+over 80%$/);
+    // Who is free follows it; the routes not selected are ranked as before.
+    expect(list).toEqual([
+      expect.stringMatching(/^▸ main\s+claude\s+1\/4$/),
+      expect.stringMatching(/^solo\s+claude\s+2\/2$/),
+      expect.stringMatching(/^wide\s+all\s+4\/6$/),
+    ]);
+  });
+
+  it("goes through each model the accounts have a limit on, then none, and hints m only where it does that", async () => {
+    const { instance } = setup({ collect: async () => OPUS });
+    const none = await ranked(instance);
+    expect(none).toContain("m model");
+    expect(panes(none).detail).toContain("Model limits: Opus, Sonnet · m to rank by one");
+
+    await press(instance, "m");
+    expect(text(instance)).toContain("ranked as --model opus");
+    expect(text(instance)).not.toContain("Model limits");
+    await press(instance, "m");
+    const sonnet = panes(text(instance)).detail;
+    expect(sonnet).toContain("Model     ranked as --model sonnet");
+    expect(row(sonnet, "ACCOUNT")).toMatch(/ACCOUNT\s+5H\s+7D\s+SONNET$/);
+    expect(row(sonnet, "claude:team")).toMatch(/^▸ claude:team\s.*5%.*22%\s+—\s+next$/);
+    await press(instance, "m");
+    expect(text(instance)).toBe(none);
+    instance.unmount();
+
+    // No account reports a limit on a model: nothing to rank by, so no hint, no line, and m does nothing.
+    const plain = setup();
+    const frame = await ranked(plain.instance);
+    expect(frame).not.toContain("m model");
+    expect(frame).not.toContain("Model limits");
+    await type(plain.instance, "m");
+    expect(text(plain.instance)).toBe(frame);
+  });
+
+  it("ranks a route selected next as a run that names no model", async () => {
+    const { instance } = setup({ collect: async () => OPUS });
+    await ranked(instance);
+    await press(instance, "m");
+    await press(instance, DOWN);
+    expect(text(instance)).not.toContain("--model");
+
+    await press(instance, UP);
+    const { list, detail } = panes(text(instance));
+    expect(detail).toContain("Model limits: Opus, Sonnet · m to rank by one");
+    expect(row(detail, "claude:team")).toMatch(/^▸ claude:team\s.*next$/);
+    expect(list[0]).toMatch(/^▸ main\s+claude\s+2\/4$/);
+  });
+
+  const WITH_CODEX: Registry = {
+    ...REGISTRY,
+    profiles: { ...REGISTRY.profiles, "codex:personal-max": profile("codex", "personal-max") },
+  };
+  /** Sorted by name: cx, then main. */
+  const BOTH: RoutesFile = { version: 1, routes: { cx: { tool: "codex", from: ["*"] }, main: FILE.routes.main } };
+  // codex:personal-max is next on cx for a run that names no model, but the 5-hour window of its
+  // limit on GPT-5.3-Codex-Spark is nearly used up.
+  const LIMITS: Record<string, QuotaSnapshot> = {
+    ...OPUS,
+    "codex:x": limited(
+      snap(30, 10),
+      limit("GPT-5.3-Codex-Spark", 1, FIVE_HOURS),
+      limit("GPT-5.3-Codex-Spark", 5, WEEK),
+    ),
+    "codex:personal-max": limited(
+      snap(5, 8),
+      limit("GPT-5.3-Codex-Spark", 90, FIVE_HOURS),
+      limit("GPT-5.3-Codex-Spark", 30, WEEK),
+    ),
+  };
+
+  it.each([60, 80, 120])("keeps a model's column inside a %i-column terminal", async (columns) => {
+    const { instance } = setup({
+      file: BOTH,
+      registry: { loads: WITH_CODEX, problem: null },
+      collect: async () => LIMITS,
+      columns,
+    });
+    const line = (frame: string, id: string) => lines(frame).find((each) => each.includes(id)) ?? "";
+    expect(line(await ranked(instance), "codex:personal-max")).toMatch(/▸ codex:personal-max\s.*next$/);
+
+    await press(instance, "m");
+    const codex = text(instance);
+    for (const each of lines(codex)) expect(each.length, each).toBeLessThanOrEqual(columns);
+    expect(codex).toContain("ranked as --model gpt-5.3-codex-spark");
+    // The limit's whole name where it fits beside whole ids, else cut to its cells.
+    expect(codex).toMatch(columns > 60 ? /ACCOUNT\s+5H\s+7D\s+GPT-5\.3-CODEX-SPARK/ : /ACCOUNT\s+5H\s+7D\s+GPT-5\.…/);
+    // The higher of the limit's windows counts, and says which it is.
+    expect(line(codex, "codex:personal-max")).toMatch(/codex:personal-max\s.*\s5H\s.*\b90%\s+over 80%$/);
+    expect(line(codex, "codex:x")).toMatch(/▸ codex:x\s.*\s7D\s.*\b5%\s+next$/);
+
+    await press(instance, DOWN);
+    await press(instance, "m");
+    const claude = text(instance);
+    for (const each of lines(claude)) expect(each.length, each).toBeLessThanOrEqual(columns);
+    expect(claude).toMatch(/ACCOUNT\s+5H\s+7D\s+OPUS/);
+    expect(line(claude, "claude:work")).toMatch(/▸ claude:work\s.*\b10%\s+next$/);
+    expect(line(claude, "claude:team")).toMatch(/claude:team\s.*\b95%\s+over 80%$/);
+  });
+
+  // A run on an all route that names a model names its tool, and only that tool's accounts are ranked.
+  it("ranks an all route's accounts of the tool that reports the limit, and says so", async () => {
+    const { instance } = setup({ registry: { loads: WITH_CODEX, problem: null }, collect: async () => LIMITS });
+    await ranked(instance);
+    await press(instance, DOWN);
+    await press(instance, DOWN);
+    expect(panes(text(instance)).list[2]).toMatch(/^▸ wide\s+all\s+5\/7$/);
+
+    await press(instance, "m");
+    const spark = panes(text(instance));
+    expect(spark.detail).toContain("Model     ranked as --tool codex --model gpt-5.3-codex-spark");
+    expect(row(spark.detail, "codex:x")).toMatch(/^▸ codex:x\s.*next$/);
+    expect(row(spark.detail, "codex:personal-max")).toMatch(/over 80%$/);
+    expect(spark.detail.some((line) => line.includes("claude:"))).toBe(false);
+    expect(spark.list[2]).toMatch(/^▸ wide\s+all\s+1\/2$/);
+
+    await press(instance, "m");
+    const opus = panes(text(instance));
+    expect(opus.detail).toContain("Model     ranked as --tool claude --model opus");
+    expect(row(opus.detail, "claude:work")).toMatch(/^▸ claude:work\s.*10%\s+next$/);
+    expect(opus.detail.some((line) => line.includes("codex:"))).toBe(false);
+    expect(opus.list[2]).toMatch(/^▸ wide\s+all\s+2\/5$/);
+  });
+
+  it("cuts the model's name before the cells lose their reset times", async () => {
+    // Reset times from the real clock, which the cells count from: each reads a whole number of hours.
+    const inHours = (hours: number) => new Date(Date.now() + (hours + 0.5) * 3_600_000).toISOString();
+    const timed = (five: number, seven: number, ...limits: ScopedQuotaWindow[]): QuotaSnapshot => ({
+      state: "ok",
+      fetchedAt: NOW,
+      session: { usedPercent: five, resetsAt: inHours(1) },
+      weekly: { usedPercent: seven, resetsAt: inHours(50) },
+      scopedLimits: limits.map((each) => ({ ...each, resetsAt: inHours(3) })),
+    });
+    const quotas = {
+      "codex:x": timed(30, 10, limit("GPT-5.3-Codex-Spark", 5, WEEK)),
+      "codex:personal-max": timed(5, 8, limit("GPT-5.3-Codex-Spark", 90, FIVE_HOURS)),
+    };
+    const { instance } = setup({
+      file: BOTH,
+      registry: { loads: WITH_CODEX, problem: null },
+      collect: async () => quotas,
+    });
+    await ranked(instance);
+    await press(instance, "m");
+    const { detail } = panes(text(instance));
+    expect(row(detail, "ACCOUNT")).toMatch(/ACCOUNT\s+5H\s+7D\s+GPT-5\.3-C…$/);
+    expect(row(detail, "codex:x")).toMatch(/^▸ codex:x\s+30% 1h\s+10% 2d\s+7D\s+5% 3h\s+next$/);
+  });
+
+  it("drops the model it ranked by once its route is removed", async () => {
+    const removed = setup({ collect: async () => OPUS });
+    await ranked(removed.instance);
+    await press(removed.instance, "m");
+    await press(removed.instance, "d");
+    await press(removed.instance, "y");
+    await until(removed.instance, (f) => panes(f).list.length === 2 && !f.includes("(y/N)"));
+    // A route of the same name, made again, is ranked as a run that names no model.
+    await press(removed.instance, "n");
+    await until(removed.instance, (f) => f.includes("New route"));
+    await press(removed.instance, "main");
+    await type(removed.instance, ENTER);
+    const again = await until(removed.instance, (f) => /▸ main/.test(f) && !f.includes("New route"));
+    expect(again).not.toContain("--model");
+    expect(panes(again).detail).toContain("Model limits: Opus, Sonnet · m to rank by one");
+  });
+
+  it("drops the model it ranked by once a refresh no longer reports it, so a later one cannot bring it back", async () => {
+    // Read with Opus, then without it, then with it again.
+    const readings = [OPUS, QUOTAS, OPUS];
+    let reads = 0;
+    const { instance, deps } = setup({ collect: async () => readings[Math.min(reads++, readings.length - 1)] });
+    await ranked(instance);
+    await press(instance, "m");
+    expect(text(instance)).toContain("ranked as --model opus");
+    await press(instance, "r");
+    await until(instance, (f) => !f.includes("--model") && !f.includes("Reading quota again"));
+    await press(instance, "r");
+    await vi.waitFor(() => expect(deps.collectQuotas).toHaveBeenCalledTimes(3));
+    const frame = await until(instance, (f) => !f.includes("Reading quota again"));
+    expect(frame).not.toContain("--model");
+    expect(panes(frame).detail).toContain("Model limits: Opus, Sonnet · m to rank by one");
+  });
+
+  it("starts a model cell's dash where the column starts, as the others do, beside a window's kind", async () => {
+    const quotas = { ...LIMITS, "codex:personal-max": snap(5, 8) };
+    const { instance } = setup({
+      file: BOTH,
+      registry: { loads: WITH_CODEX, problem: null },
+      collect: async () => quotas,
+    });
+    await ranked(instance);
+    await press(instance, "m");
+    const all = lines(text(instance));
+    const header = all.find((line) => line.includes("ACCOUNT")) ?? "";
+    expect(all.find((line) => line.includes("codex:x"))).toMatch(/\s7D\s+5%/);
+    expect((all.find((line) => line.includes("codex:personal-max")) ?? "").indexOf("—")).toBe(header.indexOf("GPT-5"));
   });
 });

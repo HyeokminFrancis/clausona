@@ -1,21 +1,33 @@
 import { Box, Text } from "ink";
 
 import type { Route } from "../../core/route-config.js";
-import { isUnread, type Ranking, type Row } from "../../core/routing.js";
+import { isUnread, type Ranking, type Row, scopedWindowKind, scopedWindowName } from "../../core/routing.js";
 import { fitQuotaValue } from "../../lib/format.js";
-import { detailOrder, overLimitText, skipReason, spendText, toolLabel } from "../../lib/route-render.js";
-import type { QuotaWindow } from "../../types.js";
+import {
+  detailOrder,
+  modelHeader,
+  modelWord,
+  overLimitText,
+  skipReason,
+  spendText,
+  toolLabel,
+} from "../../lib/route-render.js";
+import type { QuotaWindow, ToolName } from "../../types.js";
 import { QuotaCell } from "../components/QuotaCell.js";
 import { color } from "../theme.js";
 import { useWidth } from "../use-width.js";
 
 /**
  * The Routes screen's detail pane: the selected route's settings, and its members ranked as
- * `csn route explain` ranks them, with their quota and status.
+ * `csn route explain` ranks them, with their quota and status. Ranked as a run of a model would
+ * be, it shows each member's limit on that model too, as `csn route explain --model` does.
  */
 
-/** A route as the screen lists it: its name, the route with its defaults, and its ranking. */
-export type Entry = { name: string; route: Route; ranking: Ranking };
+/**
+ * A route as the screen lists it: its name, the route with its defaults, and its ranking.
+ * `onlyTool` is the tool an `all` route is ranked for, as a run naming it would be.
+ */
+export type Entry = { name: string; route: Route; ranking: Ranking; onlyTool?: ToolName };
 
 /** A row's mark (`▸`) and the space after it. */
 export const MARK = 2;
@@ -37,8 +49,12 @@ export function Setting({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function RouteDetail({ entry, pending }: { entry: Entry; pending: boolean }) {
-  const { name, route, ranking } = entry;
+/**
+ * `models` are the names of the limits the route's accounts report on one model (`Opus`), which `m`
+ * ranks by in turn. Until one is chosen, a line under the table names them.
+ */
+export function RouteDetail({ entry, pending, models }: { entry: Entry; pending: boolean; models: string[] }) {
+  const { name, route, ranking, onlyTool } = entry;
   const [detail, width] = useWidth();
   return (
     <Box ref={detail} flexDirection="column">
@@ -51,7 +67,29 @@ export function RouteDetail({ entry, pending }: { entry: Entry; pending: boolean
         value={`${route.from.join(", ")}${route.exclude.length ? ` except ${route.exclude.join(", ")}` : ""}`}
       />
       <Setting label="Fallback" value={route.fallback.length ? route.fallback.join(", ") : "none"} />
+      {/* The options that rank the same on the command line. */}
+      {ranking.model ? (
+        <Setting
+          label="Model"
+          value={`ranked as ${onlyTool ? `--tool ${onlyTool} ` : ""}--model ${modelWord(ranking.model)}`}
+        />
+      ) : null}
       <MemberTable ranking={ranking} pending={pending} width={width} />
+      {ranking.model || models.length === 0 ? null : <ModelLimits models={models} />}
+    </Box>
+  );
+}
+
+/** The models the accounts have a limit on, and the key that ranks by one: the names are cut before the key is. */
+function ModelLimits({ models }: { models: string[] }) {
+  return (
+    <Box flexDirection="row" marginTop={1}>
+      <Box flexShrink={1} minWidth={0}>
+        <Text color={color.muted} wrap="truncate-end">{`Model limits: ${models.join(", ")}`}</Text>
+      </Box>
+      <Box flexShrink={0}>
+        <Text color={color.muted}> · m to rank by one</Text>
+      </Box>
     </Box>
   );
 }
@@ -112,21 +150,30 @@ function Rest({ text, tone, after }: { text: string; tone: string; after?: strin
   );
 }
 
+/** A Codex limit's window, `5H` or `7D`, and the space after it. */
+const KIND = 3;
+
+/** The model column, when the table has one: its width, and whether its cells start with a window's kind. */
+type ModelColumn = { width: number; kinds: boolean };
+
 function MemberLine({
   line,
   idWidth,
   quota,
   cut,
+  model,
   budget,
 }: {
   line: Line;
   idWidth: number;
   quota: number;
   cut: number;
+  model?: ModelColumn;
   /** The budget column's width, when the table has one: an API profile's spend against its limit. */
   budget?: number;
 }) {
   const { row } = line;
+  const scoped = row?.scoped;
   // The window that sets the member's usage is bold, as in `csn route explain`.
   const cell = (window: QuotaWindow | undefined, which: "5H" | "7D" | "budget") => (
     <Box marginLeft={GAP} width={which === "budget" ? budget : quota} flexShrink={0}>
@@ -152,6 +199,24 @@ function MemberLine({
       </Box>
       {row ? cell(row.fiveHour, "5H") : null}
       {row ? cell(row.sevenDay, "7D") : null}
+      {row && model ? (
+        <Box marginLeft={GAP} width={model.width} flexShrink={0}>
+          {/* Which of a Codex limit's windows is the higher, as explain says it: `7D`. Without a
+              limit, the dash starts the column as the others' do. */}
+          {model.kinds && scoped ? (
+            <Box width={KIND} flexShrink={0}>
+              <Text color={color.muted}>{scopedWindowKind(scoped) ?? ""}</Text>
+            </Box>
+          ) : null}
+          <QuotaCell
+            window={scoped}
+            live={!row.usage?.stale}
+            width={quota}
+            bold={scoped !== undefined && row.usage?.window === scopedWindowName(scoped)}
+            cut={cut}
+          />
+        </Box>
+      ) : null}
       {row && budget !== undefined ? cell(row.budget, "budget") : null}
       {line.status || line.spend ? <Rest text={line.status} tone={line.tone} after={line.spend} /> : null}
     </Box>
@@ -187,10 +252,20 @@ function MemberTable({ ranking, pending, width }: { ranking: Ranking; pending: b
       }),
     ),
   ];
-  const windows = lines.flatMap(({ row }) =>
-    [row?.fiveHour, row?.sevenDay, row?.budget].filter((window): window is QuotaWindow => window !== undefined),
+  const ranked = lines.flatMap(({ row }) => (row ? [row] : []));
+  const windows = ranked.flatMap((row) =>
+    [row.fiveHour, row.sevenDay, row.scoped, row.budget].filter(
+      (window): window is QuotaWindow => window !== undefined,
+    ),
   );
   const hasBudget = lines.some(({ row }) => row?.budget !== undefined);
+  // The limit on the model the route is ranked as, named as explain names it; none when no
+  // account reports one.
+  const header = modelHeader(ranked);
+  const kinds = ranked.some((row) => row.scoped && scopedWindowKind(row.scoped));
+  /** The model column is as wide as its header, `whole`, or else as its cells, with the header cut to them. */
+  const modelOf = (quota: number, whole: boolean) =>
+    Math.max(quota + (kinds ? KIND : 0), whole && header ? header.length : 0);
   const status = Math.max(0, ...lines.filter((line) => line.row).map((line) => line.status.length));
   const longest = Math.max(
     "ACCOUNT".length,
@@ -199,15 +274,31 @@ function MemberTable({ ranking, pending, width }: { ranking: Ranking; pending: b
   /** The budget column is as wide as its header at least. */
   const budgetOf = (quota: number) => Math.max(quota, BUDGET.length);
   /** A line's width but for its id: the mark, the quota cells and the status, each after a gap. */
-  const around = (quota: number) =>
-    MARK + 2 * (GAP + quota) + (hasBudget ? GAP + budgetOf(quota) : 0) + (status ? GAP + status : 0);
-  // The most detailed cells that fit beside whole ids; failing that, percentages only and the ids cut.
+  const around = (quota: number, whole: boolean) =>
+    MARK +
+    2 * (GAP + quota) +
+    (header ? GAP + modelOf(quota, whole) : 0) +
+    (hasBudget ? GAP + budgetOf(quota) : 0) +
+    (status ? GAP + status : 0);
+  // The most detailed cells that fit beside whole ids. The gauges go first, the model's name kept
+  // whole; then the name is cut to its cells before the reset times go, as the Model setting
+  // spells it out. Failing that, percentages only and the ids cut.
   const cut = ranking.route.maxUsage;
-  const fitting = QUOTA_WIDTHS.map((at) => quotaColumn(windows, at, cut)).find(
-    (quota) => around(quota) + longest <= width,
-  );
-  const quota = fitting ?? quotaColumn(windows, QUOTA_WIDTHS[QUOTA_WIDTHS.length - 1], cut);
-  const idWidth = fitting === undefined ? Math.max("ACCOUNT".length, width - around(quota)) : longest;
+  const [widest, ...narrower] = QUOTA_WIDTHS;
+  const narrowest = QUOTA_WIDTHS[QUOTA_WIDTHS.length - 1];
+  const layouts = [
+    { at: widest, whole: true },
+    ...narrower.flatMap((at) => [
+      { at, whole: true },
+      { at, whole: false },
+    ]),
+  ];
+  const fitting = layouts
+    .map(({ at, whole }) => ({ quota: quotaColumn(windows, at, cut), whole }))
+    .find(({ quota, whole }) => around(quota, whole) + longest <= width);
+  const { quota, whole } = fitting ?? { quota: quotaColumn(windows, narrowest, cut), whole: false };
+  const idWidth = fitting === undefined ? Math.max("ACCOUNT".length, width - around(quota, whole)) : longest;
+  const model = header ? { width: modelOf(quota, whole), kinds } : undefined;
 
   return (
     <Box flexDirection="column" marginTop={1}>
@@ -222,6 +313,13 @@ function MemberTable({ ranking, pending, width }: { ranking: Ranking; pending: b
           <Box marginLeft={GAP} width={quota} flexShrink={0}>
             <Text color={color.muted}>7D</Text>
           </Box>
+          {model ? (
+            <Box marginLeft={GAP} width={model.width} flexShrink={0}>
+              <Text color={color.muted} wrap="truncate-end">
+                {header}
+              </Text>
+            </Box>
+          ) : null}
           {hasBudget ? (
             <Box marginLeft={GAP} width={budgetOf(quota)} flexShrink={0}>
               <Text color={color.muted}>{BUDGET}</Text>
@@ -236,6 +334,7 @@ function MemberTable({ ranking, pending, width }: { ranking: Ranking; pending: b
           idWidth={idWidth}
           quota={quota}
           cut={cut}
+          {...(model ? { model } : {})}
           {...(hasBudget ? { budget: budgetOf(quota) } : {})}
         />
       ))}
