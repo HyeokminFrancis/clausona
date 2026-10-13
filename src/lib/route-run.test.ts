@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { routesPaths } from "../core/routes-store.js";
+import { RoutesFileError, routesPaths } from "../core/routes-store.js";
 import type { QuotaSnapshot, Registry } from "../types.js";
 import { stripAnsi } from "./cli-style.js";
 import type { RouteIo } from "./route-io.js";
@@ -256,6 +256,30 @@ describe("runRouted", () => {
     expect(s.launches).toEqual([]);
   });
 
+  // Creating it would be refused while another route cannot be used, so it is not offered.
+  it("offers no new route while another route cannot be used, and reads no quota", async () => {
+    const s = setup({
+      interactive: true,
+      answers: ["y"],
+      routes: { version: 1, routes: { bad: { tool: "claude", strategy: "fastest" } } },
+    });
+    let reads = 0;
+    s.deps.collectQuotas = async () => {
+      reads++;
+      return {};
+    };
+    await expect(runRouted(["--route", "work"], s.launch, s.io, s.deps)).rejects.toThrow(
+      [
+        `${s.paths.routesPath} has a route that cannot be used, so nothing was saved:`,
+        "    routes.bad.strategy: must be one of round-robin, headroom, expiring",
+        "  Fix it with clausona route edit, or remove the route: clausona route remove bad.",
+      ].join("\n"),
+    );
+    expect(reads).toBe(0);
+    expect(s.confirmed).toEqual([]);
+    expect(s.launches).toEqual([]);
+  });
+
   it("offers to create an unknown route in a terminal, then runs on it", async () => {
     const s = setup({ interactive: true, answers: ["y"] });
     await runRouted(["--route", "work", "-p", "hi"], s.launch, s.io, s.deps);
@@ -430,6 +454,26 @@ describe("runRouted", () => {
       ["claude:a", ["Solo"]],
       ["claude:a", ["hello"]],
     ]);
+  });
+
+  // No route is named, so nothing in routes.json is needed: a broken hand edit stops no plain run.
+  it("runs the active profile whatever routes.json holds, unparseable too", async () => {
+    const s = setup();
+    writeFileSync(s.paths.routesPath, "{ not json");
+    await runRouted(["claude", "-p", "hi"], s.launch, s.io, s.deps);
+    expect(s.launches).toEqual([["claude:a", ["-p", "hi"]]]);
+  });
+
+  it("runs on a route while another route has a problem, and refuses only that one by its problems", async () => {
+    const s = setup({
+      routes: { version: 1, routes: { ...MAIN.routes, bad: { tool: "claude", strategy: "fastest" } } },
+    });
+    await runRouted(["--route", "main", "-p", "hi"], s.launch, s.io, s.deps);
+    expect(s.launches).toEqual([["claude:solo", ["-p", "hi"]]]);
+    const error = (await runRouted(["--route", "bad"], s.launch, s.io, s.deps).catch((e: unknown) => e)) as Error;
+    expect(error).toBeInstanceOf(RoutesFileError);
+    expect(error.message).toContain("routes.bad.strategy: must be one of round-robin, headroom, expiring");
+    expect(s.launches).toHaveLength(1);
   });
 
   it("says so when the tool has no active profile, and launches nothing", async () => {

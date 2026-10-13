@@ -4,6 +4,10 @@ import {
   checkPattern,
   checkRoute,
   checkRouteName,
+  emptyRoutesFile,
+  NO_PROFILE_NAMES,
+  type ProfileNames,
+  profileNames,
   type Route,
   type RouteOverrides,
   type RouteSpec,
@@ -14,7 +18,15 @@ import {
   withDefaults,
 } from "../core/route-config.js";
 import { expandPatterns, type Member, splitToolPrefix } from "../core/route-patterns.js";
-import { pickWithRecord, type RoutesPaths, readPicks, routesPaths } from "../core/routes-store.js";
+import {
+  type LoadedRoutes,
+  loadRoutes,
+  pickWithRecord,
+  RoutesFileError,
+  type RoutesPaths,
+  readPicks,
+  routesPaths,
+} from "../core/routes-store.js";
 import { type Ranking, rankRoute } from "../core/routing.js";
 import type { QuotaSnapshot, Registry, ToolName } from "../types.js";
 import { editInEditor } from "./editor.js";
@@ -57,16 +69,23 @@ export class NoAccountError extends Error {
 }
 
 export class UnknownRouteError extends Error {
+  /** The routes there are. A key pasted into routes.json as a route's name is never among them. */
+  readonly existing: string[];
   constructor(
     readonly routeName: string,
-    readonly existing: string[],
+    existing: string[],
   ) {
+    const listed = existing.filter((name) => checkRouteName(name) === null);
     super(
-      `Route '${routeName}' does not exist.${existing.length ? ` Existing routes: ${existing.join(", ")}.` : ""} Create it: clausona route add ${routeName}`,
+      `Route '${routeName}' does not exist.${listed.length ? ` Existing routes: ${listed.join(", ")}.` : ""} Create it: clausona route add ${routeName}`,
     );
     this.name = "UnknownRouteError";
+    this.existing = listed;
   }
 }
+
+/** The registered profiles' names, which routes.json's checks let through (checkPattern); none before init. */
+export const namesOf = (registry: Registry | null): ProfileNames => profileNames(Object.keys(registry?.profiles ?? {}));
 
 /** The registry's profiles of every tool a route of `tool` takes, as routing sees them. */
 export function membersOf(registry: Registry, tool: RouteTool): Member[] {
@@ -112,10 +131,10 @@ const PATTERN_FLAGS: ReadonlyArray<["from" | "exclude" | "fallback", string]> = 
  * was given: not by where it would sit in routes.json, which it never reaches, and not by an
  * index into the exclude list the route's own entries are merged into.
  */
-function runPatternProblems(overrides: RouteOverrides, tool: RouteTool): string[] {
+function runPatternProblems(overrides: RouteOverrides, tool: RouteTool, names: ProfileNames): string[] {
   return PATTERN_FLAGS.flatMap(([key, flag]) =>
     (overrides[key] ?? []).flatMap((pattern) => {
-      const problem = checkPattern(pattern, tool);
+      const problem = checkPattern(pattern, tool, names);
       return problem ? [`${flag}: ${problem}`] : [];
     }),
   );
@@ -164,6 +183,7 @@ export function inferRouteTool(patterns: string[]): RouteTool | undefined {
 export function resolveRoute(
   file: RoutesFile,
   run: { tool?: RouteTool; options: RoutingOptions },
+  names: ProfileNames = NO_PROFILE_NAMES,
 ): ResolvedRoute | null {
   const { tool, options } = run;
   const { route: name, ...overrides } = options;
@@ -196,7 +216,7 @@ export function resolveRoute(
     }
     return null;
   }
-  const runProblems = runPatternProblems(overrides, spec.tool);
+  const runProblems = runPatternProblems(overrides, spec.tool, names);
   if (runProblems.length) throw new Error(runProblems.join("\n"));
   // Leaving one more account out for a run must not bring back the ones the route leaves out.
   // (`route set --exclude` replaces the list: that is an edit, and goes through applyOverrides.)
@@ -205,7 +225,7 @@ export function resolveRoute(
       ? { ...overrides, exclude: unionPatterns(spec.exclude, overrides.exclude) }
       : overrides;
   const merged = applyOverrides(spec, runOverrides);
-  const problems = checkRoute(name ?? "inline", merged, name ? `routes.${name}` : "--from route");
+  const problems = checkRoute(name ?? "inline", merged, name ? `routes.${name}` : "--from route", names);
   if (problems.length) throw new Error(problems.join("\n"));
   return {
     ...(name ? { name } : {}),
@@ -213,6 +233,24 @@ export function resolveRoute(
     resolvedBy: name ? "flag" : "inline",
     ...(onlyTool ? { onlyTool } : {}),
   };
+}
+
+/**
+ * routes.json as a command that names the route `name` needs it. It is not read at all when no
+ * route is named: an unsaved route, or a tool's active profile, needs nothing from it. The other
+ * routes' problems do not stop the command; the named route's own do, as a RoutesFileError.
+ */
+export async function routesFor(
+  name: string | undefined,
+  paths: RoutesPaths,
+  names: ProfileNames = NO_PROFILE_NAMES,
+): Promise<LoadedRoutes> {
+  if (name === undefined) return { filePath: paths.routesPath, file: emptyRoutesFile(), broken: [] };
+  const loaded = await loadRoutes(paths, names);
+  // A name that cannot be a route's is resolveRoute's to refuse, without quoting it.
+  const broken = checkRouteName(name) === null ? loaded.broken.find((route) => route.name === name) : undefined;
+  if (broken) throw new RoutesFileError(loaded.filePath, broken.problems, false, name);
+  return loaded;
 }
 
 /**
@@ -267,6 +305,7 @@ export async function rankRouteNow(
     },
     deps.clock,
     deps.paths,
+    new Set(Object.keys(registry.profiles)),
   );
 }
 
@@ -287,7 +326,7 @@ export function otherToolTaking(spec: RouteSpec, registry: Registry): ToolName |
 
 /** For add and set: the route's own problems, then the API profiles this version refuses. */
 export function checkRouteMembers(name: string, spec: RouteSpec, registry: Registry): void {
-  const problems = checkRoute(name, spec);
+  const problems = checkRoute(name, spec, undefined, namesOf(registry));
   if (problems.length) throw new Error(problems.join("\n"));
   const route = withDefaults(spec);
   const members = membersOf(registry, route.tool);

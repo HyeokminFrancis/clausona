@@ -1,9 +1,19 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { acquireFileLock } from "./file-lock.js";
-import { checkRoutesFile, emptyRoutesFile, type RoutesFile } from "./route-config.js";
+import {
+  type BrokenRoute,
+  checkRouteName,
+  checkRoutesFile,
+  emptyRoutesFile,
+  NO_PROFILE_NAMES,
+  type ProfileNames,
+  type RouteSpec,
+  type RoutesFile,
+} from "./route-config.js";
 
 /**
  * ~/.clausona/routes.json (the user's routes) and ~/.clausona/route-picks.json (when each
@@ -12,13 +22,21 @@ import { checkRoutesFile, emptyRoutesFile, type RoutesFile } from "./route-confi
  * the launch cache.
  */
 
-export type RoutesPaths = { routesPath: string; picksPath: string; routesLock: string; picksLock: string };
+export type RoutesPaths = {
+  routesPath: string;
+  picksPath: string;
+  /** Where `route edit` keeps an edit it could not save because routes.json changed meanwhile. */
+  editPath: string;
+  routesLock: string;
+  picksLock: string;
+};
 
 /** Evaluated per call, so a test that points HOME elsewhere gets its own files. */
 export function routesPaths(clausonaDir: string = path.join(homedir(), ".clausona")): RoutesPaths {
   return {
     routesPath: path.join(clausonaDir, "routes.json"),
     picksPath: path.join(clausonaDir, "route-picks.json"),
+    editPath: path.join(clausonaDir, "routes.edit.json"),
     routesLock: path.join(clausonaDir, "locks", "routes.lock"),
     picksLock: path.join(clausonaDir, "locks", "route-picks.lock"),
   };
@@ -30,17 +48,23 @@ const ROUTES_LOCK_WAIT_MS = 5_000;
 /** Routing never blocks a launch on its own bookkeeping for longer than this. */
 const PICKS_LOCK_WAIT_MS = 2_000;
 
+/**
+ * routes.json, or the route `route` in it, cannot be used. A route is named only once
+ * checkRouteName has passed its name, and gets the way out `route list` gives it.
+ */
 export class RoutesFileError extends Error {
   constructor(
     readonly filePath: string,
     readonly problems: string[],
     readonly newer = false,
+    readonly route?: string,
   ) {
+    const wayOut = route ? brokenRoutesHint([{ name: route, spec: undefined, problems }]) : undefined;
     super(
       [
-        `${filePath} cannot be used:`,
+        route ? `Route '${route}' in ${filePath} cannot be used:` : `${filePath} cannot be used:`,
         ...problems.map((problem) => `    ${problem}`),
-        ...(newer ? [] : ["  Fix it with `clausona route edit`, or by hand."]),
+        ...(newer ? [] : [`  ${wayOut ?? "Fix it with `clausona route edit`, or by hand."}`]),
       ].join("\n"),
     );
     this.name = "RoutesFileError";
@@ -56,12 +80,15 @@ async function readText(filePath: string): Promise<string | null> {
   }
 }
 
-/** Written aside and renamed into place, so a reader never sees half a file. */
-async function writeAtomic(filePath: string, text: string): Promise<void> {
+/**
+ * Written aside and renamed into place, so a reader never sees half a file. `mode` is the new
+ * file's, so it holds over a file already there too.
+ */
+async function writeAtomic(filePath: string, text: string, mode?: number): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
   const tmp = `${filePath}.tmp.${process.pid}`;
   try {
-    await writeFile(tmp, text, "utf8");
+    await writeFile(tmp, text, { encoding: "utf8", ...(mode === undefined ? {} : { mode }) });
     await rename(tmp, filePath);
   } catch (error) {
     await rm(tmp, { force: true }).catch(() => {});
@@ -78,7 +105,8 @@ const toText = (value: unknown) => `${JSON.stringify(value, null, 2)}\n`;
  * line and column are counted here.
  */
 function jsonProblem(error: unknown, body: string): string {
-  const position = /in JSON at position (\d+)/.exec(error instanceof Error ? error.message : "");
+  // "… in JSON at position N", and "… after JSON at position N" for text after the closing brace.
+  const position = /JSON at position (\d+)/.exec(error instanceof Error ? error.message : "");
   if (!position) return "not valid JSON";
   const before = body.slice(0, Number(position[1]));
   const line = before.split("\n").length;
@@ -86,7 +114,12 @@ function jsonProblem(error: unknown, body: string): string {
   return `not valid JSON (line ${line}, column ${column})`;
 }
 
-export function parseRoutesText(text: string, filePath: string): RoutesFile {
+/**
+ * The text as routes.json, checked: its shape as a whole, which a RoutesFileError refuses, and
+ * each route on its own. `names` are the registered profiles' (checkPattern in route-config.ts),
+ * here and in every function below that takes them.
+ */
+function checkText(text: string, filePath: string, names: ProfileNames): { file: RoutesFile; broken: BrokenRoute[] } {
   // Windows Notepad saves UTF-8 with a byte-order mark, which JSON.parse refuses.
   const body = text.replace(/^\uFEFF/, "");
   let raw: unknown;
@@ -95,9 +128,17 @@ export function parseRoutesText(text: string, filePath: string): RoutesFile {
   } catch (error) {
     throw new RoutesFileError(filePath, [jsonProblem(error, body)]);
   }
-  const check = checkRoutesFile(raw);
+  const check = checkRoutesFile(raw, names);
   if (!check.ok) throw new RoutesFileError(filePath, check.problems, check.newerVersion !== undefined);
-  return check.file;
+  return check;
+}
+
+/** routes.json as `route edit` saves it: every route of it has to check out. */
+export function parseRoutesText(text: string, filePath: string, names: ProfileNames = NO_PROFILE_NAMES): RoutesFile {
+  const { file, broken } = checkText(text, filePath, names);
+  const problems = broken.flatMap((route) => route.problems);
+  if (problems.length > 0) throw new RoutesFileError(filePath, problems);
+  return file;
 }
 
 /** routes.json exactly as it is on disk, or null when there is none: what `route edit` starts from. */
@@ -105,9 +146,56 @@ export function readRoutesText(paths: RoutesPaths = routesPaths()): Promise<stri
   return readText(paths.routesPath);
 }
 
-export async function readRoutes(paths: RoutesPaths = routesPaths()): Promise<RoutesFile> {
+/**
+ * routes.json as read: the routes that can be used, and the ones that cannot with their problems.
+ * A file that cannot be read as routes at all - not JSON, another version, no object of routes -
+ * is refused whole, with a RoutesFileError.
+ */
+export type LoadedRoutes = { filePath: string; file: RoutesFile; broken: BrokenRoute[] };
+
+export async function loadRoutes(
+  paths: RoutesPaths = routesPaths(),
+  names: ProfileNames = NO_PROFILE_NAMES,
+): Promise<LoadedRoutes> {
   const text = await readText(paths.routesPath);
-  return text === null ? emptyRoutesFile() : parseRoutesText(text, paths.routesPath);
+  const { file, broken } =
+    text === null ? { file: emptyRoutesFile(), broken: [] } : checkText(text, paths.routesPath, names);
+  return { filePath: paths.routesPath, file, broken };
+}
+
+/** The routes that can be used. */
+export async function readRoutes(
+  paths: RoutesPaths = routesPaths(),
+  names: ProfileNames = NO_PROFILE_NAMES,
+): Promise<RoutesFile> {
+  return (await loadRoutes(paths, names)).file;
+}
+
+/**
+ * How to get past routes that cannot be used: `route edit`, or removing each one whose name can
+ * be shown and typed.
+ */
+export function brokenRoutesHint(broken: BrokenRoute[]): string {
+  const removable = broken.map((route) => route.name).filter((name) => checkRouteName(name) === null);
+  const edit = `Fix ${broken.length === 1 ? "it" : "them"} with clausona route edit`;
+  if (removable.length === 0) return `${edit}.`;
+  const remove = removable.map((name) => `clausona route remove ${name}`).join(", ");
+  return `${edit}, or remove ${removable.length === 1 ? "the route" : "the routes"}: ${remove}.`;
+}
+
+/**
+ * Why a write is refused: the file it would write still has routes that cannot be used. Also
+ * said before a route is offered for creation that this refusal would stop.
+ */
+export function writeRefusal(filePath: string, broken: BrokenRoute[]): Error {
+  const count = broken.length === 1 ? "a route" : `${broken.length} routes`;
+  return new Error(
+    [
+      `${filePath} has ${count} that cannot be used, so nothing was saved:`,
+      ...broken.flatMap((route) => route.problems).map((problem) => `    ${problem}`),
+      `  ${brokenRoutesHint(broken)}`,
+    ].join("\n"),
+  );
 }
 
 async function withRoutesLock<T>(paths: RoutesPaths, fn: () => Promise<T>): Promise<T> {
@@ -127,76 +215,143 @@ async function withRoutesLock<T>(paths: RoutesPaths, fn: () => Promise<T>): Prom
 /**
  * Changes routes.json as it stands under the lock. `update` gets a copy and returns the file to
  * write, or null to leave it alone; what it returns is checked before anything is written.
+ *
+ * The copy holds the routes that cannot be used too, as they are stored, so that removing one,
+ * or a `route set` that mends it, can be written. A file that would still hold one is not: the
+ * write is refused with its problems and the way out.
  */
 export async function updateRoutes(
   update: (current: RoutesFile) => RoutesFile | null,
   paths: RoutesPaths = routesPaths(),
+  names: ProfileNames = NO_PROFILE_NAMES,
 ): Promise<RoutesFile> {
   return withRoutesLock(paths, async () => {
-    const current = await readRoutes(paths);
-    const next = update(structuredClone(current));
-    if (next === null) return current;
-    const check = checkRoutesFile(next);
+    const { file, broken } = await loadRoutes(paths, names);
+    const current = structuredClone(file);
+    // Each broken route's copy, to the route as stored: one the update moved (a rename) is named
+    // in the refusal as it is on disk, which is where its way out finds it.
+    const asStored = new Map<unknown, BrokenRoute>();
+    const copies = broken.map((route): [string, RouteSpec] => {
+      const spec = structuredClone(route.spec);
+      if (typeof spec === "object" && spec !== null) asStored.set(spec, route);
+      return [route.name, spec as RouteSpec];
+    });
+    // Built rather than assigned: a broken route may be called `__proto__`, which assignment drops.
+    current.routes = Object.fromEntries([...Object.entries(current.routes), ...copies]);
+    const next = update(current);
+    if (next === null) return file;
+    const check = checkRoutesFile(next, names);
     if (!check.ok) throw new Error(check.problems.join("\n"));
+    if (check.broken.length > 0) {
+      throw writeRefusal(
+        paths.routesPath,
+        check.broken.map((route) => asStored.get(route.spec) ?? route),
+      );
+    }
     await writeAtomic(paths.routesPath, toText(check.file));
     return check.file;
   });
 }
 
+/** Whether two texts hold the same JSON, however they are spaced; false when either is not JSON. */
+function sameJson(a: string, b: string): boolean {
+  try {
+    return isDeepStrictEqual(JSON.parse(a.replace(/^\uFEFF/, "")), JSON.parse(b.replace(/^\uFEFF/, "")));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Writes an edited routes.json as the user saved it, if the file is still what the edit
  * started from (`expected`, null for no file). The caller has already checked `text`.
+ *
+ * When the file changed meanwhile, the edit is kept in routes.edit.json, 0600 as the editor's own
+ * scratch file is (it can hold whatever was typed), for the user to paste into the next edit.
+ * That copy goes once an edit saves what it holds, and stays through any other save.
  */
 export async function replaceRoutesText(
   expected: string | null,
   text: string,
   paths: RoutesPaths = routesPaths(),
 ): Promise<void> {
+  const body = text.endsWith("\n") ? text : `${text}\n`;
   await withRoutesLock(paths, async () => {
     if ((await readText(paths.routesPath)) !== expected) {
+      const kept = await writeAtomic(paths.editPath, body, 0o600).then(
+        () => true,
+        () => false,
+      );
       throw new Error(
-        `${paths.routesPath} changed while you were editing, so your edit was not saved. Run \`clausona route edit\` again.`,
+        kept
+          ? `${paths.routesPath} changed while you were editing, so your edit was not saved. It is kept in ${paths.editPath}: run \`clausona route edit\` and paste it in.`
+          : `${paths.routesPath} changed while you were editing, so your edit was not saved. Run \`clausona route edit\` again.`,
       );
     }
-    await writeAtomic(paths.routesPath, text.endsWith("\n") ? text : `${text}\n`);
+    await writeAtomic(paths.routesPath, body);
+    const keptEdit = await readText(paths.editPath).catch(() => null);
+    if (keptEdit !== null && sameJson(keptEdit, text)) await rm(paths.editPath, { force: true }).catch(() => {});
   });
 }
 
-export async function readPicks(paths: RoutesPaths = routesPaths()): Promise<Record<string, string>> {
+const PICKS_VERSION = 1;
+
+/** The pick record, and whether a pick may write over it. */
+type PickRecord = { lastPicked: Record<string, string>; writable: boolean };
+
+async function readPickRecord(paths: RoutesPaths): Promise<PickRecord> {
   const text = await readText(paths.picksPath).catch(() => null);
-  if (text === null) return {};
+  if (text === null) return { lastPicked: {}, writable: true };
   try {
-    const raw = JSON.parse(text) as { version?: unknown; lastPicked?: unknown };
-    if (raw.version !== 1 || typeof raw.lastPicked !== "object" || raw.lastPicked === null) return {};
-    return Object.fromEntries(
+    const raw = JSON.parse(text) as { version?: unknown; lastPicked?: unknown } | null;
+    // Another version's record is that version's, as a newer routes.json is: picks are made from
+    // nothing and go unrecorded rather than write over it.
+    if (typeof raw?.version === "number" && raw.version !== PICKS_VERSION) return { lastPicked: {}, writable: false };
+    if (raw?.version !== PICKS_VERSION || typeof raw.lastPicked !== "object" || raw.lastPicked === null) {
+      return { lastPicked: {}, writable: true };
+    }
+    const lastPicked = Object.fromEntries(
       Object.entries(raw.lastPicked as Record<string, unknown>).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );
+    return { lastPicked, writable: true };
   } catch {
     // A broken record costs one round-robin turn, never a launch.
-    return {};
+    return { lastPicked: {}, writable: true };
   }
+}
+
+export async function readPicks(paths: RoutesPaths = routesPaths()): Promise<Record<string, string>> {
+  return (await readPickRecord(paths)).lastPicked;
 }
 
 /**
  * Picks under the pick-record lock and records the choice, so picks made at the same moment
  * see each other. A lock that cannot be had within 2 s picks from the record as it is and
- * records nothing.
+ * records nothing; so does a record of another version, which is left as it is.
+ *
+ * `registered` are the profiles there are now: a removed one's pick time is dropped as the record
+ * is written. Round-robin compares pick times only among a route's members, which are registered.
  */
 export async function pickWithRecord<T>(
   choose: (lastPicked: Record<string, string>) => { result: T; picked?: string },
   clock: () => number,
   paths: RoutesPaths = routesPaths(),
+  registered?: ReadonlySet<string>,
 ): Promise<T> {
   const release = await acquireFileLock(paths.picksLock, { staleMs: LOCK_STALE_MS, waitMs: PICKS_LOCK_WAIT_MS }).catch(
     () => null,
   );
   try {
-    const lastPicked = await readPicks(paths);
+    const { lastPicked, writable } = await readPickRecord(paths);
     const { result, picked } = choose(lastPicked);
-    if (release && picked) {
-      const next = { version: 1, lastPicked: { ...lastPicked, [picked]: new Date(clock()).toISOString() } };
+    if (release && picked && writable) {
+      const kept = Object.entries(lastPicked).filter(([id]) => !registered || registered.has(id));
+      const next = {
+        version: PICKS_VERSION,
+        lastPicked: { ...Object.fromEntries(kept), [picked]: new Date(clock()).toISOString() },
+      };
       await writeAtomic(paths.picksPath, toText(next)).catch(() => {});
     }
     return result;

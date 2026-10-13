@@ -2,13 +2,13 @@ import { render } from "ink-testing-library";
 import { describe, expect, it, vi } from "vitest";
 
 import type { QuotaTarget } from "../../core/quota-store.js";
-import type { RoutesFile } from "../../core/route-config.js";
+import type { BrokenRoute, RoutesFile } from "../../core/route-config.js";
 import { RoutesFileError } from "../../core/routes-store.js";
 import { stripAnsi } from "../../lib/cli-style.js";
 import type { QuotaSnapshot, Registry } from "../../types.js";
 import { DOWN, ENTER, ESC, type Instance, press, renderAt, type, waitForFrame } from "../test-drive.js";
 import { RoutesScreen } from "./RoutesScreen.js";
-import type { RoutesScreenDeps } from "./routes-deps.js";
+import type { RoutesListDeps, RoutesScreenDeps } from "./routes-deps.js";
 
 vi.setConfig({ testTimeout: 15_000 });
 
@@ -75,6 +75,8 @@ function setup(
     file?: RoutesFile;
     collect?: Collect;
     readError?: Error;
+    /** Routes routes.json holds that cannot be used, set apart from `file`. */
+    broken?: BrokenRoute[];
     columns?: number;
     /** profiles.json as `loadRegistry` reads it, and why it cannot be used when it reads as none. */
     registry?: { loads: Registry | null; problem: string | null };
@@ -84,6 +86,14 @@ function setup(
   const deps = {
     loadRegistry: vi.fn(async () => (options.registry ? options.registry.loads : REGISTRY)),
     registryProblem: vi.fn(async (): Promise<string | null> => options.registry?.problem ?? null),
+    loadRoutes: vi.fn(async () => {
+      if (options.readError) throw options.readError;
+      return {
+        filePath: "/home/u/.clausona/routes.json",
+        file: structuredClone(current),
+        broken: options.broken ?? [],
+      };
+    }),
     readRoutes: vi.fn(async () => {
       if (options.readError) throw options.readError;
       return structuredClone(current);
@@ -96,7 +106,7 @@ function setup(
     collectQuotas: vi.fn<Collect>(options.collect ?? (async () => QUOTAS)),
     readPicks: vi.fn(async () => ({})),
     clock: () => NOW,
-  } satisfies RoutesScreenDeps;
+  } satisfies RoutesListDeps;
   const onExit = vi.fn();
   const tree = <RoutesScreen deps={deps} onExit={onExit} />;
   const instance: Instance = options.columns ? renderAt(tree, options.columns) : render(tree);
@@ -347,6 +357,27 @@ describe("RoutesScreen", () => {
     await vi.waitFor(() => expect(onExit).toHaveBeenCalledTimes(1));
   });
 
+  // One route's problem must not take the screen down: the others work, and one line says so.
+  it("lists the routes that can be used, and says in one line that one cannot and where to see why", async () => {
+    const broken: BrokenRoute[] = [
+      { name: "bad", spec: { tool: "x" }, problems: ['routes.bad.tool: must be "claude", "codex" or "all"'] },
+    ];
+    const { instance } = setup({ broken });
+    const frame = await ranked(instance);
+    const { list } = panes(frame);
+    expect(list).toHaveLength(3);
+    expect(list.some((line) => line.includes("bad"))).toBe(false);
+    expect(frame).toContain("⚠ routes.json has a route that cannot be used: clausona route list says why.");
+  });
+
+  // A typo in an exclude leaves in the account it was meant to leave out, so it is pointed out.
+  it("points out an exclude that matches nobody, as route explain does", async () => {
+    const file: RoutesFile = { version: 1, routes: { main: { tool: "claude", exclude: ["persnal"] } } };
+    const { instance } = setup({ file });
+    const { detail } = panes(await ranked(instance));
+    expect(detail).toContain("persnal           excludes nobody");
+  });
+
   // Offline, or nothing readable. Nothing read says nothing about who is free: a dash, as
   // `clausona route list` prints, not 0.
   it("shows no quota reading on every member and a dash for who is free when no quota can be read", async () => {
@@ -403,6 +434,22 @@ describe("RoutesScreen", () => {
     const { list, detail } = panes(frame);
     expect(list).toEqual([expect.stringMatching(/^main/), expect.stringMatching(/^▸ solo/)]);
     expect(detail.find(Boolean)).toBe("solo");
+  });
+
+  // Another window removed it first: nothing is written, so the routes that cannot be used are still there.
+  it("keeps the notice of a route that cannot be used when the route removed was already gone", async () => {
+    const broken: BrokenRoute[] = [
+      { name: "bad", spec: { tool: "x" }, problems: ['routes.bad.tool: must be "claude", "codex" or "all"'] },
+    ];
+    const { instance, replace } = setup({ broken });
+    await ranked(instance);
+    const { main: _gone, ...others } = FILE.routes;
+    replace({ version: 1, routes: others });
+
+    await press(instance, "d");
+    await press(instance, "y");
+    const frame = await until(instance, (f) => panes(f).list.length === 2 && !f.includes("(y/N)"));
+    expect(frame).toContain("⚠ routes.json has a route that cannot be used: clausona route list says why.");
   });
 
   it.each([

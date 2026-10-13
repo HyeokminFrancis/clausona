@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { foldProfileName } from "./profile-name.js";
 import {
   applyOverrides,
   checkPattern,
@@ -8,6 +9,7 @@ import {
   checkRoutesFile,
   holdsKey,
   newRouteSpec,
+  profileNames,
   toolsOf,
   withDefaults,
 } from "./route-config.js";
@@ -161,6 +163,55 @@ describe("checkRouteName", () => {
 });
 
 describe("checkPattern", () => {
+  // A name the profile rule takes and the key check does not: CamelCase with digits through it.
+  const longName = ["Team", "Build", "2026", "Runner", "Alpha", "7Beta", "9Zed"].join("");
+
+  it("lets a registered profile's exact name through the key check, and nothing else", () => {
+    const names = profileNames([`claude:${longName}`, "claude:work"]);
+    expect(checkPattern(longName, "claude")).toBe(
+      "looks like an API key, or names a profile that is no longer registered",
+    );
+    for (const pattern of [longName, longName.toLowerCase(), `claude:${longName}`]) {
+      expect(checkPattern(pattern, "claude", names), pattern).toBeNull();
+    }
+    // Not the name itself: one character more, or the name of another tool's profile.
+    expect(checkPattern(`${longName}x`, "claude", names)).toBe(
+      "looks like an API key, or names a profile that is no longer registered",
+    );
+    expect(checkPattern(`codex:${longName}`, "all", names)).toBe(
+      "looks like an API key, or names a profile that is no longer registered",
+    );
+    expect(checkPattern(keyShaped(), "claude", names)).toBe(
+      "looks like an API key, or names a profile that is no longer registered",
+    );
+  });
+
+  // A hand edit can put a key before an id's colon, where a tool goes.
+  it("lets no registered id through whose tool part is not a tool, and never quotes that part", () => {
+    const id = `${keyShaped()}:work`;
+    const names = profileNames([id, "gemini:work"]);
+    expect(names.size).toBe(0);
+    const refused = checkPattern(id, "claude", names);
+    expect(refused).toBe("looks like an API key, or names a profile that is no longer registered");
+    // Should such an id ever be let through, the tool part is still left out of the message.
+    const quoted = checkPattern(id, "claude", new Set([foldProfileName(id)]));
+    expect(quoted).toBe("names an unknown tool, but this route is for claude");
+  });
+
+  // profiles.json is read without the profile-name rule: a hand edit can register a key as a name.
+  it("lets no registered name through that the profile-name rule would refuse", () => {
+    const key = keyShaped();
+    const long = "a".repeat(65);
+    const names = profileNames([`claude:${key}`, `claude:${long}`, "claude:has space"]);
+    expect(names.size).toBe(0);
+    expect(checkPattern(key, "claude", names)).toBe(
+      "looks like an API key, or names a profile that is no longer registered",
+    );
+    expect(checkPattern(long, "claude", names)).toBe(
+      "looks like an API key, or names a profile that is no longer registered",
+    );
+  });
+
   it.each([
     "*",
     "team-*",
@@ -254,7 +305,7 @@ describe("checkPattern", () => {
   ])("refuses a vendor token %s, and never quotes it", (_, wrap) => {
     const token = ["hf", "Ab".repeat(17)].join("_");
     const problem = checkPattern(wrap(token), "claude") ?? "";
-    expect(problem).toBe("looks like an API key, not a profile name or email pattern");
+    expect(problem).toBe("looks like an API key, or names a profile that is no longer registered");
   });
 });
 
@@ -340,7 +391,9 @@ describe("all routes", () => {
 
   it("still refuses a key behind a prefix on an all route, without quoting it", () => {
     for (const pattern of [`codex:${keyShaped()}`, `gpt:${keyShaped()}`]) {
-      expect(checkPattern(pattern, "all")).toBe("looks like an API key, not a profile name or email pattern");
+      expect(checkPattern(pattern, "all")).toBe(
+        "looks like an API key, or names a profile that is no longer registered",
+      );
     }
   });
 
@@ -356,7 +409,7 @@ describe("all routes", () => {
 describe("checkRoutesFile", () => {
   it("accepts a file and keeps keys a later version writes", () => {
     const raw = { version: 1, routes: { main: { tool: "claude" } }, dirs: { "~/w": { claude: "main" } } };
-    expect(checkRoutesFile(raw)).toEqual({ ok: true, file: raw });
+    expect(checkRoutesFile(raw)).toEqual({ ok: true, file: raw, broken: [] });
   });
 
   // An earlier build of this version wrote a reserve limit, which routes no longer have.
@@ -372,6 +425,7 @@ describe("checkRoutesFile", () => {
     expect(checkRoutesFile(raw)).toEqual({
       ok: true,
       file: { version: 1, routes: { main: { tool: "claude", maxUsage: 80 }, odd: { tool: "codex", maxUsage: 90 } } },
+      broken: [],
     });
   });
 
@@ -383,11 +437,11 @@ describe("checkRoutesFile", () => {
       routes: { "eu.sk-team": { tool: "claude", from: ["*@sk-gaming.com", "team.sk-dev"], exclude: ["*sk-*"] } },
     };
     expect(checkRouteName("eu.sk-team")).toBeNull();
-    expect(checkRoutesFile(raw)).toEqual({ ok: true, file: raw });
+    expect(checkRoutesFile(raw)).toEqual({ ok: true, file: raw, broken: [] });
   });
 
   it("reads a missing routes object as none", () => {
-    expect(checkRoutesFile({ version: 1 })).toEqual({ ok: true, file: { version: 1, routes: {} } });
+    expect(checkRoutesFile({ version: 1 })).toEqual({ ok: true, file: { version: 1, routes: {} }, broken: [] });
   });
 
   it("says a newer version is newer", () => {
@@ -402,13 +456,22 @@ describe("checkRoutesFile", () => {
     expect(checkRoutesFile({ routes: {} })).toEqual({ ok: false, problems: ["version: must be 1"] });
   });
 
-  it("collects every route's problems", () => {
-    const raw = { version: 1, routes: { a: { tool: "x" }, b: { tool: "claude", strategy: "?" } } };
+  // One route's problem must not take the others down with it.
+  it("sets apart each route with problems, as stored, and keeps the others", () => {
+    const raw = {
+      version: 1,
+      routes: { a: { tool: "x" }, good: { tool: "claude" }, b: { tool: "claude", strategy: "?" } },
+    };
     expect(checkRoutesFile(raw)).toEqual({
-      ok: false,
-      problems: [
-        'routes.a.tool: must be "claude", "codex" or "all"',
-        "routes.b.strategy: must be one of round-robin, headroom, expiring",
+      ok: true,
+      file: { version: 1, routes: { good: { tool: "claude" } } },
+      broken: [
+        { name: "a", spec: { tool: "x" }, problems: ['routes.a.tool: must be "claude", "codex" or "all"'] },
+        {
+          name: "b",
+          spec: { tool: "claude", strategy: "?" },
+          problems: ["routes.b.strategy: must be one of round-robin, headroom, expiring"],
+        },
       ],
     });
   });

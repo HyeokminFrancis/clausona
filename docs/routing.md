@@ -71,7 +71,9 @@ account too, since its week is over, and the run's note says `weekly limit has r
 
 Round-robin keeps one record, `~/.clausona/route-picks.json`, with the time each account was
 last picked. The time belongs to the account, not to a route. A pick on one route counts as that
-account's turn on every route it is in.
+account's turn on every route it is in. A profile you remove drops out of the record at the next
+pick. A record written by a newer clausona is left alone: picks go on, but are not recorded until
+you update.
 
 Picks are made under a lock, and each one sees the picks before it. Start
 `clausona run --route main` in four terminals at the same moment and they land on four
@@ -118,7 +120,14 @@ are billed per use, and this version keeps them out of routes.
 and the form on the Routes screen offers only those.
 
 A pattern that looks like an API key or a token is refused, and clausona does not print it back.
-Route names get the same check.
+Route names get the same check. The one exception is the exact name of a profile you registered,
+with or without its tool prefix. A long name can look like a key to that check, such as a
+CamelCase name with digits through it, and a profile of that name can still be put in a route.
+
+The exception lasts only while the profile does. Remove that profile, and its name is checked as
+a key again: every route that names it cannot be used, and says it "looks like an API key, or
+names a profile that is no longer registered". Take the name out of the route with
+`clausona route edit` or `clausona route set <route> --from …`, or remove the route.
 
 ## Managing routes
 
@@ -214,9 +223,9 @@ $ clausona route list
 ```
 
 `SKIP AT` is the cut. `FREE NOW` counts the accounts under the cut right now, out of every
-account in the route. One that is signed out still counts as a member, just not as free. `NEXT`
-is the account a run would get now. When nobody can be picked it says `none`, and when the first
-account frees up.
+account in the route. One that is signed out still counts as a member, just not as free. An API
+profile does not count at all, since no run takes one. `NEXT` is the account a run would get now.
+When nobody can be picked it says `none`, and when the first account frees up.
 
 `route list` records nothing. With `--no-quota` it reads no quota at all, and `FREE NOW` and
 `NEXT` show `—`. They show the same dash when no reading could be had for any account of a route,
@@ -274,21 +283,44 @@ Any other key in a route is refused.
 `route edit` opens the file in `$VISUAL` or `$EDITOR`, or an empty one when there is no file yet.
 It checks the file when you save. A file with a problem is not written, and in a terminal you are
 asked whether to edit again. If you save without changing anything, it says "Nothing was
-changed." If `routes.json` changed while you were editing, your edit is not saved and you are
-told to run `route edit` again.
+changed." If `routes.json` changed while you were editing, your edit is not saved over it.
+It is kept in `~/.clausona/routes.edit.json`, which only you can read. Run `route edit` again
+and paste it in. Once an edit saves what that file holds, the file is deleted.
 
-When `routes.json` cannot be used, every command that reads it stops with exit code 1 and lists
-what is wrong. That includes `clausona run claude` with no route named. `clausona run <profile>`
-does not read the file.
+When `routes.json` cannot be read as routes at all (it is not JSON, say, or it comes from a
+newer clausona), every command that reads it stops with exit code 1 and lists what is wrong.
+`clausona run claude` with no route named, a run with `--from` and `clausona run <profile>` do
+not read the file, so they are never stopped by it.
+
+A problem in one route stops only the commands that use that route. `clausona run --route main`
+and `route pick main` work while route `old` has a typo. `route list` and `route explain` show
+the other routes as usual and warn about each problem:
+
+```
+  ⚠ routes.old.strategy: must be one of round-robin, headroom, expiring
+  ⚠ Fix it with clausona route edit, or remove the route: clausona route remove old.
+```
+
+A change that would save the file with such a problem still in it is refused, with the same
+problems and the same way out. So while `old` is broken, `route add` and `route set` on other
+routes stop and ask you to fix it first. `route remove old` works, and so does a `route set old`
+that fixes the problem, such as `route set old --strategy headroom`.
 
 Removing a profile leaves its routes alone. A name that is no longer registered is skipped, and
-both `route list` and `route explain` point it out. They point out patterns that match nobody
-too. `route list` puts both under its table:
+both `route list` and `route explain` point it out. The one exception is a name the key check
+would refuse, which a route can hold only while the profile is registered (see
+[Patterns](#patterns)): once it is removed, that route cannot be used until the name is taken
+out. They point out patterns that match nobody too, each one once, and an `exclude` entry that
+matches nobody. That one matters most: a typo there leaves in the account it was meant to leave
+out. `route list` puts them under its table:
 
 ```
   ⚠ ghost names 'gone', which is not a registered profile.
   ⚠ ghost: 'x-*' matches nobody.
+  ⚠ ghost: exclude 'persnal' matches nobody.
 ```
+
+Before `clausona init` no profile is registered, so `route list` names none of them as unknown.
 
 ## The Routes screen
 
@@ -313,7 +345,8 @@ list instead.
 
 The screen never records a pick. It writes `routes.json` only when you remove a route or save one
 from the form. If the file cannot be used, the screen says what is wrong with it and points you
-to `clausona route edit`.
+to `clausona route edit`. A route with a problem is left off the list, and one line under it
+says so and points you to `clausona route list`, which shows the problem.
 
 ### The form
 
@@ -476,6 +509,9 @@ A route that would take no account is not offered, since a run on it could only 
 clausona asks nothing, creates nothing and exits 1. If the other tool has accounts the same
 patterns would take, it names that run, such as `clausona run codex --route nightly`. Otherwise
 it points you to `clausona list`.
+
+Nor is a route offered while another route in `routes.json` cannot be used, since saving it would
+be refused. clausona reads no quota, asks nothing and exits 1 with the problem and how to fix it.
 
 Without a terminal nothing is created. clausona prints the command that would create it and
 exits 1:
@@ -661,7 +697,8 @@ When nobody can be picked, the JSON is still printed on stdout, and the exit cod
 | `outcome` | `{ "kind": "picked", "id", "stage", "reason" }`, or `{ "kind": "none" }` plus `soonest` (`{ "id", "at" }`) when a reset time is known |
 | `members` | One entry per account, below |
 | `excluded` | Accounts the exclude list took out, as `{ "profile", "matchedBy" }` |
-| `emptyPatterns` | Glob and email patterns in `from` or `fallback` that match nobody |
+| `emptyPatterns` | Glob and email patterns in `from` or `fallback` that match nobody, each once |
+| `emptyExcludes` | Entries of `exclude` that match nobody, names as well as patterns |
 
 Each entry in `members`:
 
@@ -679,17 +716,61 @@ Each entry in `members`:
 An account picked at the `overflow` stage has the status `picked`, even though its usage is at or
 over `maxUsage`. Percentages are not rounded in JSON. Fields are only ever added.
 
-`route list --json` gives `{ "routes": [...] }`. Each entry has `name`, `route` (the settings
-with defaults, where `tool` can be `"all"` too), `members` and `fallbackMembers` (profile ids,
-after the exclude list), `excluded`, `unknownNames` and `emptyPatterns`.
+### `list --json`
+
+`route list --json` gives `{ "routes": [...], "problems": [...] }`. Each route is ranked the way
+`explain` ranks it, so its members are the accounts a run would consider. Each entry in `routes`:
+
+| Field | Value |
+|---|---|
+| `name` | The route's name |
+| `route` | The route with every default filled in, as `settings` in `explain --json` |
+| `members`, `fallbackMembers` | Profile ids of the pool and of the fallback, after the exclude list. An API profile is in neither, since no run takes one |
+| `excluded` | Profile ids the exclude list took out of `from` or `fallback` |
+| `unknownNames` | Names in `from` or `fallback` that are not registered profiles, as written |
+| `emptyPatterns`, `emptyExcludes` | As in `explain --json` |
+| `freeNow` | `{ "free", "members" }`, what the `FREE NOW` column shows, or null |
+| `next` | Who a run would get now, as `outcome` in `explain --json`, or null |
+
+`freeNow` and `next` are null with `--no-quota`, and when no reading could be had for any account
+of the route. Before `clausona init` there is nobody to rank: the lists are empty, and both are
+null. `list --json` reads quota as the table does; add `--no-quota` when you only need the
+members.
+
+`problems` lists, as text, what is wrong with each route that cannot be used. Those routes are
+not in `routes`.
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | the tool's own | The tool ran. |
-| 1 | A usage error, an unknown route without a terminal (or answered `n` in one), or a `routes.json` that cannot be used. |
+| 1 | A usage error, an unknown route without a terminal (or answered `n` in one), or a `routes.json` or a named route that cannot be used. |
 | 75 | No account is available now, from `run` or `pick`. Retry later, or name a profile. |
+
+### Errors
+
+With `--json`, a `route` command that fails prints one object on stdout, and nothing on stderr.
+It is the shape the [Extensions commands](extensions.md#errors) use, and the exit code is the
+same as without `--json`:
+
+```json
+{
+  "version": 1,
+  "error": "not-found",
+  "message": "Route 'nope' does not exist. Existing routes: main. Create it: clausona route add nope"
+}
+```
+
+| `error` | Exit code | When |
+|---|---|---|
+| `usage` | 1 | Bad usage: an unknown option or subcommand, a bad option value, or no route named |
+| `not-found` | 1 | No route has that name |
+| `failed` | 1 | Anything else, such as clausona not set up yet. When `routes.json`, or the route named, cannot be used, it adds `file`, the file's path, and `problems`, what is wrong, as `route list` words it |
+
+`message` is what the command prints without `--json`. Read `error` to tell failures apart. Exit
+75 from `pick --json` is not an error object: it prints the `pick` JSON above, with `profile`
+null.
 
 ### The routing skill
 

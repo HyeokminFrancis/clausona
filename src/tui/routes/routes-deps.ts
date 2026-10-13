@@ -1,6 +1,14 @@
 import { collectQuotas, type QuotaTarget } from "../../core/quota-store.js";
 import type { RoutesFile } from "../../core/route-config.js";
-import { readPicks, readRoutes, routesPaths, updateRoutes } from "../../core/routes-store.js";
+import {
+  type LoadedRoutes,
+  loadRoutes,
+  readPicks,
+  readRoutes,
+  routesPaths,
+  updateRoutes,
+} from "../../core/routes-store.js";
+import { namesOf } from "../../lib/route-service.js";
 import { loadRegistry, registryProblem } from "../../lib/service.js";
 import type { QuotaSnapshot, Registry } from "../../types.js";
 
@@ -22,13 +30,19 @@ export type RoutesScreenDeps = {
   clock: () => number;
 };
 
-export function defaultRoutesScreenDeps(): RoutesScreenDeps {
+/** The screen's own, beyond its form's: routes.json with the routes that cannot be used set apart. */
+export type RoutesListDeps = RoutesScreenDeps & { loadRoutes: () => Promise<LoadedRoutes> };
+
+export function defaultRoutesScreenDeps(): RoutesListDeps {
   const paths = routesPaths();
+  // Read with each use, as the CLI does: a profile added meanwhile is a name routes.json may hold.
+  const names = async () => namesOf(await loadRegistry());
   return {
     loadRegistry,
     registryProblem,
-    readRoutes: () => readRoutes(paths),
-    updateRoutes: (update) => updateRoutes(update, paths),
+    loadRoutes: async () => loadRoutes(paths, await names()),
+    readRoutes: async () => readRoutes(paths, await names()),
+    updateRoutes: async (update) => updateRoutes(update, paths, await names()),
     collectQuotas: (targets, options) => collectQuotas(targets, { refresh: options?.refresh }),
     readPicks: () => readPicks(paths),
     clock: () => Date.now(),

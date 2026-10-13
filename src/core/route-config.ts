@@ -1,5 +1,6 @@
 import type { ToolName } from "../types.js";
 import { carriesCredentialToken, looksLikeCredential, MAX_NAME_LENGTH } from "./credential-token.js";
+import { foldProfileName } from "./profile-name.js";
 import { splitToolPrefix } from "./route-patterns.js";
 
 /**
@@ -100,6 +101,8 @@ export function applyOverrides(spec: RouteSpec, overrides: RouteOverrides): Rout
 }
 
 const ROUTE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/** A profile's name, as the profile-name rule spells it: the same characters as a route's. */
+const PROFILE_NAME = ROUTE_NAME;
 const NAME_PATTERN = /^[A-Za-z0-9._*?-]+$/;
 const ROUTE_KEYS = new Set(["tool", "from", "exclude", "strategy", "maxUsage", "fallback"]);
 /**
@@ -155,6 +158,38 @@ export function holdsKey(text: string): boolean {
   return carriesCredentialToken(text) || skToken.test(text) || text.split(/[\s,:]+/).some(looksLikeCredential);
 }
 
+/**
+ * The registered profiles' names as a pattern is compared with them: folded, bare and with their
+ * tool (`work`, `claude:work`). Each one passes the profile-name rule, which is narrower than the
+ * key check: a long CamelCase name with digits through it passes the one and not the other. A
+ * pattern that is exactly one of them is not held to the key check.
+ */
+export type ProfileNames = ReadonlySet<string>;
+
+export const NO_PROFILE_NAMES: ProfileNames = new Set();
+
+/**
+ * The profile-name rule (validateProfileName in lib/profile-ref.ts). profiles.json is read without
+ * it, and a hand edit or a name from before the rule can be anything, a key too.
+ */
+const passesNameRule = (name: string) => !looksLikeCredential(name) && PROFILE_NAME.test(name);
+
+/**
+ * The names of the profiles with these ids (`tool:name`) that pass the profile-name rule, and
+ * whose tool is one: a hand-edited id can put anything before its colon, a key too.
+ */
+export function profileNames(ids: Iterable<string>): ProfileNames {
+  const names = new Set<string>();
+  for (const id of ids) {
+    const colon = id.indexOf(":");
+    const name = id.slice(colon + 1);
+    if (!TOOLS.includes(id.slice(0, colon)) || !passesNameRule(name)) continue;
+    names.add(foldProfileName(id));
+    names.add(foldProfileName(name));
+  }
+  return names;
+}
+
 export function checkRouteName(name: string): string | null {
   // Checked first, so the message below never echoes something key-shaped.
   if (holdsKey(name)) return "That looks like an API key, not a route name.";
@@ -163,18 +198,25 @@ export function checkRouteName(name: string): string | null {
 }
 
 /**
- * A pattern's problem, or null. A key-shaped pattern is never quoted back. A `tool:` prefix must
- * name the route's tool; on an `all` route it may name either.
+ * A pattern's problem, or null. A key-shaped pattern is never quoted back, unless it is exactly
+ * the name of a registered profile (`names`). A `tool:` prefix must name the route's tool; on an
+ * `all` route it may name either.
  */
-export function checkPattern(pattern: unknown, tool: RouteTool): string | null {
+export function checkPattern(pattern: unknown, tool: RouteTool, names: ProfileNames = NO_PROFILE_NAMES): string | null {
   if (typeof pattern !== "string" || pattern.trim() === "") return "must be a non-empty string";
-  // Before anything below would store it in routes.json or quote it back.
-  if (holdsKey(pattern)) return "looks like an API key, not a profile name or email pattern";
+  // Before anything below would store it in routes.json or quote it back. A registered profile's
+  // name is let through, so one that is removed is held to the check again: the problem says so.
+  if (!names.has(foldProfileName(pattern)) && holdsKey(pattern)) {
+    return "looks like an API key, or names a profile that is no longer registered";
+  }
   // Split as the matcher splits it, so a name and an email pattern read a prefix the same way.
   const { prefix, body } = splitToolPrefix(pattern);
   if (prefix !== null && !toolsOf(tool).includes(prefix as ToolName)) {
+    const routeTool = tool === "all" ? "claude + codex" : tool;
+    // A key-shaped tool part is not quoted, nor the pattern around it.
+    if (holdsKey(prefix)) return `names an unknown tool, but this route is for ${routeTool}`;
     const what = TOOLS.includes(prefix) ? `a ${prefix} profile` : `unknown tool '${prefix}'`;
-    return `'${pattern}' names ${what}, but this route is for ${tool === "all" ? "claude + codex" : tool}`;
+    return `'${pattern}' names ${what}, but this route is for ${routeTool}`;
   }
   // A colon left in an email pattern would sit inside the address, which no account has.
   if (body.includes("@")) return /[\s,:]/.test(body) ? `'${pattern}' is not an email pattern` : null;
@@ -184,8 +226,16 @@ export function checkPattern(pattern: unknown, tool: RouteTool): string | null {
   return null;
 }
 
-/** Every problem with one route, each prefixed with where it is (`routes.<name>.<key>`). */
-export function checkRoute(name: string, raw: unknown, at = `routes.${name}`): string[] {
+/**
+ * Every problem with one route, each prefixed with where it is (`routes.<name>.<key>`). `names`
+ * are the registered profiles' (checkPattern).
+ */
+export function checkRoute(
+  name: string,
+  raw: unknown,
+  at = `routes.${name}`,
+  names: ProfileNames = NO_PROFILE_NAMES,
+): string[] {
   const nameProblem = checkRouteName(name);
   if (nameProblem) return [nameProblem];
   if (!isRecord(raw)) return [`${at}: must be an object`];
@@ -209,7 +259,7 @@ export function checkRoute(name: string, raw: unknown, at = `routes.${name}`): s
       continue;
     }
     value.forEach((pattern, index) => {
-      const problem = checkPattern(pattern, tool);
+      const problem = checkPattern(pattern, tool, names);
       if (problem) problems.push(`${at}.${key}[${index}]: ${problem}`);
     });
   }
@@ -225,9 +275,23 @@ export function checkRoute(name: string, raw: unknown, at = `routes.${name}`): s
   return problems;
 }
 
-export type RoutesCheck = { ok: true; file: RoutesFile } | { ok: false; problems: string[]; newerVersion?: number };
+/**
+ * A route in routes.json that fails its checks: as it is stored, and its problems. Its name can
+ * be anything, a key too, so it is never shown unless checkRouteName passes it.
+ */
+export type BrokenRoute = { name: string; spec: unknown; problems: string[] };
 
-export function checkRoutesFile(raw: unknown): RoutesCheck {
+export type RoutesCheck =
+  | { ok: true; file: RoutesFile; broken: BrokenRoute[] }
+  | { ok: false; problems: string[]; newerVersion?: number };
+
+/**
+ * The file's shape - a JSON object of this version, with an object of routes - is all or
+ * nothing. A route that fails its own checks is set apart in `broken` and left out of `file`, so
+ * that the others can still be used: a command refuses only the problems of the route it uses,
+ * and a write refuses a file that still has any.
+ */
+export function checkRoutesFile(raw: unknown, names: ProfileNames = NO_PROFILE_NAMES): RoutesCheck {
   if (!isRecord(raw)) return { ok: false, problems: ["must be a JSON object"] };
   if (typeof raw.version === "number" && raw.version > ROUTES_VERSION) {
     return {
@@ -240,14 +304,16 @@ export function checkRoutesFile(raw: unknown): RoutesCheck {
   if (raw.routes !== undefined && !isRecord(raw.routes)) {
     return { ok: false, problems: ["routes: must be an object of named routes"] };
   }
-  const routes = (raw.routes ?? {}) as Record<string, unknown>;
-  const problems = Object.entries(routes).flatMap(([name, spec]) => checkRoute(name, spec));
-  if (problems.length > 0) return { ok: false, problems };
-  const kept = Object.fromEntries(
-    Object.entries(routes as Record<string, Record<string, unknown>>).map(([name, spec]) => [
-      name,
-      Object.fromEntries(Object.entries(spec).filter(([key]) => !RETIRED_KEYS.has(key))) as RouteSpec,
-    ]),
-  );
-  return { ok: true, file: { ...raw, version: ROUTES_VERSION, routes: kept } };
+  const kept: Array<[string, RouteSpec]> = [];
+  const broken: BrokenRoute[] = [];
+  for (const [name, spec] of Object.entries((raw.routes ?? {}) as Record<string, unknown>)) {
+    const problems = checkRoute(name, spec, undefined, names);
+    if (problems.length > 0) {
+      broken.push({ name, spec, problems });
+      continue;
+    }
+    const fields = Object.entries(spec as Record<string, unknown>).filter(([key]) => !RETIRED_KEYS.has(key));
+    kept.push([name, Object.fromEntries(fields) as RouteSpec]);
+  }
+  return { ok: true, file: { ...raw, version: ROUTES_VERSION, routes: Object.fromEntries(kept) }, broken };
 }

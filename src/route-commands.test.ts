@@ -1,9 +1,10 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runCommand } from "./commands.js";
-import { routesPaths } from "./core/routes-store.js";
+import { RoutesFileError, routesPaths } from "./core/routes-store.js";
+import { reportError } from "./index.js";
 import { stripAnsi } from "./lib/cli-style.js";
 import type { RouteIo } from "./lib/route-io.js";
 import { renderRoutesEmpty } from "./lib/route-render.js";
@@ -484,8 +485,69 @@ describe("route list", () => {
     const out = await run("list", "--no-quota");
     expect(out).toMatch(/^ {4}main\s+claude\s+round-robin\s+80%\s+—\s+—$/m);
     expect(reads).toBe(0);
-    await run("list", "--json");
+    // --json reads quota for freeNow and next, and with --no-quota does not.
+    const json = JSON.parse(await run("list", "--json", "--no-quota"));
     expect(reads).toBe(0);
+    expect(json.routes[0]).toMatchObject({ members: ["claude:a", "claude:b", "claude:c"], freeNow: null, next: null });
+  });
+
+  it("lists in --json the members a run would rank, who is free now and who is next", async () => {
+    const { run, deps } = setup({ ...QUOTAS, "claude:b": snap(90, 0) });
+    // claude:glm is an API profile, which every run skips: not a member, though named exactly.
+    writeFileSync(
+      deps.paths.routesPath,
+      JSON.stringify({ version: 1, routes: { main: { tool: "claude", from: ["glm", "a", "b"], fallback: ["c"] } } }),
+    );
+    const [entry] = JSON.parse(await run("list", "--json")).routes;
+    expect(entry).toEqual({
+      name: "main",
+      route: {
+        tool: "claude",
+        from: ["glm", "a", "b"],
+        exclude: [],
+        strategy: "round-robin",
+        maxUsage: 80,
+        fallback: ["c"],
+      },
+      members: ["claude:a", "claude:b"],
+      fallbackMembers: ["claude:c"],
+      excluded: [],
+      unknownNames: [],
+      emptyPatterns: [],
+      emptyExcludes: [],
+      freeNow: { free: 2, members: 3 },
+      next: { kind: "picked", id: "claude:a", stage: "pool", reason: "next in turn" },
+    });
+    expect(await run("list")).toMatch(/^ {4}main\s+claude\s+round-robin\s+80%\s+2 of 3\s+claude:a$/m);
+  });
+
+  it("names nobody unknown before clausona init, when no profile is registered yet", async () => {
+    const { run, deps } = setup();
+    deps.loadRegistry = async () => null;
+    writeFileSync(
+      deps.paths.routesPath,
+      JSON.stringify({ version: 1, routes: { main: { tool: "claude", from: ["work"] } } }),
+    );
+    expect(await run("list")).not.toContain("⚠");
+    const [entry] = JSON.parse(await run("list", "--json")).routes;
+    expect(entry).toMatchObject({ members: [], unknownNames: [], emptyPatterns: [], freeNow: null, next: null });
+  });
+
+  it("says a pattern that matches nobody once, and an exclude that matches nobody too", async () => {
+    const { run, deps } = setup();
+    writeFileSync(
+      deps.paths.routesPath,
+      JSON.stringify({
+        version: 1,
+        routes: { main: { tool: "claude", from: ["*", "x-*"], fallback: ["x-*"], exclude: ["persnal", "c"] } },
+      }),
+    );
+    const out = await run("list");
+    expect(out.match(/'x-\*' matches nobody/g)).toHaveLength(1);
+    expect(out).toContain("  ⚠ main: exclude 'persnal' matches nobody.");
+    const [entry] = JSON.parse(await run("list", "--json")).routes;
+    expect(entry).toMatchObject({ emptyPatterns: ["x-*"], emptyExcludes: ["persnal"], excluded: ["claude:c"] });
+    expect(await run("explain", "main")).toMatch(/^ {4}persnal\s+excludes nobody$/m);
   });
 
   // A route can name a profile that has since been removed.
@@ -505,6 +567,182 @@ describe("route list", () => {
       members: ["claude:a", "claude:b", "claude:c"],
       unknownNames: ["gone"],
     });
+  });
+});
+
+describe("a route in routes.json that cannot be used", () => {
+  const BROKEN = {
+    version: 1,
+    routes: { main: { tool: "claude" }, bad: { tool: "claude", strategy: "fastest" } },
+  };
+  const PROBLEM = "routes.bad.strategy: must be one of round-robin, headroom, expiring";
+
+  function withBroken() {
+    const s = setup();
+    writeFileSync(s.deps.paths.routesPath, `${JSON.stringify(BROKEN, null, 2)}\n`);
+    return s;
+  }
+
+  it("is warned about by list and explain, which go on with the others", async () => {
+    const { run } = withBroken();
+    const out = await run("list");
+    expect(out).toMatch(/^ {4}main\s+claude\s+round-robin\s+80%\s+3 of 3\s+claude:a$/m);
+    expect(out).not.toMatch(/^ {4}bad\s/m);
+    expect(out).toContain(`  ⚠ ${PROBLEM}`);
+    expect(out).toContain("  ⚠ Fix it with clausona route edit, or remove the route: clausona route remove bad.");
+    const json = JSON.parse(await run("list", "--json"));
+    expect(Object.keys(json).sort()).toEqual(["problems", "routes"]);
+    expect(json.routes.map((route: { name: string }) => route.name)).toEqual(["main"]);
+    expect(json.problems).toEqual([PROBLEM]);
+    expect(await run("explain", "main")).toContain(`  ⚠ ${PROBLEM}`);
+  });
+
+  it("stops only a command that uses it, naming that route and the way out route list gives", async () => {
+    const { run, deps } = withBroken();
+    expect(await run("pick", "main")).toBe("claude:a");
+    for (const sub of ["pick", "explain"]) {
+      const error = (await run(sub, "bad").catch((e: unknown) => e)) as Error;
+      expect(error).toBeInstanceOf(RoutesFileError);
+      expect(error.message).toBe(
+        [
+          `Route 'bad' in ${deps.paths.routesPath} cannot be used:`,
+          `    ${PROBLEM}`,
+          "  Fix it with clausona route edit, or remove the route: clausona route remove bad.",
+        ].join("\n"),
+      );
+    }
+  });
+
+  // Identity cannot follow a string or null through a rename, so the name is checked before the move.
+  it("refuses to rename one stored as a string or null, naming it by its name on disk", async () => {
+    for (const spec of ["claude", null]) {
+      const { run, deps } = setup();
+      writeFileSync(
+        deps.paths.routesPath,
+        JSON.stringify({ version: 1, routes: { main: { tool: "claude" }, old: spec } }),
+      );
+      const before = readFileSync(deps.paths.routesPath, "utf8");
+      const error = (await run("rename", "old", "older").catch((e: unknown) => e)) as Error;
+      expect(error.message, String(spec)).toBe(
+        [
+          `${deps.paths.routesPath} has a route that cannot be used, so nothing was saved:`,
+          "    routes.old: must be an object",
+          "  Fix it with clausona route edit, or remove the route: clausona route remove old.",
+        ].join("\n"),
+      );
+      expect(readFileSync(deps.paths.routesPath, "utf8")).toBe(before);
+    }
+  });
+
+  // Renamed, it would still be broken: the refusal names it as it is on disk, where remove finds it.
+  it("refuses to rename it, naming it by its name on disk", async () => {
+    const { run, deps } = withBroken();
+    const before = readFileSync(deps.paths.routesPath, "utf8");
+    const error = (await run("rename", "bad", "older").catch((e: unknown) => e)) as Error;
+    expect(error.message).toBe(
+      [
+        `${deps.paths.routesPath} has a route that cannot be used, so nothing was saved:`,
+        `    ${PROBLEM}`,
+        "  Fix it with clausona route edit, or remove the route: clausona route remove bad.",
+      ].join("\n"),
+    );
+    expect(readFileSync(deps.paths.routesPath, "utf8")).toBe(before);
+  });
+
+  it("keeps every write from saving it again, and says how to get past it", async () => {
+    const { run, deps } = withBroken();
+    const before = readFileSync(deps.paths.routesPath, "utf8");
+    for (const args of [
+      ["add", "new"],
+      ["set", "main", "--strategy", "headroom"],
+      ["rename", "main", "other"],
+      ["remove", "main"],
+    ]) {
+      const error = (await run(...args).catch((e: unknown) => e)) as Error;
+      expect(error.message, args.join(" ")).toBe(
+        [
+          `${deps.paths.routesPath} has a route that cannot be used, so nothing was saved:`,
+          `    ${PROBLEM}`,
+          "  Fix it with clausona route edit, or remove the route: clausona route remove bad.",
+        ].join("\n"),
+      );
+    }
+    expect(readFileSync(deps.paths.routesPath, "utf8")).toBe(before);
+  });
+
+  it("can be mended with route set, or removed", async () => {
+    const mended = withBroken();
+    await mended.run("set", "bad", "--strategy", "headroom");
+    expect(mended.file().routes.bad).toEqual({ tool: "claude", strategy: "headroom" });
+    const removed = withBroken();
+    await removed.run("remove", "bad");
+    expect(removed.file().routes).toEqual({ main: { tool: "claude" } });
+  });
+
+  it("never names a route whose name looks like a key, in a warning, a list of routes or a way out", async () => {
+    const { run, deps } = setup();
+    const key = ["sk", "ant", "y".repeat(24)].join("-");
+    writeFileSync(
+      deps.paths.routesPath,
+      JSON.stringify({ version: 1, routes: { main: { tool: "claude" }, [key]: { tool: "claude" } } }),
+    );
+    const out = await run("list");
+    expect(out).toContain("  ⚠ That looks like an API key, not a route name.");
+    expect(out).toContain("  ⚠ Fix it with clausona route edit.");
+    const unknown = (await run("explain", "nope").catch((e: unknown) => e)) as Error;
+    expect(unknown.message).toContain("Existing routes: main.");
+    const refused = (await run("add", "new").catch((e: unknown) => e)) as Error;
+    for (const text of [out, unknown.message, refused.message]) expect(text).not.toContain("sk-");
+  });
+});
+
+// The profile rule takes this name, and the key check, which is wider, would not.
+describe("a profile whose name the key check would take for a key", () => {
+  const longName = ["Team", "Build", "2026", "Runner", "Alpha", "7Beta", "9Zed"].join("");
+  const withLong = () => {
+    const s = setup({ ...QUOTAS, [`claude:${longName}`]: snap(5, 5) });
+    s.deps.loadRegistry = async () => ({
+      ...REGISTRY,
+      profiles: {
+        ...REGISTRY.profiles,
+        [`claude:${longName}`]: { tool: "claude", configDir: "/home/u/.claude-l", email: "l@example.com" },
+      },
+    });
+    return s;
+  };
+
+  it("can be named in a route, by route add and by hand", async () => {
+    const { run, file, deps } = withLong();
+    await run("add", "solo", "--from", longName);
+    expect(file().routes.solo.from).toEqual([longName]);
+    writeFileSync(
+      deps.paths.routesPath,
+      JSON.stringify({ version: 1, routes: { hand: { tool: "claude", from: [`claude:${longName}`, "a"] } } }),
+    );
+    expect(await run("pick", "hand")).toBe(`claude:${longName}`);
+    // And by a run's own options, unsaved.
+    expect(await run("explain", "--tool", "claude", "--from", longName)).toContain(`▸ claude:${longName}`);
+    expect(JSON.parse(await run("list", "--json")).problems).toEqual([]);
+  });
+
+  // The name passed only because a profile had it; once that profile is gone, it is checked again.
+  it("makes a route that names it unusable once the profile is removed, and says why", async () => {
+    const { run, deps } = withLong();
+    await run("add", "solo", "--from", longName);
+    deps.loadRegistry = async () => REGISTRY;
+    const out = await run("list", "--no-quota");
+    expect(out).toContain(
+      "  ⚠ routes.solo.from[0]: looks like an API key, or names a profile that is no longer registered",
+    );
+    expect(out).not.toContain(longName);
+  });
+
+  it("is a key to every route command while no profile has that name", async () => {
+    const { run } = setup();
+    const error = (await run("add", "solo", "--from", longName).catch((e: unknown) => e)) as Error;
+    expect(error.message).toBe(
+      "routes.solo.from[0]: looks like an API key, or names a profile that is no longer registered",
+    );
   });
 });
 
@@ -584,6 +822,18 @@ describe("route explain and pick", () => {
     expect(JSON.parse(await run("pick", "main", "--json"))).toMatchObject({ profile: "claude:a", stage: "pool" });
   });
 
+  it("drops a removed profile's pick time when it records the next pick", async () => {
+    const { run, deps } = setup();
+    await run("add", "main");
+    const gone = { "claude:gone": "2026-10-01T00:00:00.000Z", "claude:c": "2026-10-02T00:00:00.000Z" };
+    writeFileSync(deps.paths.picksPath, JSON.stringify({ version: 1, lastPicked: gone }));
+    expect(await run("pick", "main")).toBe("claude:a");
+    expect(JSON.parse(readFileSync(deps.paths.picksPath, "utf8")).lastPicked).toEqual({
+      "claude:a": new Date(NOW).toISOString(),
+      "claude:c": "2026-10-02T00:00:00.000Z",
+    });
+  });
+
   it("fails with exit code 75 when nobody can be picked, as JSON when asked", async () => {
     const { run } = setup({ "claude:a": snap(100, 0), "claude:b": snap(100, 0), "claude:c": snap(0, 100) });
     await run("add", "main");
@@ -615,6 +865,75 @@ describe("the reserve limit, which routes no longer have", () => {
     }
     expect(stripAnsi(await runCommand("run", ["--help"]))).not.toContain("--reserve-usage");
     expect(await run("--help")).toContain("3. overflow  any member under 100%, lowest usage first");
+  });
+});
+
+describe("failures with --json", () => {
+  /** What the command leaves with: its exit code, and what it prints on stdout and stderr. */
+  async function fails(run: Promise<string>) {
+    const error = await run.then(
+      () => {
+        throw new Error("did not fail");
+      },
+      (e: unknown) => e,
+    );
+    const out: string[] = [];
+    const err: string[] = [];
+    const sink = (chunks: string[]) => ({ write: (chunk: string) => chunks.push(chunk) > 0 });
+    const code = reportError(error, sink(err), sink(out));
+    return { code, json: JSON.parse(out.join("")), stderr: err.join("") };
+  }
+
+  it("is one JSON object on stdout, as the Extensions commands print it, with the exit code kept", async () => {
+    const { run } = setup();
+    await run("add", "main");
+    for (const args of [
+      ["list", "main", "--json"],
+      ["explain", "--json"],
+      ["pick", "main", "--bogus", "--json"],
+      ["explain", "main", "--max-usage", "0", "--json"],
+      ["add", "work", "--json"],
+      ["frobnicate", "--json"],
+    ]) {
+      const failure = await fails(run(...args));
+      expect(failure, args.join(" ")).toMatchObject({ code: 1, json: { version: 1, error: "usage" }, stderr: "" });
+      expect(Object.keys(failure.json).sort()).toEqual(["error", "message", "version"]);
+    }
+    const missing = await fails(run("explain", "nope", "--json"));
+    expect(missing).toMatchObject({ code: 1, stderr: "" });
+    expect(missing.json).toEqual({
+      version: 1,
+      error: "not-found",
+      message: "Route 'nope' does not exist. Existing routes: main. Create it: clausona route add nope",
+    });
+  });
+
+  it("names the file and its problems when routes.json, or the route named, cannot be used", async () => {
+    const { run, deps } = setup();
+    writeFileSync(deps.paths.routesPath, "{ not json");
+    const unusable = await fails(run("list", "--json"));
+    expect(unusable).toMatchObject({ code: 1, stderr: "" });
+    expect(unusable.json).toMatchObject({
+      version: 1,
+      error: "failed",
+      file: deps.paths.routesPath,
+      problems: [expect.stringMatching(/^not valid JSON/)],
+    });
+    expect(Object.keys(unusable.json).sort()).toEqual(["error", "file", "message", "problems", "version"]);
+    writeFileSync(deps.paths.routesPath, JSON.stringify({ version: 1, routes: { bad: { tool: "x" } } }));
+    const broken = await fails(run("pick", "bad", "--json"));
+    expect(Object.keys(broken.json).sort()).toEqual(["error", "file", "message", "problems", "version"]);
+    expect(broken.json).toMatchObject({
+      error: "failed",
+      problems: ['routes.bad.tool: must be "claude", "codex" or "all"'],
+    });
+  });
+
+  it("leaves exit 75 and the JSON pick prints for it as they are", async () => {
+    const { run } = setup({ "claude:a": snap(100, 0), "claude:b": snap(100, 0), "claude:c": snap(0, 100) });
+    await run("add", "main");
+    const none = await fails(run("pick", "main", "--json"));
+    expect(none).toMatchObject({ code: 75, json: { profile: null, route: "main" }, stderr: "" });
   });
 });
 
@@ -716,17 +1035,34 @@ describe("route edit", () => {
     expect(readFileSync(deps.paths.routesPath, "utf8")).toBe('{ "version": 1, "routes": {} }\n');
   });
 
-  it("keeps another terminal's change to routes.json made while the editor was open", async () => {
+  it("keeps another terminal's change to routes.json made while the editor was open, and the edit beside it", async () => {
     const { deps, io, file } = setup();
     writeFileSync(deps.paths.routesPath, '{ "version": 1, "routes": {} }\n');
+    const mine = JSON.stringify({ version: 1, routes: { mine: { tool: "claude" } } });
     deps.editText = async () => {
       await runRouteCommand(["add", "theirs"], io, { ...deps, editText: async () => "" });
-      return JSON.stringify({ version: 1, routes: { mine: { tool: "claude" } } });
+      return mine;
     };
     await expect(runRouteCommand(["edit"], io, deps)).rejects.toThrow(
-      `${deps.paths.routesPath} changed while you were editing, so your edit was not saved. Run \`clausona route edit\` again.`,
+      `${deps.paths.routesPath} changed while you were editing, so your edit was not saved. It is kept in ${deps.paths.editPath}: run \`clausona route edit\` and paste it in.`,
     );
     expect(Object.keys(file().routes)).toEqual(["theirs"]);
+    expect(readFileSync(deps.paths.editPath, "utf8")).toBe(`${mine}\n`);
+    // Only its owner can read it, as the editor's scratch file: it holds whatever was typed.
+    if (process.platform !== "win32") expect(statSync(deps.paths.editPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("deletes the kept edit once an edit saves it, and leaves it through any other save", async () => {
+    const { deps, io } = setup();
+    const kept = JSON.stringify({ version: 1, routes: { mine: { tool: "claude" } } }, null, 2);
+    writeFileSync(deps.paths.editPath, `${kept}\n`);
+    deps.editText = async () => JSON.stringify({ version: 1, routes: { other: { tool: "claude" } } });
+    await runRouteCommand(["edit"], io, deps);
+    expect(existsSync(deps.paths.editPath)).toBe(true);
+    // Pasted in and saved, spaced as the editor left it.
+    deps.editText = async () => JSON.stringify({ version: 1, routes: { mine: { tool: "claude" } } });
+    await runRouteCommand(["edit"], io, deps);
+    expect(existsSync(deps.paths.editPath)).toBe(false);
   });
 
   it("opens an invalid file as it is, so it can be fixed", async () => {

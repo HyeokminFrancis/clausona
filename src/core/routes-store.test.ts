@@ -50,6 +50,7 @@ describe("routesPaths", () => {
     expect(routesPaths(dir)).toEqual({
       routesPath: path.join(dir, "routes.json"),
       picksPath: path.join(dir, "route-picks.json"),
+      editPath: path.join(dir, "routes.edit.json"),
       routesLock: path.join(dir, "locks", "routes.lock"),
       picksLock: path.join(dir, "locks", "route-picks.lock"),
     });
@@ -81,6 +82,12 @@ describe("parseRoutesText", () => {
   it("says on which line and column the JSON breaks", () => {
     const error = parseError('\uFEFF{\n  "version": 1,\n  "routes": {},\n}\n');
     expect(error.problems).toEqual(["not valid JSON (line 4, column 1)"]);
+  });
+
+  // Two objects pasted one after the other: V8 says "after JSON", not "in JSON".
+  it("says where text after the closing brace starts", () => {
+    const error = parseError('{ "version": 1 }\n{ "version": 1 }\n');
+    expect(error.problems).toEqual(["not valid JSON (line 2, column 1)"]);
   });
 
   // JSON.parse's own message quotes the text around the error.
@@ -227,6 +234,25 @@ describe("picks", () => {
     );
     expect(result).toBe("claude:a");
     expect(readJson(p.picksPath)).toEqual({ version: 1, lastPicked: { "claude:a": "2026-10-09T01:02:03.000Z" } });
+  });
+
+  // As a newer routes.json is never rewritten: an older clausona must not replace a newer record.
+  it("leaves a record of another version as it is, and picks from no record", async () => {
+    const p = paths();
+    const record = `${JSON.stringify({ version: 2, lastPicked: { "claude:a": "2026-10-08T00:00:00.000Z" } })}\n`;
+    writeFileSync(p.picksPath, record);
+    const seen: Array<Record<string, string>> = [];
+    const result = await pickWithRecord(
+      (lastPicked) => {
+        seen.push(lastPicked);
+        return { result: "claude:a", picked: "claude:a" };
+      },
+      () => Date.parse("2026-10-09T00:00:00.000Z"),
+      p,
+    );
+    expect(result).toBe("claude:a");
+    expect(seen).toEqual([{}]);
+    expect(readFileSync(p.picksPath, "utf8")).toBe(record);
   });
 
   it("records nothing when nothing was picked", async () => {
