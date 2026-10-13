@@ -1,3 +1,4 @@
+import { getEventListeners } from "node:events";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -78,6 +79,166 @@ describe("resolveSecret", () => {
     const run = windows ? "exit 3" : 'node -e "process.exit(3)"';
     await expect(resolveSecret("claude:x", { source: "command", run })).rejects.toThrow(/exited with 3/);
   });
+
+  // A vault waiting to be unlocked, or a CLI on a dead network: the command never answers. Once
+  // the signal aborts, the shell and what it started are killed, and nothing waits on them.
+  it.skipIf(windows)(
+    "stops a command that never answers once its signal aborts, and kills what it started",
+    { timeout: SPAWNING_TEST_TIMEOUT_MS },
+    async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "clausona-key-command-"));
+      temps.push(dir);
+      const pids = path.join(dir, "pids");
+      vi.stubEnv("CLAUSONA_TEST_PIDS", pids);
+      // The shell's pid, then the pid of the sleep it starts, which outlives it unless killed.
+      const run = 'echo $$ > "$CLAUSONA_TEST_PIDS"; sleep 30 & echo $! >> "$CLAUSONA_TEST_PIDS"; wait';
+      const controller = new AbortController();
+      const started = Date.now();
+      const read = resolveSecret("claude:x", { source: "command", run }, undefined, { signal: controller.signal });
+      // Aborted once the command is under way, both pids written.
+      await vi.waitFor(() => expect(readFileSync(pids, "utf8").trim().split("\n")).toHaveLength(2), {
+        timeout: 20_000,
+      });
+      controller.abort();
+      await expect(read).rejects.toThrow("the key was not read in time");
+      expect(Date.now() - started).toBeLessThan(25_000);
+      const alive = (pid: number) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const [shell, sleep] = readFileSync(pids, "utf8").trim().split("\n").map(Number);
+      await vi.waitFor(() => expect([alive(shell), alive(sleep)]).toEqual([false, false]), { timeout: 10_000 });
+    },
+  );
+
+  // Started in a group of its own, it is out of reach of the terminal's Ctrl-C: clausona ending
+  // ends it, and the signal goes on to end clausona as it would have.
+  it.skipIf(windows)(
+    "ends a key command it is waiting on when clausona is interrupted, and lets the signal take its course",
+    { timeout: SPAWNING_TEST_TIMEOUT_MS },
+    async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "clausona-key-command-"));
+      temps.push(dir);
+      const pids = path.join(dir, "pids");
+      vi.stubEnv("CLAUSONA_TEST_PIDS", pids);
+      const run = 'echo $$ > "$CLAUSONA_TEST_PIDS"; sleep 30 & echo $! >> "$CLAUSONA_TEST_PIDS"; wait';
+      const alive = (pid: number) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const others = process.listenerCount("SIGINT");
+      const controller = new AbortController();
+      // Settled when its group is killed: the key is not read.
+      const read = resolveSecret("claude:x", { source: "command", run }, undefined, { signal: controller.signal }).then(
+        () => "read",
+        () => "not read",
+      );
+      await vi.waitFor(() => expect(readFileSync(pids, "utf8").trim().split("\n")).toHaveLength(2), {
+        timeout: 20_000,
+      });
+      const [shell, sleep] = readFileSync(pids, "utf8").trim().split("\n").map(Number);
+      // The signal raised again on this process is caught here, or it would end the test run.
+      const real = process.kill.bind(process);
+      const raised: Array<string | number | undefined> = [];
+      const kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+        if (pid !== process.pid) return real(pid, signal);
+        raised.push(signal);
+        return true;
+      });
+      try {
+        (process.emit as (event: string, ...args: unknown[]) => boolean)("SIGINT", "SIGINT");
+        await vi.waitFor(() => expect([alive(shell), alive(sleep)]).toEqual([false, false]), { timeout: 10_000 });
+        // Its handlers are gone, and with no other handler the signal was raised again.
+        expect(process.listenerCount("SIGINT")).toBe(others);
+        expect(raised).toEqual(others === 0 ? ["SIGINT"] : []);
+        expect(await read).toBe("not read");
+      } finally {
+        kill.mockRestore();
+        controller.abort();
+      }
+    },
+  );
+
+  // Every API profile's key can be read at once: one set of handlers serves them all.
+  it.skipIf(windows)(
+    "puts on one set of signal handlers for many key commands at once, and takes it off after",
+    { timeout: SPAWNING_TEST_TIMEOUT_MS },
+    async () => {
+      const counts = () => ["SIGINT", "SIGTERM", "SIGHUP", "exit"].map((event) => process.listenerCount(event));
+      const before = counts();
+      const warning = vi.spyOn(process, "emitWarning");
+      // One signal given to every read, as a caller may: it gets one listener, not twelve.
+      const controller = new AbortController();
+      try {
+        const reads = Array.from({ length: 12 }, () =>
+          resolveSecret("claude:x", { source: "command", run: "sleep 30" }, undefined, {
+            signal: controller.signal,
+          }).catch(() => "not read"),
+        );
+        // Each started as it was asked for: one handler more for each event, not twelve.
+        expect(counts()).toEqual(before.map((count) => count + 1));
+        expect(getEventListeners(controller.signal, "abort")).toHaveLength(1);
+        controller.abort();
+        expect(await Promise.all(reads)).toEqual(Array(12).fill("not read"));
+        expect(counts()).toEqual(before);
+        expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+        // Not a MaxListenersExceededWarning, on process or on the signal, nor any other.
+        expect(warning).not.toHaveBeenCalled();
+      } finally {
+        warning.mockRestore();
+        controller.abort();
+      }
+    },
+  );
+
+  // Its pid, once it has exited, can be another process's: nothing is signalled then, even with a
+  // job it left behind holding its output open, which the abort no longer waits for.
+  it.skipIf(windows)(
+    "signals nothing once the command has exited, though a job it left keeps its output open",
+    { timeout: SPAWNING_TEST_TIMEOUT_MS },
+    async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "clausona-key-command-"));
+      temps.push(dir);
+      const pids = path.join(dir, "pids");
+      vi.stubEnv("CLAUSONA_TEST_PIDS", pids);
+      const run = 'echo $$ > "$CLAUSONA_TEST_PIDS"; sleep 30 & echo $! >> "$CLAUSONA_TEST_PIDS"; exit 0';
+      const alive = (pid: number) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const controller = new AbortController();
+      const read = resolveSecret("claude:x", { source: "command", run }, undefined, { signal: controller.signal });
+      await vi.waitFor(() => expect(readFileSync(pids, "utf8").trim().split("\n")).toHaveLength(2), {
+        timeout: 20_000,
+      });
+      const [shell, job] = readFileSync(pids, "utf8").trim().split("\n").map(Number);
+      try {
+        await vi.waitFor(() => expect(alive(shell)).toBe(false), { timeout: 20_000 });
+        const kill = vi.spyOn(process, "kill");
+        controller.abort();
+        await expect(read).rejects.toThrow("the key was not read in time");
+        // Only the checks above and below: no signal went to any pid.
+        expect(kill.mock.calls.filter(([, signal]) => signal !== 0)).toEqual([]);
+        kill.mockRestore();
+        expect(alive(job)).toBe(true);
+      } finally {
+        // The job is this test's own, by the pid it wrote.
+        if (alive(job)) process.kill(job, "SIGKILL");
+      }
+    },
+  );
 });
 
 /**

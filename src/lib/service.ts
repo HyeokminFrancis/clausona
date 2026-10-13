@@ -29,7 +29,7 @@ import { isKnownSecretSource, keySharersElsewhere } from "../core/key-source.js"
 import { invalidateLaunchCache, launchCachePath, launchRefPath, PLUGIN_SYNC_STAMP_NAME } from "../core/launch-cache.js";
 import { appDir, backupDirFor, claudeJsonPathForConfigDir } from "../core/paths.js";
 import { spawnCommand } from "../core/process.js";
-import { collectQuotas, type QuotaTarget } from "../core/quota-store.js";
+import { cachedQuotas, collectQuotas, type QuotaTarget } from "../core/quota-store.js";
 import { isV1Registry, migrateRegistryV1toV2, setActiveProfile } from "../core/registry.js";
 import { codexProcessesFor } from "../core/running-codex.js";
 import { createSharedLink, inspectSharedLink } from "../core/shared-links.js";
@@ -1870,7 +1870,14 @@ export async function listProfiles(options: ListProfilesOptions = {}): Promise<P
         tool: profile.tool,
         configDir: profile.configDir,
       }));
-    quotas = await collectQuotas(targets, { refresh: options.refresh, renew: options.renew });
+    // Its spend is shown as it was last read, by `route budget` or a routed run: reading it here
+    // would send its key to its provider on every list.
+    const api = entries.filter(([, profile]) => profile.kind === "api").map(([id]) => id);
+    const [plans, spend] = await Promise.all([
+      collectQuotas(targets, { refresh: options.refresh, renew: options.renew }),
+      cachedQuotas(api),
+    ]);
+    quotas = { ...shownSpend(spend), ...plans };
   }
 
   return entries.map(([id, profile]) => {
@@ -1911,13 +1918,32 @@ export async function fetchProfileQuotas(
   items: Pick<ProfileListItem, "name" | "tool" | "kind" | "configDir">[],
   options: { refresh?: boolean; renew?: boolean } = {},
 ): Promise<Record<string, QuotaSnapshot>> {
-  return collectQuotas(
-    // Same exclusion as listProfiles: an API profile has no plan quota to read, so
-    // asking for one costs a credential lookup and answers `missing`.
-    items
-      .filter((item) => item.kind !== "api")
-      .map((item) => ({ id: item.name, tool: item.tool, configDir: item.configDir })),
-    options,
+  const [plans, spend] = await Promise.all([
+    collectQuotas(
+      // Same exclusion as listProfiles: an API profile has no plan quota to read, so
+      // asking for one costs a credential lookup and answers `missing`.
+      items
+        .filter((item) => item.kind !== "api")
+        .map((item) => ({ id: item.name, tool: item.tool, configDir: item.configDir })),
+      options,
+    ),
+    // Its spend as last read, as listProfiles shows it: the dashboard resolves no key.
+    cachedQuotas(items.filter((item) => item.kind === "api").map((item) => item.name)),
+  ]);
+  return { ...shownSpend(spend), ...plans };
+}
+
+/**
+ * API profiles' cached readings as a listing shows them: the state, when, and the `budget`
+ * window. Not the spend behind it - totals and the periods' baselines - which is the cache's own
+ * bookkeeping, and would reach `list --json` as if it were something to rely on.
+ */
+function shownSpend(snapshots: Record<string, QuotaSnapshot>): Record<string, QuotaSnapshot> {
+  return Object.fromEntries(
+    Object.entries(snapshots).map(([id, snapshot]): [string, QuotaSnapshot] => [
+      id,
+      { state: snapshot.state, fetchedAt: snapshot.fetchedAt, ...(snapshot.budget ? { budget: snapshot.budget } : {}) },
+    ]),
   );
 }
 

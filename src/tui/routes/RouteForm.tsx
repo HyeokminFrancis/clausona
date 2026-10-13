@@ -1,6 +1,6 @@
 import { Box, type Key, Text, useInput } from "ink";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-
+import type { Budgets } from "../../core/route-budgets.js";
 import {
   holdsKey,
   ROUTE_TOOLS,
@@ -15,7 +15,7 @@ import { matchesMember } from "../../core/route-patterns.js";
 import { type RuleRef, removeUnfillable, renameReferences, rulesText } from "../../core/route-rules.js";
 import { type Ranking, rankRoute } from "../../core/routing.js";
 import { toolLabel } from "../../lib/route-render.js";
-import { checkRouteMembers, membersOf } from "../../lib/route-service.js";
+import { checkRouteMembersNow, membersOf } from "../../lib/route-service.js";
 import type { QuotaSnapshot, Registry } from "../../types.js";
 import { Chrome } from "../components/Chrome.js";
 import { FieldInput } from "../components/FieldInput.js";
@@ -71,6 +71,8 @@ export type RouteFormProps = {
   quotas: Record<string, QuotaSnapshot>;
   lastPicked: Record<string, string>;
   registry: Registry;
+  /** The budgets routes.json holds, which let an API profile join a route; none when not given. */
+  budgets?: Budgets;
   deps: RoutesScreenDeps;
   now: number;
   /**
@@ -80,11 +82,15 @@ export type RouteFormProps = {
   onDone: (saved: string | null, note?: string) => void;
 };
 
-/** The accounts a route can take in this version: the subscription profiles of both tools. */
-export function formAccounts(registry: Registry): FormAccount[] {
+/**
+ * The accounts the form offers: the subscription profiles of both tools, and the API profiles
+ * `offer` lets in - the ones with a limit, and any the route already names, which saving then
+ * checks as `route set` does.
+ */
+export function formAccounts(registry: Registry, offer: (id: string) => boolean = () => false): FormAccount[] {
   return membersOf(registry, "all")
-    .filter((member) => member.kind === "subscription")
-    .map(({ id, tool, name, email }) => ({ id, tool, name, email }));
+    .filter((member) => member.kind === "subscription" || offer(member.id))
+    .map(({ id, tool, name, email, kind }) => ({ id, tool, name, email, ...(kind === "api" ? { kind } : {}) }));
 }
 
 /**
@@ -115,6 +121,8 @@ const BESIDE: Record<TextField, number> = {
 
 /** The fewest account lines the form shows, however short the terminal. */
 const MIN_ACCOUNT_LINES = 3;
+
+const NO_BUDGETS: Budgets = {};
 
 /** What a field holding something key-shaped shows instead: a constant, as the API form's key field. */
 const MASK = "•".repeat(8);
@@ -219,7 +227,7 @@ const sameSpec = (a: RouteSpec | undefined, b: RouteSpec | undefined) => JSON.st
 type Outcome = "saved" | "changed" | "removed" | Errors;
 
 export function RouteForm(props: RouteFormProps) {
-  const { accounts, quotas, lastPicked, registry, deps, now, onDone } = props;
+  const { accounts, quotas, lastPicked, registry, budgets = NO_BUDGETS, deps, now, onDone } = props;
   const original = props.mode === "edit" ? props.name : undefined;
   const [state, setState] = useState(() =>
     initialFormState(
@@ -267,7 +275,8 @@ export function RouteForm(props: RouteFormProps) {
     return new Set(
       listed
         .filter((account) => {
-          if (state.every && !state.ticked.includes(account.id)) return true;
+          // Unticked, an API profile is not in the route at all: `*` never takes one.
+          if (state.every && account.kind !== "api" && !state.ticked.includes(account.id)) return true;
           const member = members.get(account.id);
           return member !== undefined && patterns.some((pattern) => matchesMember(pattern, member));
         })
@@ -285,7 +294,9 @@ export function RouteForm(props: RouteFormProps) {
         preview
           ? preview.rows.filter((row) => row.role === "pool").map((row) => row.id)
           : state.every
-            ? listed.map((account) => account.id)
+            ? listed
+                .filter((account) => account.kind !== "api" || state.ticked.includes(account.id))
+                .map((account) => account.id)
             : state.ticked,
       ),
     [preview, listed, state.every, state.ticked],
@@ -362,13 +373,21 @@ export function RouteForm(props: RouteFormProps) {
       showErrors(errors);
       return;
     }
+    setSaving(true);
     try {
-      checkRouteMembers(name, spec, registry);
+      // As `route add` checks it: each API profile the route takes needs a limit, read now.
+      await checkRouteMembersNow(name, spec, registry, {
+        budgets,
+        collect: (targets) => deps.collectQuotas(targets),
+      });
     } catch (error) {
-      showErrors({ form: errorText(error) });
+      if (alive.current) {
+        showErrors({ form: errorText(error) });
+        setSaving(false);
+      }
       return;
     }
-    setSaving(true);
+    if (!alive.current) return;
     try {
       const { outcome, dropped } = await write(name, spec);
       if (!alive.current) return;

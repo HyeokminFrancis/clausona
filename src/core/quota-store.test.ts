@@ -5,12 +5,12 @@ import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 
 import type { ToolAdapter, ToolCredential } from "../tools/types.js";
 import type { QuotaSnapshot } from "../types.js";
-import { QuotaHttpError } from "./quota.js";
+import { QUOTA_FRESH_MS, QUOTA_TIMEOUT_MS, QuotaHttpError } from "./quota.js";
 
 const getAdapter = vi.hoisted(() => vi.fn());
 vi.mock("../tools/registry.js", () => ({ getAdapter }));
 
-const { collectQuotas } = await import("./quota-store.js");
+const { cachedQuotas, collectQuotas } = await import("./quota-store.js");
 
 const NOW = 1_800_000_000_000;
 const TARGET = { id: "claude:work", tool: "claude" as const, configDir: "/tmp/.claude-work" };
@@ -341,5 +341,205 @@ describe("collectQuotas", () => {
     const result: Record<string, QuotaSnapshot> = await collectQuotas([TARGET], { now: NOW, cachePath });
 
     expect(result[TARGET.id]?.state).toBe("missing");
+  });
+});
+
+describe("collectQuotas: an API profile's spend", () => {
+  // Wednesday 2026-10-14 in UTC, so a month and a week are under way.
+  const AT = Date.parse("2026-10-14T09:30:00.000Z");
+  // Built from pieces so the source never holds a key-shaped string.
+  const KEY = ["sk", "gw", "Hd5Rk8Vn3Jc6"].join("-");
+
+  /** A stand-in fetch: no test reaches a network. */
+  function stubFetch(status: number, body: unknown, headers: Record<string, string> = {}) {
+    return vi.fn(async () => new Response(JSON.stringify(body), { status, headers }));
+  }
+
+  const apiTarget = (budget?: { usd: number; per: "day" | "week" | "month" }) => ({
+    id: "claude:gw",
+    tool: "claude" as const,
+    configDir: "/tmp/.claude-gw",
+    api: {
+      baseUrl: "https://gw.example.com",
+      authScheme: "bearer" as const,
+      readKey: vi.fn(async (_signal: AbortSignal) => KEY),
+      ...(budget ? { budget } : {}),
+    },
+  });
+
+  const collect = (target: ReturnType<typeof apiTarget>, fetch: ReturnType<typeof stubFetch>, now = AT) =>
+    collectQuotas([target], { now, cachePath, fetch: fetch as unknown as typeof globalThis.fetch });
+
+  it("reads the spend, caches it as a budget window, and keeps the key out of the cache", async () => {
+    const fetch = stubFetch(200, { info: { spend: 12, max_budget: 40 } });
+    const result = await collect(apiTarget(), fetch);
+    expect(result["claude:gw"]).toMatchObject({
+      state: "ok",
+      budget: { usedPercent: 30, spentUsd: 12, limitUsd: 40, source: "provider" },
+    });
+    const cached = readFileSync(cachePath, "utf8");
+    expect(JSON.parse(cached).profiles["claude:gw"].budget.usedPercent).toBe(30);
+    expect(cached).not.toContain(KEY);
+    expect(getAdapter).not.toHaveBeenCalled();
+  });
+
+  it("serves a fresh reading again for the limit that applies now, without asking or reading the key", async () => {
+    const target = apiTarget();
+    await collect(target, stubFetch(200, { info: { spend: 12, max_budget: 40 } }));
+    const fetch = stubFetch(500, {});
+    const budgeted = apiTarget({ usd: 20, per: "month" });
+    const result = await collect(budgeted, fetch, AT + 60_000);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(budgeted.api.readKey).not.toHaveBeenCalled();
+    // The first reading this month is where a budget counts from.
+    expect(result["claude:gw"]?.budget).toMatchObject({ spentUsd: 0, limitUsd: 20, source: "budget" });
+    // Kept, for list and the dashboard, which read only the cache.
+    expect(readCacheFile().profiles["claude:gw"].budget).toMatchObject({ limitUsd: 20, source: "budget" });
+  });
+
+  it("reads again a cached reading from before its budget's period began", async () => {
+    await collect(apiTarget(), stubFetch(200, { info: { spend: 12 } }), Date.parse("2026-10-13T23:58:00.000Z"));
+    const fetch = stubFetch(200, { info: { spend: 13 } });
+    await collect(apiTarget({ usd: 5, per: "day" }), fetch, Date.parse("2026-10-14T00:01:00.000Z"));
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("caches a provider that gives no spend reading, so the next run does not ask again", async () => {
+    const result = await collect(apiTarget({ usd: 20, per: "month" }), stubFetch(404, { detail: "Not Found" }));
+    expect(result["claude:gw"]).toEqual({ state: "error", fetchedAt: AT, noSpendReading: true });
+    const fetch = stubFetch(404, {});
+    await collect(apiTarget({ usd: 20, per: "month" }), fetch, AT + 60_000);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("keeps the period's baselines through an answer with no spend reading", async () => {
+    // A month counted from its first reading at $100.
+    await collect(apiTarget({ usd: 20, per: "month" }), stubFetch(200, { info: { spend: 100 } }));
+    const blip = await collect(apiTarget({ usd: 20, per: "month" }), stubFetch(404, {}), AT + QUOTA_FRESH_MS);
+    expect(blip["claude:gw"]).toMatchObject({ state: "error", noSpendReading: true });
+    const later = AT + 2 * QUOTA_FRESH_MS;
+    const result = await collect(apiTarget({ usd: 20, per: "month" }), stubFetch(200, { info: { spend: 107 } }), later);
+    expect(result["claude:gw"]?.budget).toMatchObject({ spentUsd: 7, usedPercent: 35 });
+  });
+
+  it("counts a late LiteLLM reset once, through the cache, as a run reads it", async () => {
+    // A key LiteLLM resets daily, under a $100 monthly budget; its job resets the key some
+    // minutes after budget_reset_at, and moves that time on as it does.
+    const month = apiTarget({ usd: 100, per: "month" });
+    const read = async (when: string, spend: number, resets: string) => {
+      const info = { spend, max_budget: 50, budget_duration: "1d", budget_reset_at: resets };
+      const result = await collect(month, stubFetch(200, { info }), Date.parse(when));
+      return result["claude:gw"]?.budget?.spentUsd;
+    };
+    await read("2026-10-14T08:00:00Z", 0, "2026-10-15T00:00:00Z");
+    expect(await read("2026-10-14T20:00:00Z", 30, "2026-10-15T00:00:00Z")).toBe(30);
+    expect(await read("2026-10-15T00:05:00Z", 31, "2026-10-15T00:00:00Z")).toBe(31);
+    expect(await read("2026-10-15T00:20:00Z", 0.5, "2026-10-16T00:00:00Z")).toBe(31.5);
+    expect(await read("2026-10-15T18:00:00Z", 10, "2026-10-16T00:00:00Z")).toBe(41);
+  });
+
+  it("keeps the last reading's spend through a failure, and pauses only this profile after a 429", async () => {
+    await collect(apiTarget(), stubFetch(200, { info: { spend: 12, max_budget: 40 } }));
+    const result = await collect(apiTarget(), stubFetch(429, {}, { "retry-after": "600" }), AT + QUOTA_FRESH_MS);
+    expect(result["claude:gw"]).toMatchObject({ state: "cooldown", fetchedAt: AT, spend: { totalUsd: 12 } });
+    expect(readCacheFile().cooldowns).toEqual({ "claude:gw": AT + QUOTA_FRESH_MS + 600_000 });
+    const fetch = stubFetch(200, { info: { spend: 13 } });
+    expect((await collect(apiTarget(), fetch, AT + QUOTA_FRESH_MS + 1000))["claude:gw"]?.state).toBe("cooldown");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("stops waiting for a key that never comes once the reading's time is up, and reads the others", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const hung = apiTarget();
+      let asked: AbortSignal | undefined;
+      hung.api.readKey.mockImplementation((signal: AbortSignal) => {
+        asked = signal;
+        return new Promise<string>(() => {});
+      });
+      const other = { ...apiTarget(), id: "claude:other" };
+      stubAdapter();
+      const fetch = stubFetch(200, { info: { spend: 1, max_budget: 10 } });
+      const reading = collectQuotas([hung, other, TARGET], {
+        now: AT,
+        cachePath,
+        fetch: fetch as unknown as typeof globalThis.fetch,
+      });
+      // The cache is read first, from disk: the clock moves once the key is being read.
+      while (!asked) await new Promise((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(QUOTA_TIMEOUT_MS);
+      const result = await reading;
+      // Left out of this run as a spend that could not be read; the command it started is told to stop.
+      expect(result["claude:gw"]).toEqual({ state: "missing", fetchedAt: AT });
+      expect(asked?.aborted).toBe(true);
+      expect(result["claude:other"]?.state).toBe("ok");
+      expect(result[TARGET.id]?.state).toBe("ok");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives each profile's reading a signal of its own, so many read at once share none", async () => {
+    const signals: AbortSignal[] = [];
+    const targets = Array.from({ length: 12 }, (_, n) => {
+      const target = { ...apiTarget(), id: `claude:gw${n}` };
+      target.api.readKey.mockImplementation(async (signal: AbortSignal) => {
+        signals.push(signal);
+        return KEY;
+      });
+      return target;
+    });
+    const warning = vi.spyOn(process, "emitWarning");
+    try {
+      await collectQuotas(targets, {
+        now: AT,
+        cachePath,
+        fetch: stubFetch(200, { info: { spend: 1 } }) as unknown as typeof globalThis.fetch,
+      });
+      expect(new Set(signals).size).toBe(12);
+      expect(warning).not.toHaveBeenCalled();
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("asks for no key for a base URL that could never be read", async () => {
+    const target = apiTarget();
+    target.api.baseUrl = "https://admin:pw@gw.example.com";
+    const fetch = stubFetch(200, { info: { spend: 1 } });
+    expect((await collect(target, fetch))["claude:gw"]?.state).toBe("error");
+    expect(target.api.readKey).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("says a key that cannot be read is missing, and a rejected one expired, without a request for the first", async () => {
+    const fetch = stubFetch(200, { info: { spend: 1 } });
+    const target = apiTarget();
+    target.api.readKey.mockRejectedValueOnce(new Error("environment variable GW_KEY is unset or empty"));
+    expect((await collect(target, fetch))["claude:gw"]?.state).toBe("missing");
+    expect(fetch).not.toHaveBeenCalled();
+    const rejected = await collectQuotas([apiTarget()], {
+      now: AT,
+      cachePath,
+      refresh: true,
+      fetch: stubFetch(401, {}) as unknown as typeof globalThis.fetch,
+    });
+    expect(rejected["claude:gw"]?.state).toBe("expired");
+  });
+});
+
+describe("cachedQuotas", () => {
+  it("returns what the cache holds for the ids asked, and fetches nothing", async () => {
+    seedCache({
+      version: 1,
+      cooldowns: {},
+      profiles: {
+        "claude:gw": { state: "ok", fetchedAt: NOW - 3_600_000 },
+        [TARGET.id]: { state: "ok", fetchedAt: NOW },
+      },
+    });
+    expect(await cachedQuotas(["claude:gw", "claude:none", "constructor"], { cachePath })).toEqual({
+      "claude:gw": { state: "ok", fetchedAt: NOW - 3_600_000 },
+    });
   });
 });

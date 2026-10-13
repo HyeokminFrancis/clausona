@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -20,17 +21,138 @@ export function keychainItemFor(profileId: string): string {
 
 type RunResult = { code: number; stdout: string };
 
-function run(command: string, args: string[], input?: string): Promise<RunResult> {
+/**
+ * Kills a running child and everything it started. On POSIX the child leads a process group of
+ * its own (run() starts it so), and the whole group is killed: a `sh -c` command's own children,
+ * which would outlive the shell, among them. Windows kills the tree under its pid. Only while the
+ * child is still running: once it has exited, its pid can be another process's.
+ */
+function killRunning(child: ChildProcess): void {
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === "win32") {
+    spawnCommand("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" }).on("error", () => {});
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    // Gone already.
+  }
+}
+
+/** The signals that end clausona from outside: Ctrl-C, a kill, a terminal closing. */
+const ENDING_SIGNALS: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+/** The detached children clausona is waiting on: a signal that ends clausona ends each of them. */
+const detachedChildren = new Set<ChildProcess>();
+
+const killDetached = () => {
+  for (const child of detachedChildren) killRunning(child);
+};
+
+/**
+ * A signal that ends clausona: it kills every detached child still running, then takes its
+ * course - with no other handler for it, it is raised again, and clausona ends as it would have.
+ */
+function onEndingSignal(signal: NodeJS.Signals): void {
+  killDetached();
+  detachedChildren.clear();
+  stopListening();
+  if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+}
+
+function stopListening(): void {
+  for (const signal of ENDING_SIGNALS) process.off(signal, onEndingSignal);
+  process.off("exit", killDetached);
+}
+
+/**
+ * Ends a detached child with clausona. Detached, it is out of the terminal's process group, which
+ * the terminal's Ctrl-C reaches, so a signal that ends clausona kills its group here, as
+ * process.exit() does (the dashboard quitting). One set of handlers serves every child: put on
+ * for the first, taken off with the last, however many keys are read at once. Returns what lets
+ * this child go, once it is done with.
+ */
+function endWithClausona(child: ChildProcess): () => void {
+  if (detachedChildren.size === 0) {
+    for (const signal of ENDING_SIGNALS) process.on(signal, onEndingSignal);
+    process.on("exit", killDetached);
+  }
+  detachedChildren.add(child);
+  return () => {
+    if (detachedChildren.delete(child) && detachedChildren.size === 0) stopListening();
+  };
+}
+
+/**
+ * The runs waiting on each signal, and the one listener that stops them all when it aborts: one
+ * listener on a signal however many runs wait on it. An AbortSignal warns past ten, and one signal
+ * given to every key read at once would pass that.
+ */
+type Waiting = { stops: Set<() => void>; listener: () => void };
+const waitingOn = new WeakMap<AbortSignal, Waiting>();
+
+/** Calls `stop` once `signal` aborts. Returns what forgets it; the last to go takes the listener off. */
+function onAbort(signal: AbortSignal, stop: () => void): () => void {
+  let waiting = waitingOn.get(signal);
+  if (!waiting) {
+    const stops = new Set<() => void>();
+    const listener = () => {
+      waitingOn.delete(signal);
+      for (const each of [...stops]) each();
+    };
+    waiting = { stops, listener };
+    waitingOn.set(signal, waiting);
+    signal.addEventListener("abort", listener, { once: true });
+  }
+  const mine = waiting;
+  mine.stops.add(stop);
+  return () => {
+    if (!mine.stops.delete(stop) || mine.stops.size > 0) return;
+    if (waitingOn.get(signal) === mine) waitingOn.delete(signal);
+    signal.removeEventListener("abort", mine.listener);
+  };
+}
+
+/**
+ * Runs `command` and resolves to its exit code and stdout. With a `signal`, the command starts
+ * in a process group of its own, with no terminal, and once the signal aborts, it and everything
+ * it started is killed, if it is still running; the result is a failure at once, not when its
+ * output closes, which a process it left behind could hold open. Until then, clausona ending
+ * ends it too (endWithClausona).
+ */
+function run(command: string, args: string[], input?: string, signal?: AbortSignal): Promise<RunResult> {
   return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ code: 1, stdout: "" });
+      return;
+    }
+    const detached = signal !== undefined && process.platform !== "win32";
     const child = spawnCommand(command, args, {
       stdio: [input === undefined ? "ignore" : "pipe", "pipe", "ignore"],
+      ...(detached ? { detached: true } : {}),
     });
+    const release = detached ? endWithClausona(child) : () => {};
     let out = "";
+    let settled = false;
+    const finish = (result: RunResult) => {
+      if (settled) return;
+      settled = true;
+      forget();
+      release();
+      resolve(result);
+    };
+    const stop = () => {
+      killRunning(child);
+      child.stdout?.destroy();
+      finish({ code: 1, stdout: "" });
+    };
+    const forget = signal ? onAbort(signal, stop) : () => {};
     child.stdout?.on("data", (chunk) => {
       out += chunk;
     });
-    child.on("close", (code) => resolve({ code: code ?? 1, stdout: out }));
-    child.on("error", () => resolve({ code: 1, stdout: "" }));
+    child.on("close", (code) => finish({ code: code ?? 1, stdout: out }));
+    child.on("error", () => finish({ code: 1, stdout: "" }));
     if (input !== undefined) child.stdin?.end(input);
   });
 }
@@ -206,9 +328,18 @@ export async function deleteSecret(profileId: string, backend?: SecretBackend): 
   return true;
 }
 
-async function readStoredSecret(profileId: string, backend?: SecretBackend): Promise<string | null> {
+async function readStoredSecret(
+  profileId: string,
+  backend?: SecretBackend,
+  signal?: AbortSignal,
+): Promise<string | null> {
   if ((backend ?? detectBackend()) === "keychain") {
-    const { code, stdout } = await run("security", ["find-generic-password", "-s", keychainItemFor(profileId), "-w"]);
+    const { code, stdout } = await run(
+      "security",
+      ["find-generic-password", "-s", keychainItemFor(profileId), "-w"],
+      undefined,
+      signal,
+    );
     return code === 0 && stdout.trim() !== "" ? stdout.trim() : null;
   }
   const values = await readSecretsFile();
@@ -225,8 +356,17 @@ async function readStoredSecret(profileId: string, backend?: SecretBackend): Pro
  * path, a token argument or the key itself - see src/lib/redact.ts, which hides it on
  * every path. A variable's name is quoted only when it is a name: a hand edit can put a
  * key in that slot.
+ *
+ * `signal` bounds a key that a command or the Keychain gives: once it aborts, what was started
+ * for it is killed, and the key is not read.
  */
-export async function resolveSecret(profileId: string, source: SecretSource, backend?: SecretBackend): Promise<string> {
+export async function resolveSecret(
+  profileId: string,
+  source: SecretSource,
+  backend?: SecretBackend,
+  options: { signal?: AbortSignal } = {},
+): Promise<string> {
+  const { signal } = options;
   // A hand edit can leave anything in the slot, or nothing. Doctor calls such a source unknown
   // and never resolves it, so launch does not read the store for it either: a profile would
   // otherwise work while doctor reported it broken. Not quoted, since it can hold anything.
@@ -257,7 +397,8 @@ export async function resolveSecret(profileId: string, source: SecretSource, bac
   if (source.source === "command") {
     const shell = process.platform === "win32" ? "powershell" : "/bin/sh";
     const args = process.platform === "win32" ? ["-NoProfile", "-Command", source.run] : ["-c", source.run];
-    const { code, stdout } = await run(shell, args);
+    const { code, stdout } = await run(shell, args, undefined, signal);
+    if (signal?.aborted) throw new Error("the key was not read in time");
     // The command line is not quoted, so the message says where it is instead - profiles.json,
     // the one place it is shown - and what replaces it. Not `config --edit`: that opens the
     // env map, and the command lives in the endpoint block.
@@ -268,7 +409,8 @@ export async function resolveSecret(profileId: string, source: SecretSource, bac
     return first;
   }
 
-  const stored = await readStoredSecret(profileId, backend);
+  const stored = await readStoredSecret(profileId, backend, signal);
+  if (signal?.aborted) throw new Error("the key was not read in time");
   if (!stored) throw new Error(`no stored secret for '${profileId}' - run 'clausona config ${profileId} --key'`);
   return stored;
 }
