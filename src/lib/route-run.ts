@@ -37,7 +37,8 @@ import {
   routesFor,
   UnknownRouteError,
 } from "./route-service.js";
-import { isResumeRun, type RunArgs, readRunArgs } from "./run-args.js";
+import { rankWaiting } from "./route-wait.js";
+import { isResumeRun, modelOf, type RunArgs, readRunArgs } from "./run-args.js";
 import { noRegistryError } from "./service.js";
 
 /**
@@ -206,8 +207,9 @@ export async function runRouted(
   }
   // `run --route main claude:b` would otherwise launch another account with `claude:b` as its
   // prompt. Checked before anything is created, ranked or recorded; the name is not echoed.
+  // `--wait` is a routing option too, though it names no route.
   if (
-    (resolved || unknown) &&
+    (resolved || unknown || run.waitMs !== undefined) &&
     !run.sawSeparator &&
     namesProfile(run.toolArgs[0], registry, resolved?.onlyTool ?? resolved?.route.tool ?? run.tool)
   ) {
@@ -248,12 +250,24 @@ export async function runRouted(
   // there are no arguments (checked above), so there is nothing to resume.
   const runTool = resolved.onlyTool ?? (resolved.route.tool === "all" ? undefined : resolved.route.tool);
   const resume = runTool ? isResumeRun(runTool, run.toolArgs) : false;
-  const ranking = await rankRouteNow(resolved, deps, { resume, record: true });
+  // The model the tool is told to use; without one, no model's own limit counts.
+  const model = runTool ? modelOf(runTool, run.toolArgs) : undefined;
+  const { waitMs } = run;
+  const { ranking, gaveUp } =
+    waitMs === undefined
+      ? { ranking: await rankRouteNow(resolved, deps, { resume, record: true, model }), gaveUp: undefined }
+      : await rankWaiting(resolved, deps, { resume, model, capMs: waitMs });
   if (ranking.outcome.kind === "none") {
     // The explain it points to ranks with the run's own options, as the run did.
     const { route: _name, ...overrides } = run.options;
     throw new NoAccountError(
-      renderNoAccount(resolved.name, ranking, { now: deps.clock(), onlyTool: resolved.onlyTool, overrides, resume }),
+      renderNoAccount(resolved.name, ranking, {
+        now: deps.clock(),
+        onlyTool: resolved.onlyTool,
+        overrides,
+        resume,
+        ...(waitMs === undefined ? {} : { wait: { capMs: waitMs, gaveUp } }),
+      }),
     );
   }
   io.say(renderNote(resolved.name, ranking, resolved.resolvedBy));

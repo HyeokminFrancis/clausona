@@ -1,4 +1,11 @@
-import { ROUTE_TOOLS, type RouteOverrides, type RouteTool, STRATEGIES, type Strategy } from "../core/route-config.js";
+import {
+  holdsKey,
+  ROUTE_TOOLS,
+  type RouteOverrides,
+  type RouteTool,
+  STRATEGIES,
+  type Strategy,
+} from "../core/route-config.js";
 import type { ToolName } from "../types.js";
 
 /**
@@ -21,6 +28,8 @@ const isRoutingFlag = (flag: string): flag is RoutingFlag =>
 export type RunArgs = {
   tool?: ToolName;
   options: RoutingOptions;
+  /** `--wait`'s cap in ms, when the run waits for an account to come free. */
+  waitMs?: number;
   toolArgs: string[];
   /** Whether a `--` ended clausona's part, so that what follows is the tool's whatever it looks like. */
   sawSeparator: boolean;
@@ -48,11 +57,47 @@ function parseStrategy(value: string): Strategy {
   return value as Strategy;
 }
 
+/** How long `--wait` waits for a reset when no cap is given. */
+export const DEFAULT_WAIT_MS = 5 * 60 * 60 * 1000;
+
+/**
+ * `--wait`'s cap: `30m`, `2h` or `1h30m`, or the default when none is given. Anything else is
+ * refused with the forms it takes, the value not echoed.
+ */
+export function parseWait(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_WAIT_MS;
+  const match = /^(?:(\d+)h)?(?:(\d+)m)?$/.exec(value);
+  const ms = match ? (Number(match[1] ?? 0) * 60 + Number(match[2] ?? 0)) * 60_000 : 0;
+  if (ms <= 0) throw new Error("--wait takes a duration such as 30m, 2h or 1h30m: --wait=30m.");
+  return ms;
+}
+
+/**
+ * `--wait`'s cap is given after `=`: `--wait 30m` would hand 30m to the tool as its prompt, or to
+ * `route pick` as the route's name. Refused when the next argument looks like a duration.
+ */
+export function refuseSpacedWait(next: string | undefined): void {
+  if (next !== undefined && /^\d[\da-z]*$/i.test(next)) {
+    throw new Error("Give --wait its cap after =, as in --wait=30m.");
+  }
+}
+
 /** `--tool` of the `route` subcommands: claude, codex, or all for a route over both. */
 export function parseRouteTool(value: string | undefined): RouteTool | undefined {
   if (value === undefined) return undefined;
   if (!ROUTE_TOOLS.includes(value as RouteTool)) throw new Error("--tool must be claude, codex or all.");
   return value as RouteTool;
+}
+
+/**
+ * `--model` of `route explain` and `route pick`: the model a run would name, whose own limit then
+ * counts. A blank one is refused, as is one shaped like a key, which explain would print.
+ */
+export function parseModel(value: string): string {
+  const model = value.trim();
+  if (model === "") throw new Error("--model needs a value.");
+  if (holdsKey(model)) throw new Error("That looks like an API key, not a model name.");
+  return model;
 }
 
 /** The routing options among `values`. The rest - `--tool`, `--add` and the like - are the caller's. */
@@ -123,6 +168,7 @@ function readValue(values: Map<string, string>, args: string[], i: number): numb
 export function readRunArgs(args: string[]): RunArgs {
   const values = new Map<string, string>();
   let tool: ToolName | undefined;
+  let waitMs: number | undefined;
   let sawSeparator = false;
   let i = 0;
   for (; i < args.length; i++) {
@@ -136,10 +182,24 @@ export function readRunArgs(args: string[]): RunArgs {
       tool = arg;
       continue;
     }
-    if (!isRoutingFlag(splitOption(arg)[0])) break;
+    const [flag, inline] = splitOption(arg);
+    // `--wait` takes its cap after `=` only, so a bare one never takes the tool's first argument.
+    if (flag === "--wait") {
+      if (waitMs !== undefined) throw new Error("--wait was given more than once. Pass it at most once.");
+      if (inline === undefined) refuseSpacedWait(args[i + 1]);
+      waitMs = parseWait(inline);
+      continue;
+    }
+    if (!isRoutingFlag(flag)) break;
     i = readValue(values, args, i);
   }
-  return { ...(tool ? { tool } : {}), options: toRoutingOptions(values), toolArgs: args.slice(i), sawSeparator };
+  return {
+    ...(tool ? { tool } : {}),
+    options: toRoutingOptions(values),
+    ...(waitMs === undefined ? {} : { waitMs }),
+    toolArgs: args.slice(i),
+    sawSeparator,
+  };
 }
 
 export type OptionSpec = { values: readonly string[]; flags: readonly string[] };
@@ -178,4 +238,31 @@ const CLAUDE_RESUME_FLAGS = new Set(["-c", "--continue", "-r", "--resume", "--fr
 export function isResumeRun(tool: ToolName, toolArgs: string[]): boolean {
   if (tool === "claude") return toolArgs.some((arg) => CLAUDE_RESUME_FLAGS.has(splitOption(arg)[0]));
   return toolArgs.some((arg) => arg === "resume" || arg === "fork");
+}
+
+/**
+ * The model the tool's arguments name, read without changing them: Claude Code's `--model`, and
+ * Codex's `-m` or `--model`, at the top level or after a subcommand such as `exec`. The last one
+ * given counts, as it does for the tool. Nothing after a `--` is read: that is the prompt. Codex's
+ * `-c model=…`, a Codex config profile and a profile's pinned model are not read, so such a run
+ * counts no model's limit; nor is a value shaped like a key, which would be echoed.
+ */
+export function modelOf(tool: ToolName, toolArgs: string[]): string | undefined {
+  let model: string | undefined;
+  for (let i = 0; i < toolArgs.length; i++) {
+    const arg = toolArgs[i];
+    if (arg === "--") break;
+    const [flag, inline] = splitOption(arg);
+    let value: string | undefined;
+    if (flag === "--model" || (tool === "codex" && flag === "-m")) {
+      value = inline ?? toolArgs[++i];
+    } else if (tool === "codex" && /^-m[^=]/.test(arg)) {
+      // Codex reads `-mgpt-5.3-codex` as `-m gpt-5.3-codex`.
+      value = arg.slice(2);
+    } else {
+      continue;
+    }
+    if (value !== undefined && value.trim() !== "" && !value.startsWith("-") && !holdsKey(value)) model = value.trim();
+  }
+  return model;
 }

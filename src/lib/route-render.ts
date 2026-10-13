@@ -16,6 +16,7 @@ import {
   type Outcome,
   type Ranking,
   type Row,
+  type ScopedWindow,
   type SkipReason,
   type Usage,
   type UsageWindow,
@@ -31,6 +32,8 @@ import {
   styledQuota,
   wholeQuotaPercent,
 } from "./format.js";
+import type { GaveUp } from "./route-wait.js";
+import { DEFAULT_WAIT_MS } from "./run-args.js";
 
 /**
  * Text and JSON for routing. Pure: `now` and the terminal width come in, nothing is read. The
@@ -48,6 +51,9 @@ export function usageText(usage?: Usage): string {
   if (!usage) return "—";
   return `${wholeQuotaPercent(usage.percent)}% ${usage.window}${usage.stale ? " (stale)" : ""}`;
 }
+
+/** A usage's window in a sentence: `5H`, `7D`, or the limit on the run's model, `the Opus limit`. */
+const windowWords = (window: string) => (window === "5H" || window === "7D" ? window : `the ${window} limit`);
 
 export function skipText(row: Pick<Row, "id" | "skip">): string {
   switch (row.skip) {
@@ -89,6 +95,9 @@ const STRATEGY_PHRASES: Record<Strategy, string> = {
 };
 
 const routeLabel = (name: string | undefined) => (name ? `route ${name}` : "inline route");
+
+/** A model's name as a shell word: as it is, unless the shell would read something in it (`opus[1m]`). */
+const modelWord = (model: string) => (/^[\w.:/-]+$/.test(model) ? model : posixQuote(model));
 
 /**
  * The width of the terminal the text goes to. The exit-75 message and the new-route preview go to
@@ -324,13 +333,37 @@ function fitTable(candidates: Table[], width: number): string[] {
  * starts where the two-digit ones do. `cut` is the route's, as quotaCell reads it.
  */
 function percentWidth(rows: Row[], cut: number): number {
-  const shown = rows.flatMap((row) => (row.skip ? [] : [row.fiveHour, row.sevenDay]));
+  const shown = rows.flatMap((row) => (row.skip ? [] : [row.fiveHour, row.sevenDay, row.scoped]));
   return Math.max(3, ...shown.map((window) => (window ? formatQuotaPercent(window, cut).length : 0)));
 }
 
-/** The 5H or 7D column: room for the widest percentage and, with `withReset`, a reset time. */
-function quotaColumn(which: UsageWindow, percent: number, withReset: boolean): Column {
-  return { label: which.padStart(percent), minWidth: withReset ? percent + 5 : percent };
+/** A column of windows: 5H, 7D, or the limit on the model a run names (`model`). */
+type WindowColumn = UsageWindow | "model";
+
+function windowOf(row: Row, which: WindowColumn): QuotaWindow | undefined {
+  if (which === "model") return row.scoped;
+  return which === "5H" ? row.fiveHour : row.sevenDay;
+}
+
+/**
+ * The model column's header: the limit's name when every account calls it the same, else MODEL.
+ * Undefined when no account has a limit on the run's model, and so no column.
+ */
+function modelHeader(rows: Row[]): string | undefined {
+  const labels = new Set(rows.flatMap((row) => (row.scoped && !row.skip ? [row.scoped.label.toUpperCase()] : [])));
+  if (labels.size === 0) return undefined;
+  return labels.size === 1 ? [...labels][0] : "MODEL";
+}
+
+/** A window column: room for the widest percentage and, with `withReset`, a reset time. */
+function quotaColumn(label: string, percent: number, withReset: boolean): Column {
+  return { label: label.padStart(percent), minWidth: withReset ? percent + 5 : percent };
+}
+
+/** The 5H and 7D columns, then the model column when a row has a limit on the run's model. */
+function windowColumns(rows: Row[]): Array<[WindowColumn, string]> {
+  const model = modelHeader(rows);
+  return [["5H", "5H"], ["7D", "7D"], ...(model ? [["model", model] as [WindowColumn, string]] : [])];
 }
 
 /**
@@ -340,17 +373,18 @@ function quotaColumn(which: UsageWindow, percent: number, withReset: boolean): C
  */
 function quotaCell(
   row: Row,
-  which: UsageWindow,
+  which: WindowColumn,
   percentAt: number,
   withReset: boolean,
   now: number,
   cut: number,
 ): Cell {
-  const window = which === "5H" ? row.fiveHour : row.sevenDay;
+  const window = windowOf(row, which);
   if (!window || row.skip) return [["—", dim]];
   const percent = formatQuotaPercent(window, cut);
   const styled = styledQuota(window, row.usage?.stale ? "error" : "ok", cut);
-  const shown = row.usage?.window === which ? bold(styled) : styled;
+  const name = which === "model" ? row.scoped?.label : which;
+  const shown = row.usage?.window === name ? bold(styled) : styled;
   const cell: Cell = [
     [" ".repeat(Math.max(0, percentAt - percent.length))],
     [percent, (text) => (text === percent ? shown : text)],
@@ -651,7 +685,16 @@ function limitsWords(max: number): string {
   return max >= 100 ? skip : `${skip}; if all are, the one with the most left`;
 }
 
-function settingsLines(route: Route, width: number): string[] {
+/**
+ * What the model an explain was given does: its own limit counts where an account reports one.
+ * The limit is named as the accounts name it.
+ */
+function modelWords(model: string, rows: Row[]): string {
+  const label = rows.find((row) => row.scoped && !row.skip)?.scoped?.label;
+  return label ? `${model}: the ${label} limit counts too` : `${model}: no account reports a limit on it`;
+}
+
+function settingsLines(route: Route, width: number, model?: { name: string; rows: Row[] }): string[] {
   const room = Math.max(20, width - BOX_CHROME - LABEL_WIDTH);
   const entry = (label: string, value: string) =>
     wrap(value, room, "").map(
@@ -666,6 +709,7 @@ function settingsLines(route: Route, width: number): string[] {
       `${route.from.join(", ")}${route.exclude.length ? ` except ${route.exclude.join(", ")}` : ""}`,
     ),
     ...entry("Fallback", route.fallback.length ? route.fallback.join(", ") : "none"),
+    ...(model ? entry("Model", modelWords(model.name, model.rows)) : []),
   ];
 }
 
@@ -725,6 +769,7 @@ function memberLines(ranking: Ranking, width: number, now: number, nobodyHint?: 
   const roundRobin = ranking.route.strategy === "round-robin";
   const cut = ranking.route.maxUsage;
   const percent = percentWidth(members, cut);
+  const windows = windowColumns(members);
   // Widest first: dashes for a skipped member's quota, then its reason across those columns
   // instead, then no LAST PICKED, then no reset times.
   const layouts = [
@@ -737,8 +782,7 @@ function memberLines(ranking: Ranking, width: number, now: number, nobodyHint?: 
     ({ lastPicked, resets, spanSkipped }): Table => ({
       columns: [
         { label: "ACCOUNT" },
-        quotaColumn("5H", percent, resets),
-        quotaColumn("7D", percent, resets),
+        ...windows.map(([, label]) => quotaColumn(label, percent, resets)),
         ...(lastPicked ? [{ label: "LAST PICKED" }] : []),
         { label: "" },
       ],
@@ -754,8 +798,7 @@ function memberLines(ranking: Ranking, width: number, now: number, nobodyHint?: 
             mark,
             cells: [
               account,
-              quotaCell(row, "5H", percent, resets, now, cut),
-              quotaCell(row, "7D", percent, resets, now, cut),
+              ...windows.map(([which]) => quotaCell(row, which, percent, resets, now, cut)),
               ...(lastPicked ? [lastPickedCell(row, now)] : []),
               status,
             ],
@@ -792,15 +835,19 @@ export function renderRouteDetail(
   const { route } = ranking;
   const title = truncate(name ?? "inline route", Math.max(8, width - 12));
   const members = memberLines(ranking, width, now, options.nobodyHint);
-  const lines = ["", box(title, settingsLines(route, width)), "", ...members];
+  const model = ranking.model ? { name: ranking.model, rows: ranking.rows } : undefined;
+  const lines = ["", box(title, settingsLines(route, width, model)), "", ...members];
   if (ranking.outcome.kind === "none") {
     const narrowed = route.tool === "all" ? options.onlyTool : undefined;
     // An unsaved route's tool is the run's tool word; on an `all` route the --from prefixes say it.
     const tool = narrowed ?? (name || route.tool === "all" ? undefined : route.tool);
+    // The model goes to the tool, as the run gives it; a run of both tools' accounts takes none.
+    const model = ranking.model && (narrowed || route.tool !== "all") ? [`--model ${modelWord(ranking.model)}`] : [];
     const run = command([
       tool ? `clausona run ${tool}` : "clausona run",
       ...(name ? [`--route ${name}`] : []),
       ...routeFlags(name, route, options.overrides),
+      ...model,
     ]);
     lines.push("", ...wrap(`Nobody can be picked now; ${run} would exit 75.`, width, "  "));
   }
@@ -839,9 +886,34 @@ export function renderNote(name: string | undefined, ranking: Ranking, resolvedB
   const parts = [`${routeLabel(name)}${ruleNote(resolvedBy)}`, pickedWhy(ranking)];
   if (usage) {
     const percent = wholeQuotaPercent(usage.percent, ranking.route.maxUsage);
-    parts.push(`${percent}% of ${usage.window} used${usage.stale ? ", last reading" : ""}`);
+    parts.push(`${percent}% of ${windowWords(usage.window)} used${usage.stale ? ", last reading" : ""}`);
   }
   return `  ${accent("▸")} ${bold(outcome.id)}  ${dim(parts.join(", "))}`;
+}
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** A moment in local time: `14:05`, or `Oct 15 14:05` when it is not on the same day as `now`. */
+export function clockTime(at: number, now: number): string {
+  const when = new Date(at);
+  const today = new Date(now);
+  const time = `${String(when.getHours()).padStart(2, "0")}:${String(when.getMinutes()).padStart(2, "0")}`;
+  const sameDay =
+    when.getFullYear() === today.getFullYear() &&
+    when.getMonth() === today.getMonth() &&
+    when.getDate() === today.getDate();
+  return sameDay ? time : `${MONTHS[when.getMonth()]} ${when.getDate()} ${time}`;
+}
+
+/**
+ * What a waiting run or pick says on stderr: until when, for which account, and the window whose
+ * reset it waits for. Without a window, the account reads as full after its reset, and the wait
+ * is for a new reading.
+ */
+export function renderWaiting(id: string, window: string | undefined, times: { until: number; now: number }): string {
+  const until = clockTime(times.until, times.now);
+  const why = window ? `(${window} resets)` : "(for a new quota reading)";
+  return `  ${dim(`waiting until ${until} for`)} ${bold(id)} ${dim(`${why} …`)}`;
 }
 
 /** A rule a run passed over: which rule, and why. */
@@ -876,17 +948,39 @@ export function renderRulesProblems(filePath: string, count: number): string {
 /** A reset nobody knows sorts after every known one. */
 const resetOrder = (at: string | null) => (at === null ? Number.MAX_SAFE_INTEGER : Date.parse(at));
 
-/** When every window at or above `limit` will have reset, and which window that is. */
-function freeAgainCell(row: Row, limit: number, at: string | null, now: number): Cell {
-  if (!at) return [["—", dim]];
+/**
+ * Which of a row's windows at or above `limit` resets at `at` (blockingReset's answer): `7D`, the
+ * limit on the run's model by its label, or `5H`.
+ */
+export function resettingWindow(row: Row, limit: number, at: string): string {
   const ms = Date.parse(at);
   const resetsThen = (window: QuotaWindow | undefined) =>
     window !== undefined &&
     window.usedPercent >= limit &&
     Boolean(window.resetsAt) &&
     Date.parse(window.resetsAt as string) === ms;
-  const which: UsageWindow = resetsThen(row.sevenDay) ? "7D" : "5H";
-  return [[`${resetsIn(at, now)} (${which} resets)`, secondary]];
+  if (resetsThen(row.sevenDay)) return "7D";
+  if (row.scoped && resetsThen(row.scoped)) return row.scoped.label;
+  return "5H";
+}
+
+/** When every window at or above `limit` will have reset, and which window that is. */
+function freeAgainCell(row: Row, limit: number, at: string | null, now: number): Cell {
+  if (!at) return [["—", dim]];
+  return [[`${resetsIn(at, now)} (${resettingWindow(row, limit, at)} resets)`, secondary]];
+}
+
+/** The `--wait` that reaches a reset at `at`: the bare one within its 5h, else one of whole hours. */
+function waitReaching(at: string, now: number): string {
+  const ms = Date.parse(at) - now;
+  return ms <= DEFAULT_WAIT_MS ? "--wait" : `--wait=${Math.ceil(ms / 3_600_000)}h`;
+}
+
+/** A `--wait` cap as it is given: `30m`, `2h`, `1h30m`. */
+function capText(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  const hours = Math.floor(minutes / 60);
+  return `${hours ? `${hours}h` : ""}${minutes % 60 || !hours ? `${minutes % 60}m` : ""}`;
 }
 
 /**
@@ -895,11 +989,20 @@ function freeAgainCell(row: Row, limit: number, at: string | null, now: number):
  * `onlyTool` is the tool a run narrowed an `all` route to: the message is about that tool's
  * accounts only, and so is the explain it points to. `overrides` are the field options the run
  * was given, and `resume` whether it resumed: the explain it points to ranks with them too.
+ * `wait` is a `--wait` that gave up, with its cap and why: the soonest reset is past the cap, or
+ * none is known.
  */
 export function renderNoAccount(
   name: string | undefined,
   ranking: Ranking,
-  options: { width?: number; now?: number; onlyTool?: ToolName; overrides?: RouteOverrides; resume?: boolean } = {},
+  options: {
+    width?: number;
+    now?: number;
+    onlyTool?: ToolName;
+    overrides?: RouteOverrides;
+    resume?: boolean;
+    wait?: { capMs: number; gaveUp?: GaveUp };
+  } = {},
 ): string {
   const width = options.width ?? terminalWidth("stderr");
   const now = options.now ?? Date.now();
@@ -925,14 +1028,14 @@ export function renderNoAccount(
   const skipped = rows.filter((row) => row.skip);
   const cut = route.maxUsage;
   const percent = percentWidth(rows, cut);
+  const windows = windowColumns(rows);
   const tables = [true, false].map(
     (resets): Table => ({
       // Nobody held back by a limit, only skipped members: their reasons, without a header.
       header: held.length > 0,
       columns: [
         { label: "ACCOUNT" },
-        quotaColumn("5H", percent, resets),
-        quotaColumn("7D", percent, resets),
+        ...windows.map(([, label]) => quotaColumn(label, percent, resets)),
         { label: "FREE AGAIN" },
         { label: "", gap: 3 },
       ],
@@ -941,8 +1044,7 @@ export function renderNoAccount(
           ({ row, at }): TableRow => ({
             cells: [
               [[row.id]],
-              quotaCell(row, "5H", percent, resets, now, cut),
-              quotaCell(row, "7D", percent, resets, now, cut),
+              ...windows.map(([which]) => quotaCell(row, which, percent, resets, now, cut)),
               freeAgainCell(row, FULL, at, now),
               row.id === soonest?.id ? [["soonest", accent]] : [],
             ],
@@ -958,16 +1060,38 @@ export function renderNoAccount(
     // An unsaved route's tool is not stored anywhere, so it is always given.
     ...(name ? (narrowed ? [`--tool ${narrowed}`] : []) : [`--tool ${narrowed ?? route.tool}`]),
     ...routeFlags(name, route, options.overrides),
+    ...(ranking.model ? [`--model ${modelWord(ranking.model)}`] : []),
     ...(options.resume ? ["--resume"] : []),
   ]);
   const when = soonest ? formatResetIn(soonest.at, new Date(now)) : undefined;
   const again = when === "now" ? "now" : when ? `after ${unbroken(when)}` : "later";
+  const gaveUp = options.wait?.gaveUp;
+  const cap = options.wait ? capText(options.wait.capMs) : "";
+  // A wait that gave up: the soonest reset is past its cap - a longer one would reach it - or it
+  // waited the cap out on a reading that still shows the account full; or no reset is known.
+  const waitAdvice = () => {
+    if (gaveUp === "no-reset") {
+      return `No account above has a known reset time, so there is nothing to wait for. Run again later, or see everything with: ${explain}`;
+    }
+    if (!soonest || when === "now") {
+      return `The ${cap} wait ran out before a quota reading showed an account free. Run again later, or see everything with: ${explain}`;
+    }
+    const longer = `--wait=${Math.ceil((Date.parse(soonest.at) - now) / 3_600_000)}h`;
+    return `Nothing comes free within the ${cap} wait. Wait longer with ${longer}, run again ${again}, or see everything with: ${explain}`;
+  };
+  // Without --wait: run again when the soonest is free, or let a --wait that reaches it do so.
+  const plainAdvice = () => {
+    const wait = soonest ? ` or with ${unbroken(waitReaching(soonest.at, now))}` : "";
+    return `Run again ${again}${wait}, or see everything with: ${explain}`;
+  };
   // Nobody held back by a limit, only skipped members: no reset frees them, and their reasons say what will.
   const advice = nothingRead(rows)
     ? `No quota could be read for any member: check the network, or run ${unbroken("clausona list --refresh")}.`
     : held.length === 0
       ? `Each account above says why it is skipped. See everything with: ${explain}`
-      : `Run again ${again}, or see everything with: ${explain}`;
+      : gaveUp
+        ? waitAdvice()
+        : plainAdvice();
   return [headline, "", ...fitTable(tables, width), "", ...wrap(advice, width, indent), ""].join("\n");
 }
 
@@ -1045,6 +1169,9 @@ const usageJson = (usage: Usage | undefined) =>
 const windowJson = (window: QuotaWindow | undefined) =>
   window ? { usedPercent: window.usedPercent, resetsAt: window.resetsAt ?? null } : null;
 
+const scopedJson = (window: ScopedWindow | undefined) =>
+  window ? { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt ?? null } : null;
+
 const soonestJson = (soonest: { id: string; at: string } | undefined) =>
   soonest ? { id: soonest.id, at: soonest.at } : null;
 
@@ -1085,6 +1212,7 @@ export function explainJson(name: string | undefined, resolvedBy: ResolvedBy, ra
     route: name ?? null,
     resolvedBy,
     settings: settingsJson(route),
+    model: ranking.model ?? null,
     outcome: outcomeJson(outcome),
     members: ranking.rows.map((row) => ({
       profile: row.id,
@@ -1095,6 +1223,7 @@ export function explainJson(name: string | undefined, resolvedBy: ResolvedBy, ra
       usage: usageJson(row.usage),
       fiveHour: windowJson(row.fiveHour),
       sevenDay: windowJson(row.sevenDay),
+      scoped: scopedJson(row.scoped),
       lastPickedAt: row.lastPickedAt ?? null,
     })),
     excluded: ranking.excluded.map((entry) => ({ profile: entry.id, matchedBy: entry.pattern })),

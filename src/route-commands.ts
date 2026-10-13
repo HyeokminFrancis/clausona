@@ -92,7 +92,17 @@ import {
   routesFor,
   UnknownRouteError,
 } from "./lib/route-service.js";
-import { parsePatterns, parseRouteTool, ROUTE_FIELD_OPTIONS, readOptions, toRoutingOptions } from "./lib/run-args.js";
+import { rankWaiting, WaitInterrupted } from "./lib/route-wait.js";
+import {
+  parseModel,
+  parsePatterns,
+  parseRouteTool,
+  parseWait,
+  ROUTE_FIELD_OPTIONS,
+  readOptions,
+  refuseSpacedWait,
+  toRoutingOptions,
+} from "./lib/run-args.js";
 import { noRegistryError } from "./lib/service.js";
 import type { Registry, ToolName } from "./types.js";
 
@@ -155,13 +165,15 @@ const SUB_HELP: Record<string, string[]> = {
     `    ${dim("has a problem, nothing is written and you can edit again.")}`,
   ],
   explain: [
-    helpUsage("clausona route explain <name> [--tool claude|codex] [options] [--resume] [--json]"),
+    helpUsage("clausona route explain <name> [--tool claude|codex] [options] [--model <name>] [--resume] [--json]"),
     helpUsage("clausona route explain --tool claude|codex|all --from <patterns> [--json]"),
-    helpUsage("clausona route explain [--tool claude|codex] [--resume] [--json]"),
+    helpUsage("clausona route explain [--tool claude|codex] [--model <name>] [--resume] [--json]"),
     "",
     `    ${dim("Every member with its 5H and 7D use, its usage (the higher of the two), when it was")}`,
     `    ${dim("last picked, and why it would or would not be picked now. Launches nothing and")}`,
     `    ${dim("records nothing. --resume ranks as a resumed run would (shared sessions only).")}`,
+    `    ${dim("--model ranks as a run of that model would: each account's weekly limit on it is")}`,
+    `    ${dim("shown as a column and counts toward its usage.")}`,
     `    ${dim("On an all route, --tool ranks only that tool's accounts, as a run naming it would.")}`,
     `    ${dim("With no name: what clausona run claude and clausona run codex would take in this")}`,
     `    ${dim("directory, which dir rule or default says so, and the explain of each route.")}`,
@@ -186,14 +198,21 @@ const SUB_HELP: Record<string, string[]> = {
     `    ${dim("lists every dir rule and default.")}`,
   ],
   pick: [
-    helpUsage("clausona route pick <name> [--tool claude|codex] [options] [--resume] [--json]"),
+    helpUsage(
+      "clausona route pick <name> [--tool claude|codex] [options] [--model <name>] [--wait[=<duration>]] [--resume] [--json]",
+    ),
     "",
     `    ${dim("Takes a turn: prints the picked profile id (or JSON) and records the pick, so the")}`,
     `    ${dim("next pick on a round-robin route takes the next account. Exits 75 when nobody can")}`,
     `    ${dim("be picked; with --json the JSON is still printed, with profile null.")}`,
+    `    ${dim("--model counts each account's weekly limit on the model the worker will run.")}`,
+    `    ${dim("--wait: when nobody is free, wait for the soonest reset (up to 5h, or 30m, 2h, 1h30m)")}`,
+    `    ${dim("and pick then. It says on stderr until when; stdout keeps only the id or the JSON.")}`,
+    `    ${dim("A reset past the cap, or none known, exits 75 at once; Ctrl-C exits 130.")}`,
     "",
     `  ${bold("EXAMPLE")}`,
     `    ${dim('id=$(clausona route pick main) && clausona run "$id" -- -p "run the tests"')}`,
+    `    ${dim('id=$(clausona route pick main --wait=2h --model opus) && clausona run "$id" -- --model opus')}`,
   ],
 };
 
@@ -226,6 +245,7 @@ export function routeHelp(sub?: string): string {
     `  ${bold("RUN ON A ROUTE")}`,
     helpUsage("clausona run --route <name> [--] [tool args...]"),
     helpUsage("clausona run claude --from 'team-*' [--] [tool args...]     # an unsaved route"),
+    helpUsage("clausona run --route <name> --wait=2h [--] [tool args...]   # wait for a free account"),
     `    ${dim("On a route over both tools (--tool all), name the tool before its arguments:")}`,
     `    ${dim("clausona run codex --route any -- exec 'review this'")}`,
     "",
@@ -237,11 +257,12 @@ export function routeHelp(sub?: string): string {
     `    ${dim("A rule whose route is gone, or for the other tool, is skipped with a warning.")}`,
     "",
     `  ${bold("HOW A PROFILE IS PICKED")}`,
-    `    ${dim("usage = the higher of the account's 5H and 7D windows")}`,
+    `    ${dim("usage = the higher of the account's 5H and 7D windows, and of its weekly limit on the")}`,
+    `    ${dim("        model the run names (claude --model opus, codex -m …, route pick --model)")}`,
     `    ${dim("1. pool      from-members under max-usage, by strategy")}`,
     `    ${dim("2. fallback  fallback-members under max-usage, first in listed order")}`,
     `    ${dim("3. overflow  any member under 100%, lowest usage first")}`,
-    `    ${dim("4. nobody    exit 75")}`,
+    `    ${dim("4. nobody    with --wait, sleep until the soonest reset and start again at 1; else exit 75")}`,
     `    ${dim("round-robin: picked longest ago · headroom: lowest usage ·")}`,
     `    ${dim("expiring: weekly limit resetting within 24h first")}`,
     `    ${dim("Resumed runs (-c, --resume, codex resume) use only accounts that share sessions.")}`,
@@ -256,6 +277,7 @@ export function routeHelp(sub?: string): string {
     `    ${dim("clausona route add <name> --tool <tool>  create a route: claude (default), codex or all")}`,
     `    ${dim("clausona route explain <name> --json     every member, its usage, and why it is or is not picked")}`,
     `    ${dim("clausona route pick <name> --json        take a turn; call it once per worker you start")}`,
+    `    ${dim("clausona route pick <name> --wait        the same, waiting for a free account (stderr says until when)")}`,
     `    ${dim("clausona route explain --json            what clausona run claude|codex takes here, and why")}`,
     `    ${dim("clausona run <profile> [--] ...          launch on the picked profile")}`,
     `    ${dim("add and set never ask; run asks one Y/n only for an unknown route in a terminal.")}`,
@@ -266,7 +288,8 @@ export function routeHelp(sub?: string): string {
     `  ${bold("EXIT CODES")}`,
     `    ${dim("the tool's own   run launched the tool")}`,
     `    ${dim("1                usage error, or routes.json cannot be used")}`,
-    `    ${dim("75               no account is available now: retry later, or name a profile")}`,
+    `    ${dim("75               no account is available now: retry later or with --wait, or name a profile")}`,
+    `    ${dim("130              Ctrl-C while --wait waited: nothing was picked or recorded")}`,
     `    ${dim("With --json, a failure is one object on stdout: { version, error, message }.")}`,
     "",
     `  ${dim("Run clausona route <command> --help for each command.")}`,
@@ -786,23 +809,40 @@ type RankingArgs = {
   tool?: RouteTool;
   json: boolean;
   resume: boolean;
+  /** The model a run would name: its own limit counts, as in that run. */
+  model?: string;
+  /** pick's `--wait` cap in ms. */
+  waitMs?: number;
 };
 
 function readRankingArgs(sub: "explain" | "pick", args: string[]): RankingArgs {
   return asUsage(() => {
+    // pick takes --wait bare or with its cap after `=`, as run does; explain picks nothing to wait for.
+    const wait = sub === "pick" ? ["--wait"] : [];
     const read = readOptions(
       args,
-      { values: ["--tool", ...ROUTE_FIELD_OPTIONS], flags: ["--json", "--resume"] },
+      { values: ["--tool", "--model", ...ROUTE_FIELD_OPTIONS, ...wait], flags: ["--json", "--resume", ...wait] },
       `route ${sub}`,
     );
+    const at = args.indexOf("--wait");
+    if (sub === "pick" && at !== -1) refuseSpacedWait(args[at + 1]);
+    // readOptions keeps a bare flag once however often it is given, so a repeat is counted here.
+    const bare = args.filter((arg) => arg === "--wait").length;
+    if (bare > 1 || (bare === 1 && read.values.has("--wait"))) {
+      throw new Error("--wait was given more than once. Pass it at most once.");
+    }
     const [name, ...extra] = read.positionals;
     if (extra.length) throw new Error(`${usage(sub)}\nRun \`clausona route ${sub} --help\` for usage.`);
+    const model = read.values.get("--model");
+    const waits = read.flags.has("--wait") || read.values.has("--wait");
     return {
       name,
       overrides: toRoutingOptions(read.values),
       tool: parseRouteTool(read.values.get("--tool")),
       json: read.flags.has("--json"),
       resume: read.flags.has("--resume"),
+      ...(model === undefined ? {} : { model: parseModel(model) }),
+      ...(waits ? { waitMs: parseWait(read.values.get("--wait")) } : {}),
     };
   });
 }
@@ -827,9 +867,9 @@ async function explainRoute(args: string[], deps: RouteDeps): Promise<string> {
   const parsed = readRankingArgs("explain", args);
   // Neither a route nor an unsaved one: what a run would take here, by the dir rules and defaults.
   if (parsed.name === undefined && Object.keys(parsed.overrides).length === 0) return explainHere(parsed, deps);
-  const { overrides, json, resume } = parsed;
+  const { overrides, json, resume, model } = parsed;
   const { resolved, loaded } = await resolveForRanking("explain", parsed, deps);
-  const ranking = await rankRouteNow(resolved, deps, { resume, record: false });
+  const ranking = await rankRouteNow(resolved, deps, { resume, record: false, model });
   if (json) return JSON.stringify(explainJson(resolved.name, resolved.resolvedBy, ranking), null, 2);
   const rules = readRules(loaded.file);
   return renderRouteDetail(resolved.name, ranking, {
@@ -845,7 +885,7 @@ async function explainRoute(args: string[], deps: RouteDeps): Promise<string> {
  * in the current directory (one of them with --tool), which rule says so, and the explain of each
  * route a run would take. Nothing is recorded.
  */
-async function explainHere({ tool, json, resume }: RankingArgs, deps: RouteDeps): Promise<string> {
+async function explainHere({ tool, json, resume, model }: RankingArgs, deps: RouteDeps): Promise<string> {
   const registry = await registryOrThrow(deps);
   const names = namesOf(registry);
   const loaded = await loadRoutes(deps.paths, names);
@@ -854,7 +894,7 @@ async function explainHere({ tool, json, resume }: RankingArgs, deps: RouteDeps)
   const found = [];
   for (const each of tools) {
     const { resolved, skipped } = routeByRules(loaded, each, deps.cwd, sys, names);
-    const ranking = resolved ? await rankRouteNow(resolved, deps, { resume, record: false }) : undefined;
+    const ranking = resolved ? await rankRouteNow(resolved, deps, { resume, record: false, model }) : undefined;
     found.push({ tool: each, resolved, ranking, skipped });
   }
   const active = (each: ToolName) => {
@@ -902,12 +942,22 @@ async function explainHere({ tool, json, resume }: RankingArgs, deps: RouteDeps)
 
 async function pickRoute(args: string[], deps: RouteDeps): Promise<string> {
   const parsed = readRankingArgs("pick", args);
-  const { overrides, json, resume } = parsed;
+  const { overrides, json, resume, model, waitMs } = parsed;
   const { resolved } = await resolveForRanking("pick", parsed, deps);
-  const ranking = await rankRouteNow(resolved, deps, { resume, record: true });
+  // While it waits, pick says so on stderr: stdout keeps only the id or the JSON.
+  const { ranking, gaveUp } =
+    waitMs === undefined
+      ? { ranking: await rankRouteNow(resolved, deps, { resume, record: true, model }), gaveUp: undefined }
+      : await rankWaiting(resolved, deps, { resume, model, capMs: waitMs });
   if (ranking.outcome.kind === "none") {
     throw new NoAccountError(
-      renderNoAccount(resolved.name, ranking, { now: deps.clock(), onlyTool: resolved.onlyTool, overrides, resume }),
+      renderNoAccount(resolved.name, ranking, {
+        now: deps.clock(),
+        onlyTool: resolved.onlyTool,
+        overrides,
+        resume,
+        ...(waitMs === undefined ? {} : { wait: { capMs: waitMs, gaveUp } }),
+      }),
       json ? JSON.stringify(pickJson(resolved.name, ranking), null, 2) : undefined,
     );
   }
@@ -917,11 +967,12 @@ async function pickRoute(args: string[], deps: RouteDeps): Promise<string> {
 /**
  * What `--json` calls a failure (withJsonErrors, which the Extensions commands use): bad usage
  * `usage`, an unknown route `not-found`, and a routes.json or route that cannot be used `failed`,
- * with the file and its problems. Exit 75 keeps the JSON `pick` prints; each keeps its exit code.
- * Anything else is `failed`.
+ * with the file and its problems. Exit 75 keeps the JSON `pick` prints, and a wait stopped by
+ * Ctrl-C (`failed`) its 130; each keeps its exit code. Anything else is `failed`.
  */
 function asJsonError(error: unknown): unknown {
   if (error instanceof NoAccountError) return new ExitError(error.message, error.exitCode, error.stdout, "failed");
+  if (error instanceof WaitInterrupted) return new ExitError(error.message, error.exitCode, undefined, "failed");
   if (error instanceof RouteUsageError) return new ExitError(error.message, 1, undefined, "usage");
   if (error instanceof UnknownRouteError) return new ExitError(error.message, 1, undefined, "not-found");
   if (error instanceof RoutesFileError) {

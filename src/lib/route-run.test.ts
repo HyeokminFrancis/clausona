@@ -58,6 +58,11 @@ function setup(
     editText: async () => "",
     cwd,
     home: dir,
+    sleep: async () => {
+      throw new Error("slept without --wait");
+    },
+    onInterrupt: () => () => {},
+    progress: () => {},
   };
   const answers = [...(options.answers ?? [])];
   const notes: string[] = [];
@@ -160,6 +165,74 @@ describe("runRouted", () => {
     expect(await runRouted(["--route", "main", "-p", "hi"], s.launch, s.io, s.deps)).toBe(0);
     expect(s.launches).toEqual([["claude:solo", ["-p", "hi"]]]);
     expect(s.notes).toEqual(["  ▸ claude:solo  route main, most room, 5% of 5H used"]);
+  });
+
+  it("counts the limit on the model the tool is told to use, and hands the arguments on as given", async () => {
+    const opus = (percent: number) => ({ label: "Opus", usedPercent: percent, resetsAt: null });
+    const quotas = {
+      "claude:a": snap(30),
+      "claude:b": { ...snap(10), scoped: opus(95), scopedLimits: [opus(95)] },
+      "claude:solo": { ...snap(5), scoped: opus(90), scopedLimits: [opus(90)] },
+    };
+    const s = setup({ routes: MAIN, quotas });
+    await runRouted(["--route", "main", "--model", "opus", "-p", "hi"], s.launch, s.io, s.deps);
+    expect(s.launches).toEqual([["claude:a", ["--model", "opus", "-p", "hi"]]]);
+    expect(s.notes).toEqual(["  ▸ claude:a  route main, most room, 30% of 5H used"]);
+    // Another model, or none: the Opus limit does not count.
+    await runRouted(["--route", "main", "--model", "sonnet"], s.launch, s.io, s.deps);
+    await runRouted(["--route", "main", "-p", "hi"], s.launch, s.io, s.deps);
+    expect(s.launches.slice(1).map(([id]) => id)).toEqual(["claude:solo", "claude:solo"]);
+  });
+
+  it("with --wait, waits for a reset within the cap and runs, and exits 75 at once past it", async () => {
+    let now = NOW;
+    const reset = new Date(NOW + 30_000).toISOString();
+    const quotas = (): Record<string, QuotaSnapshot> => {
+      const full = now < NOW + 30_000;
+      const window = { usedPercent: full ? 100 : 0, resetsAt: full ? reset : null };
+      return { "claude:a": { ...snap(0), session: window } };
+    };
+    const s = setup({ routes: { version: 1, routes: { main: { tool: "claude", from: ["a"] } } } });
+    const sleeps: number[] = [];
+    const said: string[] = [];
+    Object.assign(s.deps, {
+      collectQuotas: async () => quotas(),
+      clock: () => now,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        now += ms;
+      },
+      progress: (text: string) => said.push(stripAnsi(text)),
+    });
+    expect(await runRouted(["--route", "main", "--wait=1m", "-p", "hi"], s.launch, s.io, s.deps)).toBe(0);
+    expect(sleeps).toEqual([60_000]);
+    expect(said).toEqual([expect.stringMatching(/^ {2}waiting until \d\d:\d\d for claude:a \(5H resets\) …$/)]);
+    expect(s.launches).toEqual([["claude:a", ["-p", "hi"]]]);
+
+    // The same reset 2 minutes away is past a 1m cap: no wait, and the message says so.
+    now = NOW - 90_000;
+    const error = (await runRouted(["--route", "main", "--wait=1m"], s.launch, s.io, s.deps).catch(
+      (e: unknown) => e,
+    )) as NoAccountError;
+    expect(error).toBeInstanceOf(NoAccountError);
+    expect(error.exitCode).toBe(75);
+    expect(stripAnsi(error.message).replace(/\s+/g, " ")).toContain(
+      "Nothing comes free within the 1m wait. Wait longer with --wait=1h, run again after 2m, or see everything with: clausona route explain main",
+    );
+    expect([sleeps, s.launches.length]).toEqual([[60_000], 1]);
+  });
+
+  it("refuses --wait before a profile, as it does other routing options", async () => {
+    const s = setup({ routes: MAIN });
+    for (const args of [
+      ["--wait=2h", "claude:b"],
+      ["--wait", "solo", "-p", "hi"],
+    ]) {
+      await expect(runRouted(args, s.launch, s.io, s.deps)).rejects.toThrow(
+        "Routing options cannot be combined with a profile. Run it by name: clausona run <profile> …",
+      );
+    }
+    expect(s.launches).toEqual([]);
   });
 
   it("keeps a resumed run to profiles that share sessions", async () => {
