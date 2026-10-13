@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 
 import { acquireDirLock } from "../core/dir-lock.js";
 import { stripAnsi } from "../lib/cli-style.js";
@@ -28,13 +28,14 @@ const NOW = Date.now() + 200 * DAY;
 // Built from pieces, so no key-shaped string sits in the source.
 const KEY = ["sk", "ant", "api03", "Q2xhdXNvbmFUZXN0S2V5MTIzNDU2Nzg5MA"].join("-");
 
-/** The test's own git runs: not told where a repo is by a hook's environment (spawn leaves undefined out). */
-const GIT_ENV: NodeJS.ProcessEnv = {
-  ...process.env,
-  GIT_DIR: undefined,
-  GIT_WORK_TREE: undefined,
-  GIT_INDEX_FILE: undefined,
-};
+/** A home of the file's own, for the test's git runs' settings: removed after the file's cases. */
+const gitHome = new TestHome();
+afterAll(() => gitHome.dispose());
+/**
+ * The test's own git runs: not told where a repo is by a hook's environment, and reading none of
+ * the user's git config (TestHome.gitEnv).
+ */
+const GIT_ENV: NodeJS.ProcessEnv = { ...process.env, ...gitHome.gitEnv() };
 
 const hasGit = spawnSync("git", ["--version"], { env: GIT_ENV }).status === 0;
 
@@ -100,7 +101,13 @@ function seed() {
   return { h, app, web };
 }
 
-type RunOptions = { interactive?: boolean; confirm?: (question: string) => Promise<boolean>; columns?: number };
+type RunOptions = {
+  interactive?: boolean;
+  confirm?: (question: string) => Promise<boolean>;
+  columns?: number;
+  /** The git it asks what git tracks, and how long that git gets. */
+  git?: { binary: string; timeoutMs: number };
+};
 
 /** Runs in `cwd` of `h`, as commands.ts does - JSON errors with --json - on a clock of its own. */
 function cli(h: TestHome, cwd: string, more: Pick<WriteEnv, "lockWaitMs"> = {}) {
@@ -126,6 +133,7 @@ function cli(h: TestHome, cwd: string, more: Pick<WriteEnv, "lockWaitMs"> = {}) 
           mcpjsonStop: h.home,
           interactive: options.interactive ?? false,
           ...(options.confirm ? { confirm: options.confirm } : {}),
+          ...(options.git ? { git: options.git.binary, gitTimeoutMs: options.git.timeoutMs } : {}),
           writeEnv,
           print: (text) => {
             printed.push(text);
@@ -447,6 +455,28 @@ describe("on, for what a setting elsewhere keeps off", () => {
     expect(existsSync(h.path(".clausona"))).toBe(false);
   });
 
+  it("turns a server on for the accounts a list lets start it, and notes the one whose copy it keeps off", async () => {
+    const { h, app } = seed();
+    // Both accounts turned figma off here, and work's copy runs another command, which the list names.
+    const defaultJson = json(h.path(".claude.json"));
+    defaultJson.projects[app].disabledMcpServers = ["figma"];
+    h.write(".claude.json", defaultJson);
+    const workFile = h.write(".claude-work/.claude.json", {
+      projects: { [app]: { disabledMcpServers: ["figma"] } },
+      mcpServers: { figma: { command: "figma-work" } },
+    });
+    h.write(".claude/settings.json", { deniedMcpServers: [{ serverCommand: ["figma-work"] }] });
+    const before = read(workFile);
+    const { run } = cli(h, app);
+    const text = stripAnsi(await run("mcp", ["on", "figma", "--tool", "claude", "--yes"]));
+    expect(text).toMatch(/^ {2}✔ Turned on figma in this project, for default/);
+    expect(text).toContain(
+      `  Note:\n      Stays off for work: deniedMcpServers in ${tilde(h.path(".claude", "settings.json"), h.home)} keeps it from starting.`,
+    );
+    expect(json(h.path(".claude.json")).projects[app].disabledMcpServers).toEqual([]);
+    expect(read(workFile)).toBe(before);
+  });
+
   it("refuses a built-in skill while disableBundledSkills holds, naming where it is set", async () => {
     const { h, app } = seed();
     h.write(".claude/settings.json", { disableBundledSkills: true, skillOverrides: { "claude-api": "off" } });
@@ -537,6 +567,33 @@ describe("skills rm", () => {
     expect(text).toContain("✔ Deleted deploy-check");
     expect(existsSync(path.join(app, ".claude", "skills", "deploy-check"))).toBe(false);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "refuses a skill git did not answer for in time unless --tracked, and says git did not answer",
+    { timeout: SPAWNING_TEST_TIMEOUT_MS },
+    async () => {
+      const { h, app } = seed();
+      // A git that never answers, as git can stall on a busy machine: exec, so the kill at the
+      // time limit stops the sleep itself and leaves nothing running.
+      const binary = h.write("bin/git", "#!/bin/sh\nexec sleep 30\n");
+      chmodSync(binary, 0o755);
+      const slow = { git: { binary, timeoutMs: 500 } };
+      const { run } = cli(h, app);
+      const skill = path.join(app, ".claude", "skills", "deploy-check");
+
+      const error = await failure(run("skills", ["rm", "deploy-check", "--yes"], slow));
+      expect(error).toMatchObject({ code: 1, kind: "refused" });
+      expect(error.message).toMatch(
+        /deploy-check +Git did not answer in time whether it tracks it in app, so this may change the repo\. Add --tracked to go ahead/,
+      );
+      expect(existsSync(skill)).toBe(true);
+      const dry = stripAnsi(await run("skills", ["rm", "deploy-check", "--tracked", "--dry-run"], slow));
+      expect(dry).toMatch(/deploy-check +may change the repo \(git did not answer in time\)$/m);
+      const text = stripAnsi(await run("skills", ["rm", "deploy-check", "--tracked", "--yes"], slow));
+      expect(text).toContain("✔ Deleted deploy-check");
+      expect(existsSync(skill)).toBe(false);
+    },
+  );
 
   it("deletes the rows several --ids name; a link goes and its target stays", async () => {
     const { h, app } = seed();
@@ -669,6 +726,19 @@ describe("skills visibility, a Claude skill's alone", () => {
 });
 
 describe("mcp off and rm", () => {
+  it("turns off a Codex server in a config.toml with an integer past 2^53, and keeps that integer", {
+    timeout: SPAWNING_TEST_TIMEOUT_MS,
+  }, async () => {
+    const { h, app } = seed();
+    const file = h.path(".codex", "config.toml");
+    h.write(".codex/config.toml", 'x_big = 9007199254740993\n\n[mcp_servers.exa]\ncommand = "npx"\n');
+    const { run } = cli(h, app);
+    const text = stripAnsi(await run("mcp", ["off", "exa", "--tool", "codex", "--everywhere", "--yes"]));
+    expect(text).toContain("✔");
+    expect(read(file)).toContain("x_big = 9007199254740993");
+    expect(read(file)).toMatch(/\[mcp_servers\.exa\][^[]*enabled = false/);
+  });
+
   it("changes one account's file with --account, and refuses an account nobody has", async () => {
     const { h, app } = seed();
     const { run } = cli(h, app);

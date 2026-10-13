@@ -57,24 +57,41 @@ export function relevantIn(item: Extension, project: string | undefined): boolea
 /**
  * The copies of a Claude MCP server name that `profile` sees in `project`, as Claude Code ranks
  * them - "local-scoped servers first, followed by project-scoped servers, and finally
- * user-scoped servers": the account's local server for the project, then the `.mcp.json` ones,
- * the nearest file first, then the account's user server. With no account named, no account's
- * own server. A plugin's servers go by names of their own (`plugin:<plugin>:<name>`).
+ * user-scoped servers" - with the organization's above them all, as Claude Code 2.1.296 lays
+ * them over the rest: managed-mcp.json's server, then the one managed settings'
+ * `managedMcpServers` delivers, then the account's local server for the project, then the
+ * `.mcp.json` ones, the nearest file first, then the account's user server. With no account
+ * named, no account's own server. A plugin's servers go by names of their own
+ * (`plugin:<plugin>:<name>`). Claude Code picks the copy before it checks the lists, so a copy
+ * they keep from starting is ranked too, and hides the ones below it.
  */
 function rankedMcp(inv: Inventory, name: string, project: string, profile: string | undefined): Extension[] {
-  // A stashed copy is out of its file, and one the lists block is left out before Claude Code
-  // picks: neither wins over anything.
+  // A stashed copy is out of its file: it wins over nothing. While managed-mcp.json is there,
+  // Claude Code ranks the organization's servers alone.
+  const exclusive = inv.facts.claudeManagedMcp !== undefined;
   const named = inv.items.filter(
     (i) =>
-      i.kind === "mcp" && i.location.tool === "claude" && i.name === name && !i.stashed && !mcpBlocked(inv, i, project),
+      i.kind === "mcp" &&
+      i.location.tool === "claude" &&
+      i.name === name &&
+      !i.stashed &&
+      (!exclusive || i.location.scope === "managed"),
   );
+  const managed = named
+    .filter((i) => i.location.scope === "managed")
+    .sort((a, b) => Number(isManagedMcpFile(inv, b)) - Number(isManagedMcpFile(inv, a)));
   const own = (i: Extension) => profile !== undefined && i.location.profile === profile;
   const local = named.filter((i) => own(i) && i.location.scope === "local" && samePath(i.location.project, project));
   const mcpjson = named
     .filter((i) => isMcpjsonServer(i) && isWithin(project, i.location.project))
     .sort((a, b) => pathKey(b.location.project ?? "").length - pathKey(a.location.project ?? "").length);
   const user = named.filter((i) => own(i) && i.location.scope === "account");
-  return [...local, ...mcpjson, ...user];
+  return [...managed, ...local, ...mcpjson, ...user];
+}
+
+/** Whether a managed server is managed-mcp.json's, not one of managed settings' `managedMcpServers`. */
+function isManagedMcpFile(inv: Inventory, item: Extension): boolean {
+  return samePath(item.location.file, inv.facts.claudeManagedMcp);
 }
 
 /**
@@ -159,40 +176,71 @@ function mcpPolicies(inv: Inventory, project: string | undefined) {
 }
 
 /**
- * Whether an allowlist admits a server: a stdio one by a serverCommand entry once the list has
- * one, a remote one by a serverUrl entry likewise, and otherwise by its name.
+ * The kind of entry an allowlist admits a server by: a stdio one by command, and a remote one by
+ * URL, once the list has such an entry; else by its name.
+ */
+function admittedBy(rules: McpRule[], target: McpTarget | undefined): "serverName" | "serverCommand" | "serverUrl" {
+  const kind = target?.command !== undefined ? "serverCommand" : target?.url !== undefined ? "serverUrl" : undefined;
+  return kind !== undefined && rules.some((rule) => kind in rule) ? kind : "serverName";
+}
+
+/**
+ * Whether an allowlist admits a server, by an entry of the kind `admittedBy` says. A URL entry
+ * that a variable's value brought a `*` into admits nothing: Claude Code takes no such entry.
  */
 function admits(rules: McpRule[], name: string, target: McpTarget | undefined): boolean {
-  const kind = target?.command !== undefined ? "serverCommand" : target?.url !== undefined ? "serverUrl" : undefined;
-  const by = kind !== undefined && rules.some((rule) => kind in rule) ? kind : "serverName";
-  return rules.some((rule) => by in rule && ruleMatches(rule, name, target));
+  const by = admittedBy(rules, target);
+  return rules.some((rule) => by in rule && !("wildcard" in rule) && ruleMatches(rule, name, target));
+}
+
+/** The variables of `rules` and of `target`, each once; none for name entries, which read none. */
+function readsOf(rules: McpRule[], target: McpTarget | undefined): string[] {
+  const names = rules.flatMap((rule) => ("reads" in rule ? (rule.reads ?? []) : []));
+  if (rules.every((rule) => "serverName" in rule)) return [];
+  return [...new Set([...names, ...(target?.reads ?? [])])];
+}
+
+/** `setBy` for a list, with the variables its match read when there are any. */
+function listSetBy(file: string, key: string, reads: string[]): NonNullable<EffectiveState["setBy"]> {
+  return { file, key, ...(reads.length > 0 ? { reads } : {}) };
 }
 
 /**
  * The off that Claude Code's MCP policy puts Claude MCP server `item` in, in `project`; undefined
  * where it lets the server start. As Claude Code 2.1.296 checks a server before it starts one:
- * - while managed-mcp.json is there, it starts that file's servers and no other;
+ * - while managed-mcp.json is there, it starts the organization's servers and no other: that
+ *   file's and those of managed settings' `managedMcpServers`;
  * - a server that an entry of any denylist that applies matches does not start;
  * - with an allowlist anywhere, a server must be on it (`admits`), the lists of every file
  *   merged, or the managed ones alone when managed settings set allowManagedMcpServersOnly.
- *   A managed-mcp.json server that reads no variable of the user's needs no entry.
+ *   A server of the organization's that reads no variable of the user's needs no entry: one of
+ *   `managedMcpServers` never reads one, and one of managed-mcp.json unless its config does.
+ * `setBy.reads` names the variables the match read, as the entries and the server's config were
+ * expanded (see mcp-policy.ts): what Claude Code sees in them can differ.
  */
 export function mcpBlocked(inv: Inventory, item: Extension, project: string | undefined): EffectiveState | undefined {
   if (item.kind !== "mcp" || item.location.tool !== "claude") return undefined;
   const managed = item.location.scope === "managed";
   const exclusive = inv.facts.claudeManagedMcp;
   if (exclusive !== undefined && !managed) return { value: "off", setBy: { file: exclusive, key: MANAGED_MCP_KEY } };
-  const target = inv.facts.mcpTargets[item.id];
+  // What the server starts here: a project's own settings can set `env` for Claude Code.
+  const target =
+    (project === undefined ? undefined : inv.facts.mcpTargetsIn[pathKey(project)]?.[item.id]) ??
+    inv.facts.mcpTargets[item.id];
   const policies = mcpPolicies(inv, project);
-  const denied = policies.find((p) => p.denied?.some((rule) => ruleMatches(rule, item.name, target)));
-  if (denied) return { value: "off", setBy: { file: denied.file, key: "deniedMcpServers" } };
+  for (const policy of policies) {
+    const rule = policy.denied?.find((entry) => ruleMatches(entry, item.name, target));
+    if (rule) return { value: "off", setBy: listSetBy(policy.file, "deniedMcpServers", readsOf([rule], target)) };
+  }
   if (managed && target?.vars !== true) return undefined;
   const lock = policies.some((p) => p.managedOnly);
   const lists = policies.filter((p) => p.allowed !== undefined && (!lock || p.layer === "managed"));
   const first = lists[0];
   const rules = lists.flatMap((p) => p.allowed ?? []);
   if (first === undefined || admits(rules, item.name, target)) return undefined;
-  return { value: "off", setBy: { file: first.file, key: "allowedMcpServers" } };
+  const by = admittedBy(rules, target);
+  const decided = rules.filter((rule) => by in rule);
+  return { value: "off", setBy: listSetBy(first.file, "allowedMcpServers", readsOf(decided, target)) };
 }
 
 /**
@@ -384,19 +432,58 @@ export function isManagedSetting(inv: Inventory, file: string): boolean {
 }
 
 /**
- * Whether Codex trusts `project`: a [projects."<key>"] table with trust_level = "trusted" whose
- * key samePaths it. Codex 0.159.3 ignores the `.codex/` folder of any other project, one it has
- * no record of too.
+ * Whether Codex trusts `project`, as Codex 0.159.3 decides it (`decision_for_dir`): the first of
+ * the project's folders (codexTrustFolders) - its own, its project root, its repository's root -
+ * that a [projects."<key>"] table with a trust_level samePaths decides, trusted only with
+ * trust_level = "trusted". So a linked worktree of a trusted repo, and a folder inside one, are
+ * trusted, unless a nearer table says otherwise. Codex ignores the `.codex/` folder of any other
+ * project, one it has no record of too.
  */
 export function codexTrusted(inv: Inventory, project: string | undefined): boolean {
-  return project !== undefined && inv.facts.codexTrust.some((t) => t.trusted && samePath(t.project, project));
+  if (project === undefined) return false;
+  for (const folder of inv.facts.codexTrustFolders[pathKey(project)] ?? [project]) {
+    const set = inv.facts.codexTrust.filter((t) => t.trusted !== undefined && samePath(t.project, folder));
+    if (set.length > 0) return set.some((t) => t.trusted === true);
+  }
+  return false;
+}
+
+/**
+ * The main checkout's file whose hooks Codex runs in place of `item`'s, a Codex hook in a linked
+ * worktree's own `.codex` folder (codexWorktrees): the hooks.json, or the config.toml, of the
+ * main checkout's `.codex` folder at that place. Undefined for any other item.
+ */
+export function codexWorktreeRuns(inv: Inventory, item: Extension): string | undefined {
+  const loc = item.location;
+  if (item.kind !== "hook" || loc.tool !== "codex" || loc.scope !== "project" || loc.project === undefined) {
+    return undefined;
+  }
+  const worktree = inv.facts.codexWorktrees[pathKey(loc.project)];
+  if (worktree === undefined || !samePath(path.dirname(loc.file), path.join(loc.project, ".codex"))) return undefined;
+  return path.join(worktree.hooks, path.basename(loc.file));
+}
+
+/**
+ * The off a project's own Codex hook or server is in while Codex does not trust the project:
+ * Codex 0.159.3 then leaves the project's `.codex` folder out, its hooks and its config.toml's
+ * servers with it. `setBy` names the project's `trust_level` in the user config.toml.
+ */
+function codexUntrustedOff(inv: Inventory, item: Extension): EffectiveState | undefined {
+  const own = item.location.scope === "project" ? item.location.project : undefined;
+  if (own === undefined || codexTrusted(inv, own)) return undefined;
+  const config = inv.places.codexConfig;
+  const key = `projects.${JSON.stringify(own)}.trust_level`;
+  return config === undefined ? { value: "off" } : { value: "off", setBy: { file: config, key } };
 }
 
 /**
  * The user's `mcp_servers.<name>.enabled`, or the project's when Codex trusts the project; for a
- * plugin's server, its plugin's state, then `plugins."<id>".mcp_servers.<name>.enabled`.
+ * plugin's server, its plugin's state, then `plugins."<id>".mcp_servers.<name>.enabled`. A server
+ * a project defines is off while Codex does not trust the project (codexUntrustedOff).
  */
 function codexMcpState(inv: Inventory, item: Extension, project: string | undefined): EffectiveState {
+  const untrusted = codexUntrustedOff(inv, item);
+  if (untrusted) return untrusted;
   const plugin = item.location.scope === "plugin" ? item.location.plugin : undefined;
   if (plugin !== undefined) {
     // A plugin's server is switched under the plugin's table, never by a user server's name.
@@ -422,8 +509,27 @@ function codexMcpState(inv: Inventory, item: Extension, project: string | undefi
     inv.facts.codexMcpEnabled.filter((e) => e.name === item.name),
     project,
   );
-  if (!hit) return { value: "on" };
-  return { value: hit.enabled ? "on" : "off", setBy: { file: hit.file, key: `mcp_servers.${item.name}.enabled` } };
+  const state: EffectiveState = hit
+    ? { value: hit.enabled ? "on" : "off", setBy: { file: hit.file, key: `mcp_servers.${item.name}.enabled` } }
+    : { value: "on" };
+  const winner = projectCopy(inv, item, project);
+  return winner ? { ...state, shadowedBy: winner.id } : state;
+}
+
+/**
+ * The server of a user server's name that `project` defines, where Codex trusts the project: Codex
+ * 0.159.3 merges the project's table over the user's, so the project's copy is the one it starts.
+ */
+function projectCopy(inv: Inventory, item: Extension, project: string | undefined): Extension | undefined {
+  if (item.location.scope !== "global" || project === undefined || !codexTrusted(inv, project)) return undefined;
+  return inv.items.find(
+    (other) =>
+      other.kind === "mcp" &&
+      other.location.tool === "codex" &&
+      other.location.scope === "project" &&
+      other.name === item.name &&
+      samePath(other.location.project, project),
+  );
 }
 
 /** Of one switch's entries, the one Codex takes in `project`: that project's where it trusts it, else the user's. */
@@ -493,15 +599,17 @@ export function stateOf(inv: Inventory, item: Extension, project?: string, profi
 }
 
 /**
- * A Codex hook's state, as Codex 0.159.3 runs it: off with its plugin; else on where, in at least
- * one Codex profile, the hook as it is now is the one trusted under its key and the key does not
+ * A Codex hook's state, as Codex 0.159.3 runs it: off with its plugin, and a project's off while
+ * Codex does not trust the project, as it then leaves the project's `.codex` folder out - `setBy`
+ * naming the project's `trust_level` in the user config.toml; else on where, in at least one
+ * Codex profile, the hook as it is now is the one trusted under its key and the key does not
  * turn it off (`[hooks.state."<key>"]`) - a bundled plugin's cleanup hook always, and one with
  * no trust identity as before; off where every profile's key turns it off; else pending
  * approval, Codex waiting for the user to review it with /hooks - `setBy` naming the trust that
  * no longer matches when the hook changed since.
  */
 function codexHookState(inv: Inventory, item: Extension, project: string | undefined): EffectiveState {
-  const off = codexPluginOff(inv, item, project);
+  const off = codexPluginOff(inv, item, project) ?? codexUntrustedOff(inv, item);
   if (off) return off;
   const trust = inv.facts.codexHookTrust.find((t) => t.id === item.id);
   if (!trust || trust.builtin) return { value: "on" };

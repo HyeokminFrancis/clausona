@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -6,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { runCommand } from "../commands.js";
 import { stripAnsi } from "../lib/cli-style.js";
 import { ERROR_KINDS, ExitError, withJsonErrors } from "../lib/json-errors.js";
-import { LEFT_ALONE, REFUSAL_CODES, REFUSALS, toggleVerb } from "./actions.js";
+import { LEFT_ALONE, REFUSAL_CODES, REFUSALS, toggleVerb, UNCHECKED_REASON } from "./actions.js";
 import { KEEP_OPERATIONS } from "./apply.js";
 import {
   CHANGE_JSON_KEYS,
@@ -61,8 +62,14 @@ const TAGS = [
   "hidden by Parent folders copy",
   "unused",
   "no front matter",
+  "invalid front matter",
   "name too long",
+  "no description",
+  "main checkout's runs",
   "invalid hooks file",
+  "not supported",
+  "empty command",
+  "empty tool",
 ];
 
 /** The keys `ls --json` writes, in order. */
@@ -285,15 +292,50 @@ function seed() {
     skillOverrides: { "old-one": "off" },
     hooks: { Stop: [{ hooks: [{ type: "command", command: "notify-done" }] }] },
   });
-  h.codex("personal", ".codex");
+  // A prompt hook, an empty command and an empty tool in Codex's config.toml, which Codex does not run.
+  h.codex(
+    "personal",
+    ".codex",
+    [
+      "[[hooks.Stop]]",
+      "[[hooks.Stop.hooks]]",
+      'type = "prompt"',
+      'prompt = "p"',
+      "[[hooks.Stop.hooks]]",
+      'type = "command"',
+      'command = ""',
+      "[[hooks.Stop.hooks]]",
+      'type = "mcp_tool"',
+      'server = "s"',
+      'tool = ""',
+    ].join("\n"),
+  );
+  // A linked worktree of a trusted repo, as git keeps one, with a hook in its own .codex folder,
+  // which Codex does not run there. Codex's projects record both.
+  const main = h.path("repos", "main");
+  const wt = h.path("repos", "main-wt");
+  h.write("repos/main/.git/HEAD", "ref: refs/heads/main\n");
+  h.write("repos/main/.git/worktrees/wt/HEAD", "ref: refs/heads/wt\n");
+  h.write("repos/main/.git/worktrees/wt/gitdir", `${path.join(wt, ".git")}\n`);
+  h.write("repos/main/.git/worktrees/wt/commondir", "../..\n");
+  h.write("repos/main-wt/.git", `gitdir: ${path.join(main, ".git", "worktrees", "wt")}\n`);
+  h.write("repos/main-wt/.codex/hooks.json", {
+    hooks: { Stop: [{ hooks: [{ type: "command", command: "wt-done" }] }] },
+  });
+  h.write(
+    ".codex/config.toml",
+    `[projects.${JSON.stringify(main)}]\ntrust_level = "trusted"\n\n[projects.${JSON.stringify(wt)}]\n\n${readFileSync(h.path(".codex", "config.toml"), "utf8")}`,
+  );
   h.skill(".agents/skills", "eli5");
-  // Two SKILL.md files and a hooks file Codex skips.
+  // Four SKILL.md files and a hooks file Codex skips.
   h.write(".codex/hooks.json", {
     $schema: "x",
     hooks: { Stop: [{ hooks: [{ type: "command", command: "codex-done" }] }] },
   });
   h.write(".agents/skills/plain/SKILL.md", "just text\n");
   h.write(".agents/skills/long/SKILL.md", `---\nname: ${"x".repeat(65)}\ndescription: d\n---\n`);
+  h.write(".agents/skills/bad-yaml/SKILL.md", '---\nname: bad-yaml\ndescription: "x" y\n---\n');
+  h.write(".agents/skills/no-desc/SKILL.md", "---\nname: no-desc\n---\nbody\n");
   // The managed settings are the home's own, so the test never reads this machine's. `terminal`
   // runs it as if on one, answering yes.
   const run = (command: ExtensionsCommand, args: string[], terminal = false) =>
@@ -486,6 +528,8 @@ describe("docs/extensions.md", () => {
         for (const one of texts) expect(text, code).toContain(placeheld(one));
       }
     }
+    // What `tracked` says instead where git did not answer in time, in the words under the table.
+    expect(plain([DOC.replace(/\s+/g, " ")])).toContain(placeheld(UNCHECKED_REASON));
   });
 
   it("lists the keys a plan, a change, a refusal, an unchanged row and an undo write, in order", async () => {

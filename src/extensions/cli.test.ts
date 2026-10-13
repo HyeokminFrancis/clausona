@@ -1,13 +1,18 @@
+import { spawnSync } from "node:child_process";
+import { mkdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ExitError, withJsonErrors } from "../lib/json-errors.js";
 import { leakedWindows } from "../test-leaks.js";
+import { SPAWN_TIMEOUT_MS, SPAWNING_TEST_TIMEOUT_MS } from "../test-timeouts.js";
 import { type ExtensionsCommand, runExtensionsCommand } from "./cli.js";
 import { scopeSentence } from "./describe.js";
 import { loadInventory } from "./inventory.js";
+import { tilde } from "./present.js";
 import { scopesFor } from "./scopes.js";
+import { codexCanonical } from "./sources/codex-trust.js";
 import { TestHome } from "./test-home.js";
 
 const DAY = 86_400_000;
@@ -71,6 +76,27 @@ async function failure(promise: Promise<string>): Promise<ExitError> {
 }
 
 const firstLine = (text: string) => text.split("\n")[0] ?? "";
+
+const hasGit = spawnSync("git", ["--version"]).status === 0;
+
+/** The test's own git run in `h`, with none of the user's git config (TestHome.gitEnv). */
+function gitIn(h: TestHome, cwd: string, ...args: string[]): void {
+  const result = spawnSync(
+    "git",
+    ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args],
+    { cwd, env: { ...process.env, ...h.gitEnv() }, encoding: "utf8", timeout: SPAWN_TIMEOUT_MS },
+  );
+  if (result.status !== 0) throw new Error(`git ${args[0]} failed: ${result.stderr}`);
+}
+
+/**
+ * A `[projects]` key as Codex 0.159.3 writes one (project_trust_key): the folder's real path as
+ * Codex spells it, long names and all, and on Windows in lower case.
+ */
+function codexTrustKey(folder: string): string {
+  const real = codexCanonical(realpathSync.native(folder));
+  return process.platform === "win32" ? real.replace(/[A-Z]/g, (c) => c.toLowerCase()) : real;
+}
 
 describe("skills ls", () => {
   it("lists what loads here by default, titled with the scope and the project", async () => {
@@ -989,6 +1015,331 @@ describe("Codex hooks and Codex's trust", () => {
     expect(shown).toMatch(/^Loaded\s+not yet: you have not trusted it yet - review it with \/hooks in Codex$/m);
     const on = await run(h, app, "hooks", ["on", "--id", b.id, "--yes"]);
     expect(on).toContain("already in its file: Codex runs it once you trust it with /hooks");
+  });
+
+  it("lists the servers a project Codex does not trust defines as off there, out of Loaded", async () => {
+    const { h, app, web } = seed();
+    h.write(
+      ".codex/config.toml",
+      `[projects.${JSON.stringify(app)}]\ntrust_level = "trusted"\n\n[projects.${JSON.stringify(web)}]\ntrust_level = "untrusted"\n\n[mcp_servers.shared]\ncommand = "user-shared"\n`,
+    );
+    const servers = (d: string) =>
+      `[mcp_servers.${d}-srv]\ncommand = "${d}-srv"\n\n[mcp_servers.shared]\ncommand = "${d}-shared"\n`;
+    h.write("repos/app/.codex/config.toml", servers("app"));
+    h.write("repos/web/.codex/config.toml", servers("web"));
+    // What Codex 0.159.3's config/read gave in web: the user's shared alone.
+    const project = JSON.parse(await run(h, web, "mcp", ["ls", "--tool", "codex", "--scope", "project", "--json"]));
+    expect(
+      project.items.map((i: { name: string; state: string; tags: string[] }) => [i.name, i.state, i.tags]),
+    ).toEqual([
+      ["shared", "off", ["off"]],
+      ["web-srv", "off", ["off"]],
+    ]);
+    const loaded = JSON.parse(await run(h, web, "mcp", ["ls", "--tool", "codex", "--json"]));
+    expect(loaded.items.map((i: { name: string; scope: string }) => [i.name, i.scope])).toEqual([["shared", "global"]]);
+    const shown = await run(h, web, "mcp", ["show", "web-srv"]);
+    expect(shown).toMatch(/^Loaded\s+off: Codex starts a project's servers only once it trusts the project$/m);
+    expect(shown).toMatch(/^Trust\s+Codex does not trust this project, so it ignores its \.codex folder\.$/m);
+    // In app, which Codex trusts, app's own load.
+    const own = JSON.parse(await run(h, app, "mcp", ["ls", "--tool", "codex", "--scope", "project", "--json"]));
+    expect(own.items.map((i: { state: string }) => i.state)).toEqual(["on", "on"]);
+  });
+
+  it("hides the user's server under a same-name one a trusted project defines, as Codex takes the project's", async () => {
+    const { h, app, web } = seed();
+    h.write(
+      ".codex/config.toml",
+      `[projects.${JSON.stringify(app)}]\ntrust_level = "trusted"\n\n[mcp_servers.shared]\ncommand = "user-shared"\n`,
+    );
+    h.write("repos/app/.codex/config.toml", '[mcp_servers.shared]\ncommand = "app-shared"\n');
+    h.write("repos/web/.codex/config.toml", '[mcp_servers.shared]\ncommand = "web-shared"\n');
+    // Codex 0.159.3's config/read in app: shared runs app-shared.
+    const loaded = JSON.parse(await run(h, app, "mcp", ["ls", "--tool", "codex", "--json"]));
+    expect(loaded.items.map((i: { name: string; scope: string }) => [i.name, i.scope])).toEqual([
+      ["shared", "project"],
+    ]);
+    const global = JSON.parse(await run(h, app, "mcp", ["ls", "--tool", "codex", "--scope", "global", "--json"]));
+    expect(global.items.map((i: { name: string; tags: string[] }) => [i.name, i.tags])).toEqual([
+      ["shared", ["hidden by Project copy"]],
+    ]);
+    const shown = await run(h, app, "mcp", ["show", "--id", global.items[0].id]);
+    expect(shown).toMatch(/^Loaded\s+no, the Project copy wins \(~[\\/]repos[\\/]app[\\/]\.codex[\\/]config\.toml\)$/m);
+    // In web, which Codex does not trust, the user's runs.
+    const there = JSON.parse(await run(h, web, "mcp", ["ls", "--tool", "codex", "--json"]));
+    expect(there.items.map((i: { name: string; scope: string }) => [i.name, i.scope])).toEqual([["shared", "global"]]);
+  });
+
+  it.skipIf(!hasGit)(
+    "trusts a linked worktree of a trusted repo, and a folder inside one, by the repo's entry, as Codex does",
+    async () => {
+      const { h } = seed();
+      // main is trusted and commits its .codex folder; main-wt is a worktree of it, and so is
+      // main-own, which its own entry marks untrusted; pkg is a folder inside main.
+      const main = h.path("repos", "main");
+      mkdirSync(main, { recursive: true });
+      gitIn(h, main, "init", "-q");
+      h.write("repos/main/.codex/config.toml", '[mcp_servers.projsrv]\ncommand = "projsrv"\n');
+      h.write("repos/main/.codex/hooks.json", {
+        hooks: { Stop: [{ hooks: [{ type: "command", command: "main-stop" }] }] },
+      });
+      h.write("repos/main/pkg/.codex/config.toml", '[mcp_servers.pkgsrv]\ncommand = "pkgsrv"\n');
+      gitIn(h, main, "add", ".");
+      gitIn(h, main, "commit", "-q", "-m", "init");
+      const [wt, own] = [h.path("repos", "main-wt"), h.path("repos", "main-own")];
+      gitIn(h, main, "worktree", "add", "-q", wt);
+      gitIn(h, main, "worktree", "add", "-q", own);
+      const pkg = h.path("repos", "main", "pkg");
+      // By its real path, as Codex records a trust: git names the main checkout by it too. A
+      // table with no trust_level, as main-wt's, decides nothing.
+      h.write(
+        ".codex/config.toml",
+        [
+          `[projects.${JSON.stringify(codexTrustKey(main))}]`,
+          'trust_level = "trusted"',
+          `[projects.${JSON.stringify(wt)}]`,
+          `[projects.${JSON.stringify(own)}]`,
+          'trust_level = "untrusted"',
+          "",
+        ].join("\n"),
+      );
+      h.claude("default", ".claude", { projects: { [wt]: {}, [own]: {}, [pkg]: {} } });
+      const states = async (cwd: string, command: ExtensionsCommand, scope = "project") =>
+        JSON.parse(await run(h, cwd, command, ["ls", "--tool", "codex", "--scope", scope, "--json"])).items.map(
+          (i: { name: string; state: string; tags: string[] }) => [i.name, i.state, i.tags],
+        );
+      // What Codex 0.159.3 gave from main-wt: its .codex layer enabled, projsrv among the servers.
+      expect(await states(wt, "mcp")).toEqual([["projsrv", "on", []]]);
+      // Its own Stop is not what Codex runs there: main's is, waiting for its review.
+      expect(await states(wt, "hooks")).toEqual([
+        ["Stop", "on", ["main checkout's runs"]],
+        ["Stop", "pending-approval", ["pending approval"]],
+      ]);
+      expect(await run(h, wt, "mcp", ["show", "projsrv"])).not.toMatch(/^Trust/m);
+      const off = JSON.parse(
+        await run(h, wt, "mcp", ["off", "projsrv", "--tool", "codex", "--tracked", "--dry-run", "--json"]),
+      );
+      expect(off.refused).toEqual([]);
+      expect(off.changes.map((c: { file: string }) => c.file)).toEqual([path.join(wt, ".codex", "config.toml")]);
+      // pkg is in main's repo, so main is here there; its server is among the other projects'.
+      expect(await states(main, "mcp", "other")).toContainEqual(["pkgsrv", "on", []]);
+      // An entry of the worktree's own comes first.
+      expect(await states(own, "mcp")).toEqual([["projsrv", "off", ["off"]]]);
+    },
+    SPAWNING_TEST_TIMEOUT_MS,
+  );
+
+  it.skipIf(!hasGit)(
+    "lists a worktree's main checkout's hooks as the ones that run there, and changes the worktree's own nowhere",
+    async () => {
+      const { h } = seed();
+      const stop = (command: string) => ({ hooks: { Stop: [{ hooks: [{ type: "command", command }] }] } });
+      const main = h.path("repos", "main");
+      mkdirSync(main, { recursive: true });
+      gitIn(h, main, "init", "-q");
+      h.write("repos/main/.codex/hooks.json", stop("echo a"));
+      h.write(
+        "repos/main/.codex/config.toml",
+        '[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "main-toml"\n',
+      );
+      gitIn(h, main, "add", ".");
+      gitIn(h, main, "commit", "-q", "-m", "init");
+      const wt = h.path("repos", "main-wt");
+      gitIn(h, main, "worktree", "add", "-q", wt);
+      // The worktree's own copy, changed since, and a hook of its own config.toml: Codex reads neither there.
+      h.write("repos/main-wt/.codex/hooks.json", stop("echo wt"));
+      h.write(
+        "repos/main-wt/.codex/config.toml",
+        '[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "wt-toml"\n',
+      );
+      // git names the main checkout by its real path, and Codex keys the hooks it runs there by it.
+      const real = realpathSync.native(main);
+      const mainHooks = path.join(real, ".codex", "hooks.json");
+      // `echo a` on Stop trusted at the hash Codex 0.159.3 gives it, under the main checkout's key.
+      h.write(
+        ".codex/config.toml",
+        [
+          `[projects.${JSON.stringify(codexTrustKey(main))}]`,
+          'trust_level = "trusted"',
+          `[hooks.state.${JSON.stringify(`${mainHooks}:stop:0:0`)}]`,
+          'trusted_hash = "sha256:f9b7a328de9c5845f5eed806f12f8f5adeba50ba82617690fd3f8ededeb12f90"',
+          "",
+        ].join("\n"),
+      );
+      h.claude("default", ".claude", { projects: { [wt]: {} } });
+      type Row = { id: string; state: string; tags: string[]; file: string; summary: { command: string } };
+      const listed: Row[] = JSON.parse(
+        await run(h, wt, "hooks", ["ls", "--tool", "codex", "--scope", "project", "--json"]),
+      ).items;
+      const rows = listed.map((i) => [i.summary.command, i.state, i.tags, i.file]);
+      expect(rows).toEqual([
+        ["echo wt", "on", ["main checkout's runs"], path.join(wt, ".codex", "hooks.json")],
+        ["wt-toml", "on", ["main checkout's runs"], path.join(wt, ".codex", "config.toml")],
+        ["echo a", "on", [], mainHooks],
+        ["main-toml", "pending-approval", ["pending approval"], path.join(real, ".codex", "config.toml")],
+      ]);
+      const loaded = JSON.parse(await run(h, wt, "hooks", ["ls", "--tool", "codex", "--json"])).items;
+      expect(loaded.map((i: Row) => i.summary.command)).toEqual(["echo a"]);
+      const byCommand = (command: string) => listed.find((i) => i.summary.command === command)?.id ?? "";
+      const shownAt = tilde(mainHooks, h.home);
+      const shown = await run(h, wt, "hooks", ["show", "--id", byCommand("echo wt")]);
+      const loadedLine = shown.split("\n").find((line) => line.startsWith("Loaded"));
+      expect(loadedLine?.replace(/^Loaded\s+/, "")).toBe(`no, Codex runs the hooks in ${shownAt} in this worktree`);
+      // The worktree's own: refused, naming the main checkout's file; what clausona kept aside it may delete.
+      for (const verb of ["off", "rm"]) {
+        const own = JSON.parse(await run(h, wt, "hooks", [verb, "--id", byCommand("echo wt"), "--dry-run", "--json"]));
+        expect(own.changes).toEqual([]);
+        expect(own.refused.map((r: { code: string; reason: string }) => [r.code, r.reason])).toEqual([
+          ["codex-worktree-hook", `Codex runs the hooks in ${shownAt} in this worktree. Change them there.`],
+        ]);
+      }
+      // The main checkout's, from the worktree: its file, which git tracks there, with consent.
+      const mainOff = (more: string[]) =>
+        run(h, wt, "hooks", ["off", "--id", byCommand("echo a"), "--dry-run", "--json", ...more]).then(JSON.parse);
+      const unconsented = (await mainOff([])).refused;
+      expect(unconsented.map((r: { code: string }) => r.code)).toEqual(["tracked"]);
+      expect(unconsented[0].reason).toMatch(/^Git tracks it in main, so this changes the repo\. /);
+      const consented = await mainOff(["--tracked"]);
+      expect(consented.refused).toEqual([]);
+      expect(consented.changes.map((c: { file: string; what: string }) => [c.file, c.what])).toEqual([
+        [mainHooks, "Stop hook taken out, kept by clausona"],
+      ]);
+      // Turned off, the copy clausona keeps is the worktree's row, off, and no hook Codex skips.
+      await run(h, wt, "hooks", ["off", "--id", byCommand("echo a"), "--tracked", "--yes"]);
+      const after: Row[] = JSON.parse(
+        await run(h, wt, "hooks", ["ls", "--tool", "codex", "--scope", "project", "--json"]),
+      ).items;
+      const keptCopy = after.find((i) => i.summary.command === "echo a");
+      expect(keptCopy && [keptCopy.state, keptCopy.tags, keptCopy.file]).toEqual(["off", ["off"], mainHooks]);
+      expect(await run(h, wt, "hooks", ["show", "--id", keptCopy?.id ?? ""])).toMatch(
+        /^Loaded\s+off everywhere — clausona keeps its settings so you can turn it back on$/m,
+      );
+    },
+    SPAWNING_TEST_TIMEOUT_MS,
+  );
+
+  it.skipIf(!hasGit)(
+    "says first that Codex does not trust a worktree, where it runs neither its own hooks nor its main checkout's",
+    async () => {
+      const { h } = seed();
+      const main = h.path("repos", "main");
+      mkdirSync(main, { recursive: true });
+      gitIn(h, main, "init", "-q");
+      h.write("repos/main/.codex/hooks.json", {
+        hooks: { Stop: [{ hooks: [{ type: "command", command: "echo a" }] }] },
+      });
+      gitIn(h, main, "add", ".");
+      gitIn(h, main, "commit", "-q", "-m", "init");
+      const own = h.path("repos", "main-own");
+      gitIn(h, main, "worktree", "add", "-q", own);
+      // main is trusted, and the worktree's own entry says untrusted: Codex lists no hooks there.
+      h.write(
+        ".codex/config.toml",
+        `[projects.${JSON.stringify(codexTrustKey(main))}]\ntrust_level = "trusted"\n\n[projects.${JSON.stringify(own)}]\ntrust_level = "untrusted"\n`,
+      );
+      h.claude("default", ".claude", { projects: { [own]: {} } });
+      type Row = { id: string; state: string; tags: string[]; file: string };
+      const rows: Row[] = JSON.parse(
+        await run(h, own, "hooks", ["ls", "--tool", "codex", "--scope", "project", "--json"]),
+      ).items;
+      const ownRow = rows.find((i) => i.file === path.join(own, ".codex", "hooks.json"));
+      expect(ownRow && [ownRow.state, ownRow.tags]).toEqual(["off", ["off", "main checkout's runs"]]);
+      const shown = await run(h, own, "hooks", ["show", "--id", ownRow?.id ?? ""]);
+      expect(shown).toMatch(/^Loaded\s+off: Codex runs a project's hooks only once it trusts the project$/m);
+      expect(shown).toMatch(/^Trust\s+Codex does not trust this project, so it ignores its \.codex folder\.$/m);
+      const off = JSON.parse(await run(h, own, "hooks", ["off", "--id", ownRow?.id ?? "", "--dry-run", "--json"]));
+      expect(off.refused.map((r: { code: string }) => r.code)).toEqual(["codex-untrusted"]);
+    },
+    SPAWNING_TEST_TIMEOUT_MS,
+  );
+
+  it("lists a Codex hook clausona keeps aside as off, not as one Codex skips", async () => {
+    const { h, app } = seed();
+    h.write(".codex/hooks.json", { hooks: { Stop: [{ hooks: [{ type: "command", command: "echo kept" }] }] } });
+    const global = async () =>
+      JSON.parse(await run(h, app, "hooks", ["ls", "--tool", "codex", "--scope", "global", "--json"])).items;
+    await run(h, app, "hooks", ["off", "--id", (await global())[0].id, "--yes"]);
+    const kept = await global();
+    expect(
+      kept.map((i: { summary: { command: string }; state: string; tags: string[] }) => [
+        i.summary.command,
+        i.state,
+        i.tags,
+      ]),
+    ).toEqual([["echo kept", "off", ["off"]]]);
+    expect(await run(h, app, "hooks", ["show", "--id", kept[0].id])).toMatch(
+      /^Loaded\s+off everywhere — clausona keeps its settings so you can turn it back on$/m,
+    );
+  });
+
+  it("lists the hooks of a project Codex does not trust as off there, and says it is the trust", async () => {
+    const { h, app, web } = seed();
+    const stop = (command: string) => ({ hooks: { Stop: [{ hooks: [{ type: "command", command }] }] } });
+    h.write(
+      ".codex/config.toml",
+      `[projects.${JSON.stringify(app)}]\ntrust_level = "trusted"\n\n[projects.${JSON.stringify(web)}]\ntrust_level = "untrusted"\n`,
+    );
+    h.write("repos/app/.codex/hooks.json", stop("app-stop"));
+    h.write("repos/web/.codex/hooks.json", stop("web-stop"));
+    const json = JSON.parse(await run(h, web, "hooks", ["ls", "--tool", "codex", "--scope", "project", "--json"]));
+    expect(json.items.map((i: { state: string; tags: string[] }) => [i.state, i.tags])).toEqual([["off", ["off"]]]);
+    expect(await run(h, web, "hooks", ["ls", "--tool", "codex"])).not.toContain("web-stop");
+    const shown = await run(h, web, "hooks", ["show", "--id", json.items[0].id]);
+    expect(shown).toMatch(/^Loaded\s+off: Codex runs a project's hooks only once it trusts the project$/m);
+    expect(shown).toMatch(/^Trust\s+Codex does not trust this project, so it ignores its \.codex folder\.$/m);
+    // A trusted project's hook waits for its own review, as before.
+    const own = JSON.parse(await run(h, app, "hooks", ["ls", "--tool", "codex", "--scope", "project", "--json"]));
+    expect(own.items.map((i: { state: string }) => i.state)).toEqual(["pending-approval"]);
+  });
+
+  it("lists a command hook with an empty command as such, out of Loaded, and says Codex skips it", async () => {
+    const { h, app } = seed();
+    h.write(".codex/hooks.json", {
+      hooks: { Stop: [{ hooks: [{ type: "command", command: " " }] }] },
+    });
+    const json = JSON.parse(await run(h, app, "hooks", ["ls", "--tool", "codex", "--scope", "global", "--json"]));
+    expect(json.items.map((i: { tags: string[] }) => i.tags)).toEqual([["empty command"]]);
+    expect(JSON.parse(await run(h, app, "hooks", ["ls", "--tool", "codex", "--json"])).items).toEqual([]);
+    expect(await run(h, app, "hooks", ["show", "--id", json.items[0].id])).toMatch(
+      /^Loaded\s+no, Codex skips a hook whose command is empty$/m,
+    );
+  });
+
+  it("lists an MCP tool hook with an empty server or tool as such, out of Loaded, and says why", async () => {
+    const { h, app } = seed();
+    h.write(".codex/hooks.json", { hooks: { Stop: [{ hooks: [{ type: "mcp_tool", server: "s", tool: "" }] }] } });
+    const json = JSON.parse(await run(h, app, "hooks", ["ls", "--tool", "codex", "--scope", "global", "--json"]));
+    expect(json.items.map((i: { tags: string[] }) => i.tags)).toEqual([["empty tool"]]);
+    expect(JSON.parse(await run(h, app, "hooks", ["ls", "--tool", "codex", "--json"])).items).toEqual([]);
+    expect(await run(h, app, "hooks", ["show", "--id", json.items[0].id])).toMatch(
+      /^Loaded\s+no, Codex skips an MCP tool hook whose server or tool is empty$/m,
+    );
+  });
+
+  it("lists a prompt or agent hook as not supported, out of Loaded, and says Codex does not run it", async () => {
+    const { h, app } = seed();
+    h.write(".codex/hooks.json", {
+      hooks: {
+        Stop: [
+          {
+            hooks: [
+              { type: "prompt", prompt: "summarize the turn" },
+              { type: "agent", prompt: "check the diff" },
+            ],
+          },
+        ],
+      },
+    });
+    expect(await run(h, app, "hooks", ["ls", "--tool", "codex"])).not.toContain("summarize");
+    const json = JSON.parse(await run(h, app, "hooks", ["ls", "--tool", "codex", "--scope", "global", "--json"]));
+    const prompt = json.items.find((i: { summary: { type: string } }) => i.summary.type === "prompt");
+    const agent = json.items.find((i: { summary: { type: string } }) => i.summary.type === "agent");
+    expect([prompt.tags, agent.tags]).toEqual([["not supported"], ["not supported"]]);
+    expect(await run(h, app, "hooks", ["show", "--id", prompt.id])).toMatch(
+      /^Loaded\s+no, Codex does not run prompt hooks yet$/m,
+    );
+    expect(await run(h, app, "hooks", ["show", "--id", agent.id])).toMatch(
+      /^Loaded\s+no, Codex does not run agent hooks yet$/m,
+    );
   });
 });
 

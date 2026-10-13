@@ -427,7 +427,7 @@ describe("redactCommand on the shapes a differential against the first version f
       ],
       [
         command(`bash -c "curl --data 'x=1&token=a ${HEX}&y=2' https://h.example"`),
-        `bash -c "curl --data 'x=1&token=<hidden>' https://h.example"`,
+        `bash -c "curl --data 'x=1&token=<hidden>&y=2' https://h.example"`,
       ],
     ]);
   });
@@ -501,6 +501,146 @@ describe("redactCommand on the shapes a differential against the first version f
       [command(`git pull | tool -b ${HEX}`), "git pull | tool -b <hidden>"],
       [mcp(["--name", "git", "-b", HEX]), "tool --name git -b <hidden>"],
       [mcp(["-b", HEX]), "tool -b <hidden>"],
+    ]);
+  });
+});
+
+describe("redactCommand on the shapes the differential left after #97", () => {
+  const HEX = "0123456789abcdef".repeat(2);
+  const command = (line: string) => hookSummary("Stop", undefined, { type: "command", command: line }).command ?? "";
+  const mcp = (args: string[]) => mcpSummary({ command: "tool", args }).command ?? "";
+  const hidden = (shown: [string, string][], secrets: string[] = [HEX]) => {
+    for (const [actual, expected] of shown) {
+      expect(actual).toBe(expected);
+      for (const secret of secrets) expect(actual).not.toContain(secret);
+    }
+  };
+
+  it("reads a secret-named option after a secret flag as the flag's value, unless it takes a plain value", () => {
+    // A password spelled like an option named for a secret. Built from pieces.
+    const SPELLED = ["--my", "token"].join("");
+    hidden(
+      [
+        [mcp(["--password", SPELLED]), "tool --password <hidden>"],
+        [command(`tool --token ${SPELLED}`), "tool --token <hidden>"],
+        // What it would take starts with a dash or ends the command: hidden as before, and it too.
+        [command(`tool --api-key ${SPELLED} --verbose`), "tool --api-key <hidden> <hidden>"],
+        [command(`tool --secret ${SPELLED} && notify`), "tool --secret <hidden> <hidden> notify"],
+        [mcp(["--password", SPELLED, "-H", `X-Api-Key: ${HEX}`]), "tool --password <hidden> -H X-Api-Key: <hidden>"],
+        [mcp(["--auth", "--api-key", SPELLED]), "tool --auth <hidden> <hidden>"],
+      ],
+      [HEX, SPELLED],
+    );
+    // An option with a plain value is still an option, as before.
+    hidden([
+      [mcp(["--auth", "--api-key", HEX]), "tool --auth --api-key <hidden>"],
+      [command(`tool -b --api-key ${HEX} --verbose`), "tool -b --api-key <hidden> --verbose"],
+    ]);
+  });
+
+  it("shows -b and what follows under a tool whose -b is no cookie, and reads it as curl's elsewhere", () => {
+    expect(redactCommand(["tar", "-c", "-b", "20", "-f", "out.tar", "dir"])).toBe("tar -c -b 20 -f out.tar dir");
+    expect(command("sort -b -k 2 names.txt")).toBe("sort -b -k 2 names.txt");
+    expect(command("du -b /srv/data | sort -b")).toBe("du -b /srv/data | sort -b");
+    expect(command("sudo rsync -b -a src/ dst/")).toBe("sudo rsync -b -a src/ dst/");
+    expect(redactCommand(["bash", "-c", "cut -b 1-8 app.log && split -b 1m app.log part"])).toBe(
+      "bash -c cut -b 1-8 app.log && split -b 1m app.log part",
+    );
+    // Its command's first word decides, so a tool's name as an argument does not.
+    expect(command("tar -f sort -b 20 -x")).toBe("tar -f sort -b 20 -x");
+    hidden([
+      [
+        command(`tar -b 20 -xf a.tar && curl -b sid=${HEX} https://h.example`),
+        "tar -b 20 -xf a.tar && curl -b <hidden> https://h.example",
+      ],
+      [mcp(["--name", "tar", "-b", HEX]), "tool --name tar -b <hidden>"],
+      [command(`docker run img sort -b ${HEX}`), "docker run img sort -b <hidden>"],
+      // A program's -c in a shell's command line is that program's: what follows starts nothing.
+      [redactCommand(["bash", "-c", `tool -c tar -b ${HEX}`]), "bash -c tool -c tar -b <hidden>"],
+      [command(`bash -c "tool -c git -b ${HEX}"`), `bash -c "tool -c git -b <hidden>"`],
+      // So does a word that runs the next one, when it is an argument itself.
+      [mcp(["--mode", "time", "sort", "-b", HEX]), "tool --mode time sort -b <hidden>"],
+      [command(`tool --run env git -b ${HEX}`), "tool --run env git -b <hidden>"],
+      // A tool whose -b can be a secret is not one of them: gh secret set takes the secret there.
+      [command(`gh secret set API_TOKEN -b ${HEX}`), "gh secret set API_TOKEN -b <hidden>"],
+      // Nor one whose later words are another program's: a script's, a remote command's.
+      [command(`python3 fetch.py -b ${HEX}`), "python3 fetch.py -b <hidden>"],
+      [command(`ssh host fetch -b ${HEX}`), "ssh host fetch -b <hidden>"],
+    ]);
+  });
+
+  it("ends a spaced secret in a form body at the next field, and hides that field's own secret", () => {
+    hidden([
+      [mcp(["-d", `a=1&password=a ${HEX}&name=bob`]), "tool -d a=1&password=<hidden>&name=bob"],
+      [
+        command(`curl -d "a=1&password=a ${HEX}&name=bob" https://h.example`),
+        `curl -d "a=1&password=<hidden>&name=bob" https://h.example`,
+      ],
+      [
+        mcp(["-d", `a=1&password=a ${HEX}&token=b ${HEX}&name=bob more`]),
+        "tool -d a=1&password=<hidden>&token=<hidden>&name=bob more",
+      ],
+      [mcp(["-d", `a=1&password=a ${HEX} &name=bob`]), "tool -d a=1&password=<hidden> &name=bob"],
+      // An & with no field after it is the secret's.
+      [mcp(["-d", `a=1&password=a ${HEX}&b ${HEX}`]), "tool -d a=1&password=<hidden>"],
+      // Outside a form, a value with &x= in it is all secret: an assignment, an option's value.
+      [mcp(["-e", `TOKEN=a ${HEX}&x=${HEX}`]), "tool -e TOKEN=<hidden>"],
+      [command(`tool --api-key "a ${HEX}&x=${HEX}"`), `tool --api-key "<hidden>"`],
+    ]);
+  });
+});
+
+describe("redactCommand where a line break or a lone & ends a command", () => {
+  const HEX = "0123456789abcdef".repeat(2);
+  const command = (line: string) => hookSummary("Stop", undefined, { type: "command", command: line }).command ?? "";
+  const hidden = (shown: [string, string][]) => {
+    for (const [actual, expected] of shown) {
+      expect(actual).toBe(expected);
+      expect(actual).not.toContain(HEX);
+    }
+  };
+
+  it("reads -b in the command after one a tool of its own -b starts as that command's", () => {
+    hidden([
+      [command(`cat notes.txt\ngh secret set TOKEN -b ${HEX}`), "cat notes.txt gh secret set TOKEN -b <hidden>"],
+      [command(`ls & gh secret set TOKEN -b ${HEX}`), "ls & gh secret set TOKEN -b <hidden>"],
+      [command(`ls |& gh secret set TOKEN -b ${HEX}`), "ls |& gh secret set TOKEN -b <hidden>"],
+      [command(`tar -xf a.tar\r\n\nmytool -b ${HEX}`), "tar -xf a.tar mytool -b <hidden>"],
+      [command(`git pull\nmytool -b ${HEX}`), "git pull mytool -b <hidden>"],
+      [
+        redactCommand(["bash", "-c", `ls\ngh secret set TOKEN -b ${HEX}`]),
+        "bash -c ls gh secret set TOKEN -b <hidden>",
+      ],
+      [command(`bash -c 'ls\ngh secret set TOKEN -b ${HEX}'`), "bash -c 'ls gh secret set TOKEN -b <hidden>'"],
+      [mcpSummary({ command: `cat notes.txt\nmytool -b ${HEX}` }).command ?? "", "cat notes.txt mytool -b <hidden>"],
+      // A password spelled like a secret option, which took a word of the next command.
+      [command("tool --password --mytoken\nserve"), "tool --password <hidden> <hidden>"],
+    ]);
+    // And the tool's own -b, where it starts the next command.
+    expect(command("gh secret set TOKEN x\ntar -b 20 -xf a.tar")).toBe("gh secret set TOKEN x tar -b 20 -xf a.tar");
+    expect(command("make & sort -b names.txt")).toBe("make & sort -b names.txt");
+  });
+
+  it("starts no command at a boundary in a quoted value, at a line a backslash goes on, or in one argument", () => {
+    hidden([
+      [command(`gh secret set TOKEN "x && cat" -b ${HEX}`), `gh secret set TOKEN "x && cat" -b <hidden>`],
+      [command(`gh secret set TOKEN "x & cat" -b ${HEX}`), `gh secret set TOKEN "x & cat" -b <hidden>`],
+      [command(`gh secret set TOKEN 'x\ncat' -b ${HEX}`), `gh secret set TOKEN 'x cat' -b <hidden>`],
+      [command(`gh secret set TOKEN \\\ncat -b ${HEX}`), "gh secret set TOKEN \\ cat -b <hidden>"],
+      [command(`gh secret set TOKEN "x bash -c cat" -b ${HEX}`), `gh secret set TOKEN "x bash -c cat" -b <hidden>`],
+      // An MCP server's argument is no command line, but for a shell's: what is in it is a value.
+      [
+        mcpSummary({ command: "gh", args: ["secret", "set", "x\ncat", "-b", HEX] }).command ?? "",
+        "gh secret set x cat -b <hidden>",
+      ],
+      [
+        mcpSummary({ command: "gh", args: ["secret", "set", "x && cat", "-b", HEX] }).command ?? "",
+        "gh secret set x && cat -b <hidden>",
+      ],
+      [
+        mcpSummary({ command: "gh", args: ["secret", "set", "x bash -c", "cat", "-b", HEX] }).command ?? "",
+        "gh secret set x bash -c cat -b <hidden>",
+      ],
     ]);
   });
 });

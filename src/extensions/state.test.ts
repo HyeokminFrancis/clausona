@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { type Extension, emptyFacts, type Inventory, type StateFacts } from "./model.js";
+import { pathKey } from "./read.js";
 import {
   claudeMcpTaken,
   claudeSkillOverride,
@@ -341,7 +342,119 @@ describe("Claude MCP under managed-mcp.json, allowedMcpServers and deniedMcpServ
     expect(stateOf(locked, fs, P, "claude:a")).toEqual(off("/m/managed.json", "allowedMcpServers"));
   });
 
-  it("lets a copy the lists block hide no other copy", () => {
+  it("starts managedMcpServers' servers beside managed-mcp.json's, over every other copy of the name, unless denied", () => {
+    // github in managed settings' managedMcpServers, as in account a's user and local servers.
+    const delivered: Extension = {
+      ...ext("mcp", "github", { tool: "claude", scope: "managed", file: "/m/managed-settings.json" }),
+      id: "mcp:claude:managed:settings:github",
+    };
+    const localA: Extension = {
+      ...ext("mcp", "github", { tool: "claude", scope: "local", profile: "claude:a", project: P, file: "/u/a.json" }),
+      id: "mcp:claude:local:claude:a@app:github",
+    };
+    const all = [...items, delivered, localA];
+    const settled = { ...targets, [delivered.id]: { url: "https://gh.example.com/mcp", vars: false } };
+    const open = inv(all, { mcpTargets: settled });
+    expect(stateOf(open, delivered, P, "claude:a")).toEqual({ value: "on" });
+    // Claude Code lays the organization's servers over the local, project and user ones of the name.
+    for (const copy of [gh, ghB, localA]) {
+      expect(stateOf(open, copy, P, copy.location.profile).shadowedBy).toBe(delivered.id);
+    }
+    expect(claudeMcpTaken(open, "github", P, "claude:a")?.id).toBe(delivered.id);
+
+    // While managed-mcp.json is there, they still start, and a managed-mcp.json server of the name wins.
+    const exclusive = inv(all, { mcpTargets: settled, claudeManagedMcp: "/m/managed-mcp.json" });
+    expect(stateOf(exclusive, delivered, P, "claude:a")).toEqual({ value: "on" });
+    const company = {
+      ...delivered,
+      id: "mcp:claude:managed:-:github",
+      location: { ...delivered.location, file: "/m/managed-mcp.json" },
+    };
+    const both = inv([company, delivered], {
+      mcpTargets: { ...settled, [company.id]: { url: "https://company.example.com/mcp", vars: false } },
+      claudeManagedMcp: "/m/managed-mcp.json",
+    });
+    expect(stateOf(both, delivered, P, "claude:a").shadowedBy).toBe(company.id);
+    expect(stateOf(both, company, P, "claude:a")).toEqual({ value: "on" });
+
+    // They need no allowlist entry; a denylist entry keeps them out.
+    const allowNone = inv(all, {
+      mcpTargets: settled,
+      claudeMcpPolicy: [{ file: "/u/settings.json", layer: "user", allowed: [] }],
+    });
+    expect(stateOf(allowNone, delivered, P, "claude:a")).toEqual({ value: "on" });
+    const denied = inv(all, {
+      mcpTargets: settled,
+      claudeMcpPolicy: [
+        { file: "/u/settings.json", layer: "user", denied: [{ serverUrl: "https://gh.example.com/*" }] },
+      ],
+    });
+    expect(stateOf(denied, delivered, P, "claude:a")).toEqual(off("/u/settings.json", "deniedMcpServers"));
+  });
+
+  it("names the variables a match read, and takes no URL entry a value brought a * into on an allowlist", () => {
+    const denied = inv(items, {
+      mcpTargets: { ...targets, [fs.id]: { command: "hash-fs", vars: true, reads: ["TOOLS"] } },
+      claudeMcpPolicy: [
+        { file: "/u/settings.json", layer: "user", denied: [{ serverCommand: "hash-gh", reads: ["BIN"] }] },
+        { file: "/m/managed.json", layer: "managed", denied: [{ serverCommand: "hash-fs" }] },
+      ],
+    });
+    // The entry's variables, or the server's: either can make the match.
+    expect(stateOf(denied, gh, P, "claude:a")).toEqual({
+      value: "off",
+      setBy: { file: "/u/settings.json", key: "deniedMcpServers", reads: ["BIN"] },
+    });
+    expect(stateOf(denied, fs, P, "claude:a")).toEqual({
+      value: "off",
+      setBy: { file: "/m/managed.json", key: "deniedMcpServers", reads: ["TOOLS"] },
+    });
+    // A name entry reads none, whatever the server's config does.
+    const byName = inv(items, {
+      mcpTargets: { ...targets, [fs.id]: { command: "hash-fs", vars: true, reads: ["TOOLS"] } },
+      claudeMcpPolicy: [{ file: "/u/settings.json", layer: "user", denied: [{ serverName: "files" }] }],
+    });
+    expect(stateOf(byName, fs, P, "claude:a")).toEqual(off("/u/settings.json", "deniedMcpServers"));
+
+    // Left out of an allowlist: the variables of the entries of the kind that decides, and the server's.
+    const allowed = inv(items, {
+      mcpTargets: { ...targets, [remote.id]: { url: "https://mcp.example.com/api", vars: true, reads: ["HOST"] } },
+      claudeMcpPolicy: [
+        {
+          file: "/u/settings.json",
+          layer: "user",
+          allowed: [
+            { serverUrl: "https://other.example/*", reads: ["OTHER"] },
+            { serverCommand: "hash-x", reads: ["BIN"] },
+          ],
+        },
+      ],
+    });
+    expect(stateOf(allowed, remote, P, "claude:a")).toEqual({
+      value: "off",
+      setBy: { file: "/u/settings.json", key: "allowedMcpServers", reads: ["OTHER", "HOST"] },
+    });
+
+    // A value that brings a * in: an allowlist never takes the entry, a denylist does.
+    const wild = { serverUrl: "https://*.example.com/*", reads: ["HOST"], wildcard: true as const };
+    const allowWild = inv(items, {
+      mcpTargets: targets,
+      claudeMcpPolicy: [{ file: "/u/settings.json", layer: "user", allowed: [wild] }],
+    });
+    expect(stateOf(allowWild, remote, P, "claude:a").value).toBe("off");
+    const denyWild = inv(items, {
+      mcpTargets: targets,
+      claudeMcpPolicy: [{ file: "/u/settings.json", layer: "user", denied: [wild] }],
+    });
+    expect(stateOf(denyWild, remote, P, "claude:a")).toEqual({
+      value: "off",
+      setBy: { file: "/u/settings.json", key: "deniedMcpServers", reads: ["HOST"] },
+    });
+  });
+
+  // Claude Code 2.1.296 picks one copy per name before it checks the lists (bk, then Rz): a
+  // copy a list keeps from starting still hides the copies below it, and none of them starts.
+  it("lets a copy the lists block still hide the copies below it, as Claude Code picks before it checks", () => {
     const local = {
       ...named(
         ext("mcp", "gh-local", {
@@ -359,8 +472,17 @@ describe("Claude MCP under managed-mcp.json, allowedMcpServers and deniedMcpServ
       claudeMcpPolicy: [{ file: "/u/settings.json", layer: "user", denied: [{ serverCommand: "hash-local" }] }],
     });
     expect(stateOf(i, local, P, "claude:a")).toEqual(off("/u/settings.json", "deniedMcpServers"));
-    expect(stateOf(i, gh, P, "claude:a")).toEqual({ value: "on" });
-    expect(claudeMcpTaken(i, "github", P, "claude:a")?.id).toBe(gh.id);
+    expect(stateOf(i, gh, P, "claude:a")).toEqual({ value: "on", shadowedBy: local.id });
+    expect(claudeMcpTaken(i, "github", P, "claude:a")?.id).toBe(local.id);
+    // b has no local copy: its user server is the one of the name, and it starts.
+    expect(stateOf(i, ghB, P, "claude:b")).toEqual({ value: "on" });
+    // While managed-mcp.json is there, only the organization's copies are in the running.
+    const exclusive = inv([...items, local], {
+      mcpTargets: { ...targets, [local.id]: { command: "hash-local", vars: false } },
+      claudeManagedMcp: "/m/managed-mcp.json",
+    });
+    expect(stateOf(exclusive, gh, P, "claude:a")).toEqual(off("/m/managed-mcp.json", "managed-mcp.json"));
+    expect(claudeMcpTaken(exclusive, "github", P, "claude:a")).toBeUndefined();
   });
 });
 
@@ -632,6 +754,53 @@ describe("Codex", () => {
     expect(stateOf(i, exa, Q).value).toBe("off");
   });
 
+  it("reads a server an untrusted project defines as off there, as Codex leaves out the project's config", () => {
+    const own = (project: string): Extension => ({
+      ...ext("mcp", "db", { tool: "codex", scope: "project", project, file: `${project}/.codex/config.toml` }),
+      id: `mcp:codex:project:${project}:db`,
+    });
+    const [app, web, lab] = [P, Q, "/repos/lab"].map(own) as [Extension, Extension, Extension];
+    const i: Inventory = {
+      // web is marked untrusted; lab has no record at all.
+      ...inv([app, web, lab], {
+        codexTrust: [
+          { project: P, trusted: true },
+          { project: Q, trusted: false },
+        ],
+      }),
+      places: { claudeJson: {}, stashDir: "/s", codexConfig: "/c/config.toml" },
+    };
+    expect(stateOf(i, app, P)).toEqual({ value: "on" });
+    expect(stateOf(i, web, Q)).toEqual({
+      value: "off",
+      setBy: { file: "/c/config.toml", key: `projects."${Q}".trust_level` },
+    });
+    expect(stateOf(i, lab, "/repos/lab").value).toBe("off");
+  });
+
+  it("hides a user server under a same-name one a trusted project defines, and not in an untrusted one", () => {
+    const user = ext("mcp", "shared", { tool: "codex", scope: "global", file: "/c/config.toml" });
+    const own = (project: string): Extension => ({
+      ...ext("mcp", "shared", { tool: "codex", scope: "project", project, file: `${project}/.codex/config.toml` }),
+      id: `mcp:codex:project:${project}:shared`,
+    });
+    const [app, web] = [own(P), own(Q)];
+    const i: Inventory = {
+      ...inv([user, app, web], {
+        codexTrust: [
+          { project: P, trusted: true },
+          { project: Q, trusted: false },
+        ],
+      }),
+      places: { claudeJson: {}, stashDir: "/s", codexConfig: "/c/config.toml" },
+    };
+    // Codex 0.159.3's config/read: the project's in place of the user's, where it trusts the project.
+    expect(stateOf(i, user, P)).toEqual({ value: "on", shadowedBy: app.id });
+    expect(stateOf(i, app, P)).toEqual({ value: "on" });
+    expect(stateOf(i, user, Q)).toEqual({ value: "on" });
+    expect(stateOf(i, user)).toEqual({ value: "on" });
+  });
+
   it("trusts a project whose recorded key is the same path and says trusted", () => {
     const i = inv([], {
       codexTrust: [
@@ -643,6 +812,63 @@ describe("Codex", () => {
     expect(codexTrusted(i, Q)).toBe(false);
     expect(codexTrusted(i, "/repos/elsewhere")).toBe(false);
     expect(codexTrusted(i, undefined)).toBe(false);
+  });
+
+  it("takes a project's trust from the first of its folders with a trust_level, as Codex looks them up", () => {
+    // A linked worktree of P, a folder inside P, and a worktree of P marked untrusted itself.
+    const [wt, pkg, own] = ["/wt/app-feature", `${P}/pkg`, "/wt/app-own"];
+    const i = inv([], {
+      codexTrust: [
+        { project: P, trusted: true },
+        // A table with no trust_level decides nothing: Codex looks at the next folder.
+        { project: pkg },
+        { project: own, trusted: false },
+      ],
+      // By pathKey, as readCodex keys it: on Windows, resolved onto a drive and in lower case.
+      codexTrustFolders: { [pathKey(wt)]: [wt, wt, P], [pathKey(pkg)]: [pkg, P, P], [pathKey(own)]: [own, own, P] },
+    });
+    expect(codexTrusted(i, wt)).toBe(true);
+    expect(codexTrusted(i, pkg)).toBe(true);
+    expect(codexTrusted(i, own)).toBe(false);
+    // With no folders read for it, a project is looked up by its own path alone.
+    expect(codexTrusted(i, "/wt/unread")).toBe(false);
+    const viaRoot = inv([], {
+      codexTrust: [{ project: P, trusted: false }],
+      codexTrustFolders: { [pathKey(wt)]: [wt, P] },
+    });
+    expect(codexTrusted(viaRoot, wt)).toBe(false);
+  });
+
+  describe("Codex's trust keys", () => {
+    const realPlatform = process.platform;
+    const on = (platform: NodeJS.Platform) =>
+      Object.defineProperty(process, "platform", { value: platform, configurable: true });
+    afterEach(() => on(realPlatform));
+
+    it("match in any case on Windows alone, and a network share by Codex's spelling of its real path", () => {
+      // codexRoots' folders for a repo on a network share, as Z: maps one: the real path as
+      // Codex spells it, then as reached.
+      const share = "\\\\?\\UNC\\Server\\Share\\Repo";
+      const local = "C:\\Users\\RunnerAdmin\\Repo";
+      const facts = (key: string, folders: string[]) =>
+        inv([], {
+          codexTrust: [{ project: key, trusted: true }],
+          codexTrustFolders: { [pathKey("Z:\\Repo")]: folders },
+        });
+      on("win32");
+      expect(codexTrusted(facts(share.toLowerCase(), [share, "Z:\\Repo"]), "Z:\\Repo")).toBe(true);
+      expect(codexTrusted(facts(local.toLowerCase(), [local, "Z:\\Repo"]), "Z:\\Repo")).toBe(true);
+      // realpath's spelling of the share is not Codex's, which it records the trust by.
+      expect(codexTrusted(facts(share.toLowerCase(), ["\\\\Server\\Share\\Repo", "Z:\\Repo"]), "Z:\\Repo")).toBe(false);
+      // An 8.3 short name is a spelling of its own.
+      expect(codexTrusted(facts("c:\\users\\runner~1\\repo", [local, "Z:\\Repo"]), "Z:\\Repo")).toBe(false);
+      // Anywhere else Codex compares the key as it is.
+      for (const platform of ["darwin", "linux"] as const) {
+        on(platform);
+        expect(codexTrusted(facts(local.toLowerCase(), [local, "Z:\\Repo"]), "Z:\\Repo")).toBe(false);
+        expect(codexTrusted(facts(local, [local, "Z:\\Repo"]), "Z:\\Repo")).toBe(true);
+      }
+    });
   });
 });
 
@@ -777,6 +1003,33 @@ describe("Codex hooks", () => {
       { file: config, key: keys[1] ?? "", trustedHash: "sha256:now" },
     );
     expect(stateOf(one, stop, P).value).toBe("on");
+  });
+
+  it("is off in a project Codex does not trust, trusted or not, as Codex leaves out the project's .codex", () => {
+    const at = (project: string): Extension => ({
+      ...ext("hook", "Stop", { tool: "codex", scope: "project", project, file: `${project}/.codex/hooks.json` }),
+      id: `hook:codex:project:${project}:Stop#0.0`,
+    });
+    const [app, web, lab] = [P, Q, "/repos/lab"].map(at) as [Extension, Extension, Extension];
+    const key = (h: Extension) => `${h.location.file}:stop:0:0`;
+    const i: Inventory = {
+      ...inv([app, web, lab], {
+        // web is marked untrusted; lab has no record at all.
+        codexTrust: [
+          { project: P, trusted: true },
+          { project: Q, trusted: false },
+        ],
+        codexHookTrust: [app, web, lab].map((h) => ({ id: h.id, keys: [key(h)], hash: "sha256:now" })),
+        codexHookStates: [app, web, lab].map((h) => ({ file: config, key: key(h), trustedHash: "sha256:now" })),
+      }),
+      places: { claudeJson: {}, stashDir: "/s", codexConfig: config },
+    };
+    expect(stateOf(i, app, P)).toEqual({ value: "on" });
+    expect(stateOf(i, web, Q)).toEqual({ value: "off", setBy: { file: config, key: `projects."${Q}".trust_level` } });
+    expect(stateOf(i, lab, "/repos/lab")).toEqual({
+      value: "off",
+      setBy: { file: config, key: `projects."/repos/lab".trust_level` },
+    });
   });
 
   it("runs a bundled cleanup hook and a hook with no trust identity, and none of a plugin that is off", () => {

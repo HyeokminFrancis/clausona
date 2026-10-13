@@ -81,11 +81,25 @@ export type Extension = {
   noFrontMatter?: true;
   /**
    * Why Codex does not load this, in its tag's words: a skill whose SKILL.md has `no front
-   * matter` (no block delimited by `---`) or whose `name too long` (over 64 characters), and a
-   * hook in an `invalid hooks file` (more than `hooks` and `description` at its top). Unlike
-   * Claude Code, Codex lists no skill without front matter, so it does not load.
+   * matter` (no block delimited by `---`), `invalid front matter` (not YAML Codex reads), whose
+   * `name too long` (over 64 characters) or with `no description`, a hook in an `invalid hooks
+   * file` (more than `hooks` and `description` at its top), and one Codex does not run at all,
+   * `not supported` (a prompt or agent hook, an MCP tool hook when a session ends), with an
+   * `empty command`, or an MCP tool hook with an `empty tool` (or server). A hook in a linked
+   * worktree's own `.codex` folder is `main checkout's runs`: Codex runs the main checkout's
+   * hooks there in its place. Unlike Claude Code, Codex lists no skill without front matter, or
+   * without a description, so it does not load.
    */
-  codexError?: "no front matter" | "name too long" | "invalid hooks file";
+  codexError?:
+    | "no front matter"
+    | "invalid front matter"
+    | "name too long"
+    | "no description"
+    | "main checkout's runs"
+    | "invalid hooks file"
+    | "not supported"
+    | "empty command"
+    | "empty tool";
   /** What is shown about it, already redacted. */
   summary?: Record<string, string>;
   /** Hooks: where the command sits in its file. */
@@ -104,8 +118,11 @@ export type StateValue = SkillVisibility | "pending-approval";
 
 export type EffectiveState = {
   value: StateValue;
-  /** Where the value comes from; absent for a default. */
-  setBy?: { file: string; key: string };
+  /**
+   * Where the value comes from; absent for a default. `reads`, for an MCP list's match: the
+   * variables the entry and the server's config were expanded with (mcp-policy.ts).
+   */
+  setBy?: { file: string; key: string; reads?: string[] };
   /** The id of a same-name item that wins over this one. */
   shadowedBy?: string;
 };
@@ -147,6 +164,11 @@ export type StateFacts = {
   claudeManagedMcp?: string;
   /** Claude MCP server id -> what it starts, which the lists match. Never printed. */
   mcpTargets: Record<string, McpTarget>;
+  /**
+   * pathKey of a project whose own settings set `env` -> server id -> what the server starts
+   * there, where that differs from `mcpTargets`. Never printed.
+   */
+  mcpTargetsIn: Record<string, Record<string, McpTarget>>;
   /** `.claude.json` → projects[P].disabledMcpServers, per account. */
   claudeMcpDisabled: { file: string; profile: string; project: string; names: string[] }[];
   /** `.mcp.json` approvals, from settings and from an account's project entry. */
@@ -173,9 +195,23 @@ export type StateFacts = {
   fingerprints: Record<string, string>;
   /**
    * Each `[projects."<P>"]` table in the user config.toml, in key order: Codex reads a project's
-   * .codex folder only when it trusts the project.
+   * .codex folder only when it trusts the project. `trusted` is absent when the table sets no
+   * `trust_level`, which decides nothing: Codex then looks at the next folder (codexTrustFolders).
    */
-  codexTrust: { project: string; trusted: boolean }[];
+  codexTrust: { project: string; trusted?: boolean }[];
+  /**
+   * By pathKey of each project read, the folders whose trust Codex takes for it, in the order
+   * it looks (sources/codex-trust.ts): the project's own, its project root, its repository's -
+   * a linked worktree's main checkout. A project not here is looked up by its own path alone.
+   */
+  codexTrustFolders: Record<string, string[]>;
+  /**
+   * By pathKey of each project read that is in a linked git worktree and has a `.codex` folder:
+   * the main checkout, and the `.codex` folder at the project's place in it. Codex 0.159.3 runs
+   * that folder's hooks there - its hooks.json and its config.toml's `[hooks]` - in place of the
+   * project's own; the rest of the project's config is its own (sources/codex-trust.ts).
+   */
+  codexWorktrees: Record<string, { main: string; hooks: string }>;
   /**
    * Each `[plugins."<plugin>@<marketplace>"]` table in the user config.toml and in a project's:
    * Codex loads a plugin only where a table names it. `enabled` is absent when the table does not
@@ -213,12 +249,15 @@ export function emptyFacts(): StateFacts {
     claudeFlags: [],
     claudeMcpPolicy: [],
     mcpTargets: {},
+    mcpTargetsIn: {},
     claudeMcpDisabled: [],
     claudeMcpjson: [],
     codexSkillConfig: [],
     codexMcpEnabled: [],
     fingerprints: {},
     codexTrust: [],
+    codexTrustFolders: {},
+    codexWorktrees: {},
     codexPlugins: [],
     codexPluginServers: [],
     codexHookTrust: [],

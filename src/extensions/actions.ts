@@ -67,6 +67,8 @@ export const REFUSAL_CODES = [
   "mcp-not-allowed",
   "managed-mcp",
   "bundled-off",
+  "codex-config-hook",
+  "codex-worktree-hook",
 ] as const;
 export type RefusalCode = (typeof REFUSAL_CODES)[number];
 
@@ -80,6 +82,8 @@ export type Refusal = {
   flags?: string;
   /** `tracked`: the project, by name, that the reason says git tracks it in - for the TUI's warning. */
   project?: string;
+  /** `tracked`: git did not answer in time whether it tracks it, so it counts as tracked (UNCHECKED_REASON). */
+  unchecked?: true;
 };
 
 /** One text, or one per tool where the tools differ. */
@@ -223,6 +227,16 @@ export const REFUSALS: Readonly<Record<RefusalCode, { reason: Words; keys?: Word
     keys: "Change it there.",
     flags: "Change it there.",
   },
+  "codex-config-hook": {
+    reason: "It is written in {~file}, where clausona does not change hooks.",
+    keys: "Use /hooks in Codex, or edit the file.",
+    flags: "Use /hooks in Codex, or edit the file.",
+  },
+  "codex-worktree-hook": {
+    reason: "Codex runs the hooks in {~file} in this worktree.",
+    keys: "Change them there.",
+    flags: "Change them there.",
+  },
 };
 
 const TOOL_NAME: Record<ToolName, string> = { claude: "Claude Code", codex: "Codex" };
@@ -267,6 +281,23 @@ export const ONE_ACCOUNT_KEYS = "Press d and choose only {short} in the dialog."
  */
 export const NO_PROJECT_KEYS = "Run csn in a project.";
 
+/**
+ * What `tracked` says instead where git did not answer in time whether it tracks the row: it
+ * counts as tracked all the same, so the same consent goes ahead.
+ */
+export const UNCHECKED_REASON =
+  "Git did not answer in time whether it tracks it in {project name}, so this may change the repo.";
+
+function fillValues(row: { name: string }, tool: ToolName, fill: RefusalFill): Record<string, string> {
+  return { name: row.name, ...fill, "Claude Code|Codex": TOOL_NAME[tool] };
+}
+
+/** `tracked` for a row git did not answer for in time: UNCHECKED_REASON, and marked so. */
+export function uncheckedRefusal(row: { key: string; name: string }, tool: ToolName, fill: RefusalFill): Refusal {
+  const made = refusal("tracked", row, tool, fill);
+  return { ...made, reason: filled(UNCHECKED_REASON, tool, fillValues(row, tool, fill)) ?? "", unchecked: true };
+}
+
 /** The refusal `code` for a row of `tool`, its words filled in; `keysInstead` stands in for the table's keys words. */
 export function refusal(
   code: RefusalCode,
@@ -276,7 +307,7 @@ export function refusal(
   keysInstead?: string,
 ) {
   const spec = REFUSALS[code];
-  const values: Record<string, string> = { name: row.name, ...fill, "Claude Code|Codex": TOOL_NAME[tool] };
+  const values = fillValues(row, tool, fill);
   const keys = filled(keysInstead ?? spec.keys, tool, values);
   const flags = filled(spec.flags, tool, values);
   const made: Refusal = {

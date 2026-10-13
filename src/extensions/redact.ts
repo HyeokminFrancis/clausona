@@ -92,8 +92,14 @@ const URL_RUN = /[a-z][a-z0-9+.-]*:\/\/[^\s"'`]+/gi;
 /** The word SQL puts before a password literal: `PASSWORD 'x'`. MySQL's `IDENTIFIED BY 'x'` is the other. */
 const SQL_PASSWORD = /^password$/i;
 
-/** A word that ends one command and starts the next, in a shell's command line. */
-const SEPARATOR = /^(&&|\|\||\||;)$|;$/;
+/** A word that ends one command and starts the next, in a shell's command line: `&&`, `|`, `&`, `cmd;`. */
+const SEPARATOR = /^(&&|\|\||\||\|&|&|;)$|;$/;
+
+/** A line break, which ends a command in a command line as `;` does. */
+const LINE_BREAK = /\r\n|\r|\n/;
+
+/** A word that goes on to the next line: a `\` at its end, or cmd's `^`, or PowerShell's backtick. */
+const CONTINUES = /[\\^`]$/;
 
 /** A word that may start a command: what a command line or a separator puts first, or runs the rest. */
 const RUNS_NEXT = /^(env|sudo|exec|command|nohup|time|xargs)$/;
@@ -106,9 +112,18 @@ const GO_OPTION = /^-[a-z][a-z\d]*(?:[-_][a-z\d]+)*$/;
 
 /**
  * A command line's words: whether each ends an argument (an MCP server's argument can hold
- * several), and the quote a value that ends at a word goes on in (`openQuotes`).
+ * several), the quote a value that ends at a word goes on in (`openQuotes`), the words whose
+ * shown text joins the one before it with no space - a form field cut from the word a hidden
+ * value ended in (`stopAtField`) - and the words a line break comes before, in a command line.
  */
-type Line = { words: string[]; ends: boolean[]; open: string[]; shown: string[] };
+type Line = {
+  words: string[];
+  ends: boolean[];
+  open: string[];
+  shown: string[];
+  joined: Set<number>;
+  breaks: Set<number>;
+};
 
 /** A POSIX shell's option for a command line: `-c`, alone or ending a run of short options (`-lc`, `-euc`). */
 const POSIX_COMMAND = /^-[a-zA-Z]*c$/;
@@ -172,22 +187,44 @@ function isShellCommand(args: string[], at: number): boolean {
  * still on its first and last. So a value that opens a quote runs on through the word that
  * closes it, the way the shell would read it, and so does one that ends at a word inside a
  * quoted string (`-d "user=bob&password=a b"`); one in an argument of several words runs to
- * that argument's end. The quotes are kept around what stands in for a value.
+ * that argument's end. A form field's value that runs on so ends at the next field
+ * (`-d "a=1&password=a b&name=c"`), as a form's reader splits it. The quotes are kept around
+ * what stands in for a value.
+ *
+ * A line break ends a command where `args` is a command line: the text of a hook or a command
+ * split at its whitespace, the arguments `lineStarts` names coming after one (`commandWords`),
+ * and a shell's command line in one argument. An MCP server's other arguments are values, a line
+ * break in them too.
  */
-export function redactCommand(args: string[]): string {
-  const line: Line = { words: [], ends: [], open: [], shown: [] };
+export function redactCommand(args: string[], lineStarts: ReadonlySet<number> = new Set()): string {
+  const line: Line = { words: [], ends: [], open: [], shown: [], joined: new Set(), breaks: new Set() };
   const bodies: boolean[] = [];
+  let broken = false;
   for (const [n, arg] of args.entries()) {
-    const words = arg.split(/\s+/).filter(Boolean);
     const commandLine = isShellCommand(args, n - 1);
-    for (const [k, word] of words.entries()) {
+    const lines = commandLine ? arg.split(LINE_BREAK) : [arg];
+    broken ||= lineStarts.has(n);
+    const words = lines.flatMap((text, l) =>
+      text
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((word, w) => ({ word, after: l > 0 && w === 0 })),
+    );
+    for (const [k, { word, after }] of words.entries()) {
+      if (broken || after) line.breaks.add(line.words.length);
+      broken = false;
       line.words.push(word);
       line.ends.push(commandLine || k === words.length - 1);
       bodies.push(commandLine && k === 0);
     }
   }
   line.open = openQuotes(line.words, bodies);
-  for (let i = 0; i < line.words.length; i++) i = redactAt(line, i);
+  for (let i = 0; i < line.words.length; i++) {
+    const from = line.shown.length;
+    const joins = line.joined.has(i) && from > 0;
+    i = redactAt(line, i);
+    if (joins) line.shown.splice(from - 1, 2, `${line.shown[from - 1]}${line.shown[from] ?? ""}`);
+  }
   return line.shown.join(" ");
 }
 
@@ -261,7 +298,7 @@ function redactAt(line: Line, i: number): number {
   // or in the quoted string the word is in: `-d "user=bob&password=a b"`.
   const tail = valueAtEnd(word);
   if (tail !== undefined && (!line.ends[i] || line.open[i] !== "")) {
-    return hideValue(line, i, redactWord(word.slice(0, tail)), "", word.slice(tail));
+    return hideValue(line, i, redactWord(word.slice(0, tail.at)), "", word.slice(tail.at), tail.field);
   }
   line.shown.push(redactWord(word));
   if (i + 1 >= line.words.length) return i;
@@ -293,17 +330,43 @@ function redactAt(line: Line, i: number): number {
  * they start with (`--token "-u x"`). And a word that may be either - an option named for a
  * secret in Go's single-dash style (`-b -token x`), or a double-dash one not spelled the way
  * option names are (`--Tk9Secret`) - is hidden as a value, and so is the word after it, its
- * value if it is an option: whichever it is, the secret is hidden.
+ * value if it is an option: whichever it is, the secret is hidden. One spelled as option names
+ * are is read as `optionOrValue` says.
  */
 function hideFlagValue(line: Line, i: number): number {
   const at = i + 1;
   const next = line.words[at] ?? "";
   if (leadingQuote(next) !== "" || !line.ends[at]) return hideWord(line, at);
+  if (isSpelledSecretOption(next)) return optionOrValue(line, at);
   const either = mayBeSecretFlag(next);
   if (!either && hidesOwnValue(line, at)) return i;
   const last = hideWord(line, at);
   if (!either || last !== at || at + 1 >= line.words.length || hidesOwnValue(line, at + 1)) return last;
   return hideWord(line, at + 1);
+}
+
+/** A double-dash option spelled the way option names are, and named for a secret: `--api-key`. */
+function isSpelledSecretOption(word: string): boolean {
+  const option = /^--([\w.-]+)$/.exec(word)?.[1];
+  return option !== undefined && isSecretName(option) && SPELLED_OPTION.test(option);
+}
+
+/**
+ * Shows `words[at]`, a word spelled like an option named for a secret right after a secret's
+ * option, and what it takes; returns the index of the last word. It is read by its own rule
+ * first. When that takes a plain value, it is an option, as in `--auth --api-key K`. Otherwise it
+ * is the value of the option before it, a password such as `--mytoken`, and is hidden: nothing
+ * follows it in its command, or what follows has a rule of its own (`-H …`), or what it took
+ * starts with a dash or ends the command, which stays hidden too. So the secret is hidden
+ * whichever it is; only a password of that spelling with a plain word after it still shows.
+ */
+function optionOrValue(line: Line, at: number): number {
+  const first = line.shown.length;
+  const last = redactAt(line, at);
+  const taken = last > at ? unquoted(line.words[at + 1] ?? "") : "";
+  const elsewhere = SEPARATOR.test(taken) || line.breaks.has(at + 1);
+  if (taken === "" || taken.startsWith("-") || elsewhere) line.shown[first] = HIDDEN;
+  return last;
 }
 
 /** See hideFlagValue: a word after a secret's option that may be its value or an option of its own. */
@@ -314,31 +377,112 @@ function mayBeSecretFlag(word: string): boolean {
 }
 
 /**
- * Whether `words[i]` is curl's cookie option, `-b` or `--cookie`. Under git, `-b` names a branch
- * (`git checkout -b feature`): the command it is in starts with git. Anywhere else `-b` is read
- * as curl's, the safe side, whatever the program.
+ * The programs whose `-b` is no credential, as their man pages give it: git's names a branch;
+ * the others' is a size, a byte list, a path or a batch file (tar, cut, split, tail, base64,
+ * zip, sftp), a backup (cp, mv, ln, install, rsync, patch), or a switch of their own (sort, du,
+ * ls, grep, diff, ...). Left out are a tool whose `-b` can be a secret (`gh secret set -b`), and
+ * one whose later words can be another program's (python's script, ssh's remote command).
+ */
+const NO_COOKIE_B = new Set([
+  "base64",
+  "cat",
+  "cp",
+  "cut",
+  "df",
+  "diff",
+  "du",
+  "file",
+  "fold",
+  "git",
+  "grep",
+  "hexdump",
+  "install",
+  "ln",
+  "ls",
+  "lsof",
+  "md5sum",
+  "mv",
+  "nl",
+  "od",
+  "patch",
+  "rg",
+  "rsync",
+  "sftp",
+  "sha256sum",
+  "shasum",
+  "sort",
+  "split",
+  "tail",
+  "tar",
+  "unzip",
+  "wget",
+  "xxd",
+  "zip",
+]);
+
+/**
+ * Whether `words[i]` is curl's cookie option, `-b` or `--cookie`. Under git and the other
+ * programs of NO_COOKIE_B, `-b` is their own (`git checkout -b feature`, `tar -b 20`): the
+ * command it is in is theirs. Anywhere else `-b` is read as curl's, the safe side, whatever the
+ * program.
  */
 function isCookieFlag(line: Line, i: number): boolean {
   const word = line.words[i] ?? "";
   const body = word.slice(leadingQuote(word).length);
-  return COOKIE_FLAG.test(body) && (body !== "-b" || !underGit(line, i));
+  return COOKIE_FLAG.test(body) && (body !== "-b" || !underNoCookieTool(line, i));
 }
 
 /**
- * Whether the command `words[i]` is in is git's: walking back to where the command starts - the
- * line's start, a separator, a shell's command option, a word that runs the next one - its
- * first word names git, and no word on the way names curl.
+ * Whether the command `words[i]` is in is one of NO_COOKIE_B's: walking back to a separator, a
+ * line break or the line's start, a word names one of them where it starts a command
+ * (`startsCommand`), and no word on the way names curl. A name that starts no command is an
+ * argument (`--name tar`), and the walk goes on past it. The walk stops at any separator or line
+ * break, one in a quoted value too: the command before it is not read as `-b`'s.
  */
-function underGit(line: Line, i: number): boolean {
+function underNoCookieTool(line: Line, i: number): boolean {
   for (let k = i - 1; k >= 0; k--) {
+    if (line.breaks.has(k + 1)) return false;
     const word = unquoted(line.words[k] ?? "");
     const program = programName(word);
     if (SEPARATOR.test(word) || program === "curl") return false;
-    if (program !== "git") continue;
-    const before = unquoted(line.words[k - 1] ?? "");
-    return k === 0 || SEPARATOR.test(before) || RUNS_NEXT.test(before) || isShellCommand(line.words, k - 1);
+    if (NO_COOKIE_B.has(program) && startsCommand(line, k)) return true;
   }
   return false;
+}
+
+/**
+ * Whether `words[k]` starts a command: it is the line's first word, or follows a line break, a
+ * separator or a shell's command option, or a word that runs the next one where that word starts
+ * a command itself - `sudo rsync`, but not `--mode time sort`, where time is an argument. Not in
+ * a value (`inValue`), whose `&&`, `;`, line break or `-c` is the value's, nor at a line a word
+ * goes on from (`CONTINUES`).
+ */
+function startsCommand(line: Line, k: number): boolean {
+  if (k === 0) return true;
+  if (inValue(line, k)) return false;
+  const before = line.words[k - 1] ?? "";
+  if (line.breaks.has(k)) return !CONTINUES.test(before);
+  if (SEPARATOR.test(before) || opensShellLine(line.words, k - 1)) return k < 2 || !inValue(line, k - 1);
+  return RUNS_NEXT.test(unquoted(before)) && startsCommand(line, k - 1);
+}
+
+/**
+ * Whether `words[k]` is in one value with the word before it: in a quoted string that goes on
+ * past that word (`openQuotes`), or in the same argument, one that is no shell's command line.
+ */
+function inValue(line: Line, k: number): boolean {
+  return line.open[k - 1] !== "" || line.ends[k - 1] !== true;
+}
+
+/**
+ * Whether `words[at]` is the option a shell takes its command line with (`isShellCommand`), and
+ * not a later program's: when the line's program is the shell, its first such option is. So in
+ * `bash -c "tool -c tar -b x"`, tool's `-c` starts no command, and its `-b` stays curl's.
+ */
+function opensShellLine(words: string[], at: number): boolean {
+  const shell = SHELL_COMMAND.get(programName(words[0] ?? ""));
+  if (shell !== undefined && words.slice(1, at).some((word) => shell.test(word))) return false;
+  return isShellCommand(words, at);
 }
 
 /** A word without the quotes at its ends. */
@@ -422,14 +566,17 @@ function valueEnd(line: Line, i: number): number {
  * or the end - and what follows that is shown, redacted. An unquoted value is the rest of the
  * word, with any closing quotes or brackets after it shown - or, when the word is not the last
  * of its argument, the rest of that argument; or, when the word is in a quoted string that goes
- * on past it (`openQuotes`), the rest of that string.
+ * on past it (`openQuotes`), the rest of that string. When the value is a form's `field`, either
+ * ends at the next field (`nextField`).
  */
-function hideValue(line: Line, at: number, prefix: string, quote: string, rest: string): number {
+function hideValue(line: Line, at: number, prefix: string, quote: string, rest: string, field = false): number {
   if (quote === "") {
     // An argument that goes on past the value's word is value to its end: `API_KEY=a b`,
     // `alice:a b`, and `--api-key a b` as one argument. It is one value to the program, whatever
     // its spaces; a shell's command line, whose words are the shell's own, ends at each word.
     if (!line.ends[at]) {
+      const next = field ? nextField(line, at, argEnd(line, at), "") : undefined;
+      if (next) return stopAtField(line, prefix, next);
       line.shown.push(`${prefix}${HIDDEN}`);
       return valueEnd(line, at);
     }
@@ -438,6 +585,8 @@ function hideValue(line: Line, at: number, prefix: string, quote: string, rest: 
     const open = line.open[at] ?? "";
     if (open !== "" && at + 1 < line.words.length) {
       const { last, after } = closing(line, at + 1, open, line.words[at + 1] ?? "");
+      const next = field ? nextField(line, at, last, open) : undefined;
+      if (next) return stopAtField(line, prefix, next);
       line.shown.push(`${prefix}${HIDDEN}${rest.includes(open) ? "" : open}${after}`);
       return last;
     }
@@ -450,6 +599,39 @@ function hideValue(line: Line, at: number, prefix: string, quote: string, rest: 
   // the credential from the word after it.
   const scheme = closed && after === "" && AUTH_SCHEME.test(inside.trim().split(/\s+/).pop() ?? "");
   return scheme && last + 1 < line.words.length ? hideWord(line, last + 1) : last;
+}
+
+/**
+ * Where the next field of a form starts after a value that runs on from `words[at]` to `last`:
+ * the word, and the place in it of the first `&` that a field's name and `=` follow
+ * (`b&name=c`). `quote` is the quote the value is in, if any; a field after it closes is not
+ * the value's. None when a quote comes first, since what it opens or closes is not known here.
+ */
+function nextField(line: Line, at: number, last: number, quote: string): { word: number; at: number } | undefined {
+  for (let w = at + 1; w <= last; w++) {
+    const word = line.words[w] ?? "";
+    const close = quote === "" ? -1 : word.indexOf(quote);
+    const text = close < 0 ? word : word.slice(0, close);
+    const field = /&[\w.-]+=/.exec(text);
+    if (/["'`]/.test(text.slice(0, field?.index ?? text.length))) return undefined;
+    if (field) return { word: w, at: field.index };
+    if (close >= 0) return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Shows `prefix` and HIDDEN for a value that ends where `field` starts, and returns the index of
+ * the value's last word. The field's word is left to be read on its own, from its `&`, and its
+ * shown text joins the hidden value's, as the two were one word: `password=<hidden>&name=c`.
+ */
+function stopAtField(line: Line, prefix: string, field: { word: number; at: number }): number {
+  line.shown.push(`${prefix}${HIDDEN}`);
+  if (field.at > 0) {
+    line.words[field.word] = (line.words[field.word] ?? "").slice(field.at);
+    line.joined.add(field.word);
+  }
+  return field.word - 1;
 }
 
 /**
@@ -599,9 +781,10 @@ function openKeyValue(word: string): { at: number; quote: string } | undefined {
 
 /**
  * Where a secret-named key's unquoted value starts in `word` when it runs to the word's end, as
- * `hideKeyValues` reads it: `user=bob&password=x`. Not a key in a URL, whose rules hide its query.
+ * `hideKeyValues` reads it: `user=bob&password=x`; and whether the key is a form's field, after
+ * an `&`. Not a key in a URL, whose rules hide its query.
  */
-function valueAtEnd(word: string): number | undefined {
+function valueAtEnd(word: string): { at: number; field: boolean } | undefined {
   const urls = [...word.matchAll(URL_RUN)].map((m) => ({ from: m.index ?? 0, to: (m.index ?? 0) + m[0].length }));
   const keys = new RegExp(KEY_AT.source, "g");
   for (let key = keys.exec(word); key !== null; key = keys.exec(word)) {
@@ -610,7 +793,7 @@ function valueAtEnd(word: string): number | undefined {
     if (key[3] !== "" || !isSecretName(key[2] ?? "") || urls.some((url) => start >= url.from && start < url.to))
       continue;
     const value = /^[^\s"'&,;}]+/.exec(word.slice(at))?.[0];
-    if (value !== undefined && at + value.length === word.length) return at;
+    if (value !== undefined && at + value.length === word.length) return { at, field: word[start - 1] === "&" };
   }
   return undefined;
 }
@@ -689,13 +872,35 @@ export function mcpSummary(config: unknown): Record<string, string> {
   if (typeof config.command === "string") {
     const args = Array.isArray(config.args) ? config.args.filter((a): a is string => typeof a === "string") : [];
     // The command is a command line when it holds spaces, so its words are its own arguments.
-    out.command = redactCommand([...config.command.split(/\s+/), ...args]);
+    const command = commandWords(config.command);
+    out.command = redactCommand([...command.words, ...args], command.lineStarts);
   }
   const env = names(config.env);
   if (env.length > 0) out.env = env.join(", ");
   const headers = [...names(config.headers), ...names(config.http_headers), ...names(config.env_http_headers)];
   if (headers.length > 0) out.headers = headers.join(", ");
   return out;
+}
+
+/**
+ * A command line's text split at whitespace, each word its own argument, and the arguments a
+ * line break comes before, where one command ends and the next starts (see `redactCommand`).
+ */
+function commandWords(text: string): { words: string[]; lineStarts: Set<number> } {
+  const words: string[] = [];
+  const lineStarts = new Set<number>();
+  for (const [n, part] of text.split(LINE_BREAK).entries()) {
+    const own = part.split(/\s+/).filter(Boolean);
+    if (n > 0 && own.length > 0) lineStarts.add(words.length);
+    words.push(...own);
+  }
+  return { words, lineStarts };
+}
+
+/** `text`, a hook's command or prompt, as the inventory shows it. */
+function redactLine(text: string): string {
+  const { words, lineStarts } = commandWords(text);
+  return redactCommand(words, lineStarts);
 }
 
 /**
@@ -707,8 +912,8 @@ export function hookSummary(event: string, matcher: string | undefined, hook: un
   if (matcher) out.matcher = matcher;
   if (isRecord(hook)) {
     if (typeof hook.type === "string") out.type = hook.type;
-    if (typeof hook.command === "string") out.command = redactCommand(hook.command.split(/\s+/).filter(Boolean));
-    if (typeof hook.prompt === "string") out.prompt = redactCommand(hook.prompt.split(/\s+/).filter(Boolean));
+    if (typeof hook.command === "string") out.command = redactLine(hook.command);
+    if (typeof hook.prompt === "string") out.prompt = redactLine(hook.prompt);
   }
   return out;
 }
