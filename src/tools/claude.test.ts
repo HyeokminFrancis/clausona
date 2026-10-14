@@ -134,6 +134,207 @@ describe("claudeAdapter.sharedSkipSet", () => {
   });
 });
 
+/** Whether a profile keeps `name` for itself, as setupSharedLinks decides it: by set or by pattern. */
+function keptApart(name: string, mergeSessions: boolean): boolean {
+  return (
+    claudeAdapter.sharedSkipSet(mergeSessions).has(name) || claudeAdapter.shouldSkipName?.(name, mergeSessions) === true
+  );
+}
+
+describe("Claude Code state for one account or org", () => {
+  // Names as Claude Code 2.1.299 builds them: the files, then each sibling it names for them.
+  const ACCOUNT_STATE = [
+    "policy-limits.json",
+    "policy-limits.json.signature.json",
+    "policy-limits.json.signature-iat.json",
+    "policy-limits.json.stamp.json",
+    "remote-settings.json",
+    "remote-settings.json.signature.json",
+    "remote-settings.json.signature-iat.json",
+    "remote-settings.json.synced-at",
+    "remote-settings-helper-consent",
+    "remote-settings-consent.json",
+    "mcp-needs-auth-cache.json",
+    "state",
+    "chrome",
+  ];
+
+  it("is never shared, in either session mode", () => {
+    for (const name of ACCOUNT_STATE) {
+      expect(keptApart(name, false), `${name} when separated`).toBe(true);
+      expect(keptApart(name, true), `${name} when merged`).toBe(true);
+    }
+  });
+
+  it("is in the skip set by name, so repair can bring a profile's own copy back from a backup", () => {
+    for (const name of ACCOUNT_STATE) expect(claudeAdapter.sharedSkipSet(true).has(name), name).toBe(true);
+  });
+
+  it("takes the temp files and locks Claude Code writes beside each of those files with it", () => {
+    // Its atomic writer stages `<file>.tmp.<8 hex>`, and the signature's lock is `<file>.lock`.
+    for (const name of [
+      "policy-limits.json.tmp.0a1b2c3d",
+      "policy-limits.json.signature-iat.json.lock",
+      "remote-settings.json.signature.json.tmp.0a1b2c3d",
+      "remote-settings-consent.json.tmp.0a1b2c3d",
+      "remote-settings-helper-consent.tmp.0a1b2c3d",
+    ]) {
+      expect(keptApart(name, true), name).toBe(true);
+    }
+  });
+
+  it("leaves names that only start alike shared", () => {
+    for (const name of ["policy-limits.jsonl", "remote-settings", "states", "chrome-profiles", "statefile.json"]) {
+      expect(keptApart(name, true), name).toBe(false);
+    }
+  });
+});
+
+describe("the rest of Claude Code's state for one config dir", () => {
+  it("keeps what belongs to one account apart, in either session mode", () => {
+    for (const name of [
+      // Copies of the account file, and the legacy one Claude Code reads in its place.
+      ".claude.json.backup",
+      ".claude-staging-oauth.json",
+      ".claude-local-oauth.json",
+      ".claude-custom-oauth.json",
+      ".config.json",
+      "backups",
+      // The background daemon: its control key and roster, its lock and status, the scheduled
+      // tasks and Remote Control folders it runs, its log, and its sign-in state.
+      "daemon",
+      "daemon-auth-cooldown",
+      "daemon-auth-status.json",
+      "daemon.lock",
+      "daemon.status.json",
+      "daemon.scheduled.status.json",
+      "daemon.json",
+      "daemon.log",
+      // Events stamped with the account, waiting to be sent again.
+      "telemetry",
+      ".session_ingress_token",
+      "hfi-auth.json",
+    ]) {
+      expect(keptApart(name, false), `${name} when separated`).toBe(true);
+      expect(keptApart(name, true), `${name} when merged`).toBe(true);
+      expect(claudeAdapter.sharedSkipSet(true).has(name), `${name} by name`).toBe(true);
+    }
+  });
+
+  it("keeps every name that starts with daemon apart, as Claude Code's own list of state does", () => {
+    for (const name of ["daemon.log.1", "daemon.lock.tmp.0a1b2c3d", "daemon-worker.json", "daemons"]) {
+      expect(keptApart(name, true), name).toBe(true);
+    }
+  });
+
+  it("keeps every copy and companion of the account file apart", () => {
+    for (const name of [
+      ".claude.json.backup.1760000000000",
+      ".claude.json.corrupted.1760000000000",
+      ".claude.json.bak",
+      ".claude-custom-oauth.json.backup",
+      ".config.json.backup",
+      ".session_ingress_token.e3.tmp.0a1b2c3d",
+    ]) {
+      expect(keptApart(name, true), name).toBe(true);
+    }
+  });
+
+  it("keeps the caches and ledgers of the account it runs as apart", () => {
+    // Model access and catalog, MCP discovery, /stats, feedback drafts waiting to be sent, and
+    // active time: a copy that stops following the primary's loses nothing.
+    for (const name of ["cache", "mcp-discovery-cache", "stats-cache.json", "feedback", "active-time.json"]) {
+      expect(keptApart(name, false), `${name} when separated`).toBe(true);
+      expect(keptApart(name, true), `${name} when merged`).toBe(true);
+      expect(claudeAdapter.sharedSkipSet(true).has(name), `${name} by name`).toBe(true);
+    }
+  });
+
+  it("shares what carries sessions across accounts when sessions are merged", () => {
+    for (const name of [
+      "projects",
+      "jobs",
+      "teams",
+      "sessions",
+      "todos",
+      "shell-snapshots",
+      "file-history",
+      "history.jsonl",
+      "tasks",
+      "session-env",
+      "plans",
+      "paste-cache",
+      "uploads",
+    ]) {
+      expect(keptApart(name, true), name).toBe(false);
+    }
+  });
+
+  it("leaves names that only start alike shared", () => {
+    for (const name of [".claude-code-router.json", "config.json", "my-daemon.json", "telemetry.md", "backups-old"]) {
+      expect(keptApart(name, true), name).toBe(false);
+    }
+  });
+});
+
+describe("what doctor says of a link to the primary's", () => {
+  it("says of a sibling what it says of the file it belongs to", () => {
+    for (const [sibling, file] of [
+      ["policy-limits.json.tmp.0a1b2c3d", "policy-limits.json"],
+      ["remote-settings.json.synced-at.tmp.0a1b2c3d", "remote-settings.json"],
+      ["remote-settings-consent.json.tmp.0a1b2c3d", "remote-settings-consent.json"],
+      ["remote-settings-helper-consent.tmp.0a1b2c3d", "remote-settings-helper-consent"],
+      // A copy of an account file is a copy: Claude Code reads only the file itself as the account.
+      [".config.json.backup", ".claude.json.backup"],
+      [".claude-custom-oauth.json.backup", ".claude.json.backup"],
+      [".claude-staging-oauth.json.tmp.12345.0a1b2c3d4e5f", ".claude.json.backup"],
+      [".session_ingress_token.e3.tmp.0a1b2c3d", ".session_ingress_token"],
+      ["daemon.log.1", "daemon.log"],
+    ]) {
+      expect(claudeAdapter.unsharedRisk?.(sibling), sibling).toEqual(claudeAdapter.unsharedRisk?.(file));
+      expect(claudeAdapter.unsharedRisk?.(sibling), sibling).toBeDefined();
+    }
+  });
+
+  it("says the account files themselves act as the primary's account, and their copies are copies", () => {
+    for (const name of [".config.json", ".claude-custom-oauth.json", ".claude-local-oauth.json"]) {
+      expect(claudeAdapter.unsharedRisk?.(name)?.risk, name).toBe("wrong_account");
+    }
+    for (const name of [".config.json.backup", ".claude-local-oauth.json.backup", ".claude.json.backup"]) {
+      expect(claudeAdapter.unsharedRisk?.(name)?.risk, name).toBe("isolation");
+    }
+  });
+
+  it("says nothing more than that it is not shared of the account file itself or a temp file", () => {
+    for (const name of [".claude.json", ".credentials.json", "settings.json.tmp.0a1b2c3d"]) {
+      expect(claudeAdapter.unsharedRisk?.(name), name).toBeUndefined();
+    }
+  });
+});
+
+describe("temp files left from a save", () => {
+  it("are never shared, whatever file they were saving", () => {
+    for (const name of [
+      // Claude Code's atomic writer: `<file>.tmp.<8 hex>`.
+      "settings.json.tmp.0a1b2c3d",
+      // Its synchronous writer: `<file>.tmp.<pid>.<12 hex>`.
+      "history.jsonl.tmp.12345.0a1b2c3d4e5f",
+      ".claude.json.tmp.78985.429da2c70baf",
+      // The `.session-stats.json` writer: `<file>.tmp.<pid>.<ms>.<base 36>`.
+      ".session-stats.json.tmp.56475.1780981766229.1qip4a37kvx",
+    ]) {
+      expect(keptApart(name, false), `${name} when separated`).toBe(true);
+      expect(keptApart(name, true), `${name} when merged`).toBe(true);
+    }
+  });
+
+  it("are told apart from names that only mention tmp", () => {
+    for (const name of ["notes.tmp", "settings.json.tmp", "settings.json.tmp.old", "a.tmp.0a1b2c3", "tmp.0a1b2c3d"]) {
+      expect(keptApart(name, true), name).toBe(false);
+    }
+  });
+});
+
 /**
  * The one place clausona writes Claude Code's own credentials: a renewal on macOS, into the
  * Keychain item Claude Code reads. It is the user's live subscription login, so the item must

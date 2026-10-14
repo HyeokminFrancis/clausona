@@ -8,7 +8,7 @@ import { spawnCommand } from "../core/process.js";
 import { parseClaudeQuota, QuotaHttpError } from "../core/quota.js";
 import { writeKeychainItem } from "../lib/secrets.js";
 import type { QuotaWindows } from "../types.js";
-import type { SignInCheck, ToolAdapter, ToolCredential } from "./types.js";
+import type { SignInCheck, ToolAdapter, ToolCredential, UnsharedRisk } from "./types.js";
 
 // `.credentials.json` is the OAuth token store Claude Code uses wherever there is no
 // system keychain — on macOS the tokens live in the Keychain under a per-config-dir
@@ -33,6 +33,228 @@ const BASE_SHARED_LINK_SKIP = new Set([
   "gh-pr-status-cache.json",
   ".session-stats.json",
 ]);
+
+// State Claude Code keeps for one account or one org (2.1.299), each name as it builds it:
+//
+// - `policy-limits.json` holds the org's policy limits. Beside it are the signature Claude Code
+//   checks them by (`.signature.json`, `.signature-iat.json`) and `.stamp.json`, which names the
+//   identity they were fetched for.
+// - `remote-settings.json` holds the org's remote managed settings, with the same two signature
+//   files and `.synced-at`, the time of the last sync. `remote-settings-helper-consent` and
+//   `remote-settings-consent.json` record what this account agreed to apply from them.
+// - `mcp-needs-auth-cache.json` lists the MCP servers and claude.ai connectors that need this
+//   account's sign-in.
+// - `state/` holds per-account records such as MCP discovery verdicts.
+// - `chrome/` holds the Claude in Chrome native host wrapper, written for this config dir.
+//
+// A link to the primary's makes a profile read the primary account's: until Claude Code refetches,
+// it can apply the primary org's policy limits and remote settings. Claude Code saves its own copy
+// by writing a new file and renaming it over the link, so the link does not last either.
+const ACCOUNT_STATE = [
+  "policy-limits.json",
+  "policy-limits.json.signature.json",
+  "policy-limits.json.signature-iat.json",
+  "policy-limits.json.stamp.json",
+  "remote-settings.json",
+  "remote-settings.json.signature.json",
+  "remote-settings.json.signature-iat.json",
+  "remote-settings.json.synced-at",
+  "remote-settings-helper-consent",
+  "remote-settings-consent.json",
+  "mcp-needs-auth-cache.json",
+  "state",
+  "chrome",
+] as const;
+
+// What Claude Code writes beside those files while it saves one: `<file>.tmp.<8 hex>` from its
+// atomic writer and `<file>.lock` while it holds a signature's lock. Each starts with the name of
+// the file it belongs to and a dot.
+const ACCOUNT_STATE_SIBLING =
+  /^(?:policy-limits\.json|remote-settings\.json|remote-settings-consent\.json|remote-settings-helper-consent)\../;
+
+// The rest of what Claude Code keeps for one account in its config dir (2.1.299). Each is on its
+// list of the entries it leaves out of a snapshot of the dir's configuration, as state:
+//
+// - Copies of the account file, which holds the signed-in account and its MCP servers:
+//   `.claude.json.backup`, and `backups/`, where Claude Code saves a copy at most once a minute
+//   and from where it offers the newest one to restore a lost `.claude.json`. Shared, that copy
+//   could be another account's. `.claude-<env>-oauth.json` is the account file under a staging,
+//   local or custom OAuth URL, and a `.config.json` beside it is the legacy one, which Claude Code
+//   reads in place of `.claude.json` when it is there.
+// - The background daemon: `daemon/` holds its control key, the roster of the sessions it runs,
+//   their tokens, and the nonce its Windows pipe is named by. On Windows a profile linking the
+//   primary's reaches the primary's daemon, which runs its sessions on the primary's sign-in;
+//   elsewhere two accounts' daemons write one roster. `daemon.lock` names the daemon's pid, which
+//   Claude Code stops when it cannot reach that daemon, and `daemon.status.json` and
+//   `daemon.scheduled.status.json` its workers. `daemon.json` holds the workers it runs: scheduled
+//   tasks (a prompt, a folder, a cron) and the folders it serves for Remote Control, each run on
+//   the daemon's own sign-in, so shared, every account would run the same tasks again on its own
+//   quota. `daemon.log` is its log. `daemon-auth-status.json` says whether the daemon's account
+//   must sign in again, and `daemon-auth-cooldown` when it may next ask. Claude Code leaves every
+//   name starting with `daemon` out of a snapshot of the dir, and so does this.
+// - `telemetry/` holds events that failed to send, stamped with the account and org. A later run
+//   of the same session sends them again, on whichever account resumed it.
+// - `.session_ingress_token` and `hfi-auth.json` hold tokens of hosted sessions.
+const ACCOUNT_DIR_STATE = [
+  ".claude.json.backup",
+  ".claude-staging-oauth.json",
+  ".claude-local-oauth.json",
+  ".claude-custom-oauth.json",
+  ".config.json",
+  "backups",
+  "daemon",
+  "daemon-auth-cooldown",
+  "daemon-auth-status.json",
+  "daemon.lock",
+  "daemon.status.json",
+  "daemon.scheduled.status.json",
+  "daemon.json",
+  "daemon.log",
+  "telemetry",
+  ".session_ingress_token",
+  "hfi-auth.json",
+] as const;
+
+// Every other copy or companion of those files: `.claude.json.backup.<ms>`, `.corrupted.<ms>`,
+// a `.bak` of the user's, and a token's temp file.
+const ACCOUNT_DIR_STATE_SIBLING =
+  /^(?:\.claude(?:-staging-oauth|-local-oauth|-custom-oauth)?\.json|\.config\.json|\.session_ingress_token)\../;
+
+// Caches and ledgers Claude Code keeps for the account it runs as (2.1.299): `cache/` (the models
+// this account was refused or served, its catalog's confidential ids, team discovery),
+// `mcp-discovery-cache/`, `stats-cache.json` (the /stats numbers, which two profiles would
+// overwrite in turn), `feedback/` (drafts queued to be sent, which could go out on another
+// account) and `active-time.json`. A profile whose copy stops following the primary's loses
+// nothing by it.
+const ACCOUNT_CACHES = ["cache", "mcp-discovery-cache", "stats-cache.json", "feedback", "active-time.json"] as const;
+
+// A temp file a save writes beside its target and renames over it, left behind when the save
+// stopped part way. Claude Code's atomic writer names it `<file>.tmp.<8 hex>` and its synchronous
+// one `<file>.tmp.<pid>.<12 hex>` (2.1.299; the two shapes it recognises as its own). The writer
+// of `.session-stats.json`, which is not Claude Code, leaves `<file>.tmp.<pid>.<ms>.<base 36>`.
+// Linked into a profile, a leftover in the primary stays there for good, and holds nothing a
+// profile reads.
+const TEMP_LEFTOVER = /^.+\.tmp\.(?:[0-9a-f]{8}|\d+\.[0-9a-f]{12}|\d+\.\d+\.[0-9a-z]+)$/;
+
+/**
+ * What a profile's link to the primary's `name` does, for the state Claude Code keeps for one
+ * account or org, each with its siblings. Nothing for the rest of the skip set: a temp file, a
+ * cache for one config dir, or session state while sessions are kept apart.
+ */
+function claudeUnsharedRisk(name: string): UnsharedRisk | undefined {
+  // A sibling is said as the file it belongs to; every file the sibling rules above match is one
+  // here, followed by a dot. A sibling of any account file is a copy of it, which Claude Code can
+  // offer to restore but never reads as the account: only the file itself acts as one.
+  // `.claude.json` itself is the profile's account file, kept apart since the first release.
+  const family = /^(?:\.claude(?:-staging-oauth|-local-oauth|-custom-oauth)?\.json|\.config\.json)\./.test(name)
+    ? ".claude.json."
+    : name.match(
+        /^(?:policy-limits\.json|remote-settings\.json|remote-settings-consent\.json|remote-settings-helper-consent|\.session_ingress_token|daemon\.log)(?=\.|$)/,
+      )?.[0];
+  switch (family ?? name) {
+    case "policy-limits.json":
+      return {
+        risk: "isolation",
+        why: "so this profile reads the primary account's org policy limits, and can apply them",
+      };
+    case "remote-settings.json":
+      return {
+        risk: "isolation",
+        why: "so this profile reads the primary account's org remote managed settings, and can apply them",
+      };
+    case "remote-settings-consent.json":
+    case "remote-settings-helper-consent":
+      return {
+        risk: "isolation",
+        why: "so this profile reads what the primary account agreed to apply from its org's remote settings",
+      };
+    case "mcp-needs-auth-cache.json":
+      return {
+        risk: "isolation",
+        why: "so this profile reads which MCP servers the primary account has to sign in to",
+      };
+    case "state":
+      return {
+        risk: "isolation",
+        why: "so this profile reads the primary account's records, such as MCP discovery verdicts",
+      };
+    case "chrome":
+      return {
+        risk: "isolation",
+        why: "so Claude in Chrome in this profile runs the native host Claude Code wrote for the primary's config dir",
+      };
+    case ".claude.json.":
+      return {
+        risk: "isolation",
+        why: "so this profile's copies of its account file are the primary account's, which Claude Code can offer to restore",
+      };
+    case "backups":
+      return {
+        risk: "isolation",
+        why: "so this profile keeps its copies of .claude.json with the primary account's, and Claude Code can offer the primary's to restore a lost one",
+      };
+    case ".claude-staging-oauth.json":
+    case ".claude-local-oauth.json":
+    case ".claude-custom-oauth.json":
+    case ".config.json":
+      return {
+        risk: "wrong_account",
+        why: "so this profile reads the primary's account file, and Claude Code runs as the primary's account",
+      };
+    case "daemon":
+      return {
+        risk: "wrong_account",
+        why: "so this profile uses the primary's daemon directory: its control key, roster and session tokens, and on Windows the primary's daemon itself, which runs on the primary's account",
+      };
+    case "daemon.lock":
+      return {
+        risk: "wrong_account",
+        why: "so this profile reads the primary's daemon lock as its own daemon's, and Claude Code here can stop the primary's daemon as this profile's",
+      };
+    case "daemon.status.json":
+    case "daemon.scheduled.status.json":
+      return {
+        risk: "isolation",
+        why: "so this profile reads the status of the primary account's daemon and its workers",
+      };
+    case "daemon.json":
+      return {
+        risk: "isolation",
+        why: "so this profile's daemon runs the primary's scheduled tasks and serves its Remote Control folders, on this account",
+      };
+    case "daemon.log":
+      return { risk: "isolation", why: "so this profile's daemon writes into the primary account's daemon log" };
+    case "daemon-auth-cooldown":
+    case "daemon-auth-status.json":
+      return {
+        risk: "isolation",
+        why: "so this profile reads whether the primary account's daemon has to sign in again",
+      };
+    case "telemetry":
+      return {
+        risk: "isolation",
+        why: "so this profile can send the primary account's queued events, on its own sign-in",
+      };
+    case ".session_ingress_token":
+    case "hfi-auth.json":
+      return { risk: "wrong_account", why: "so this profile reads the primary's session tokens" };
+    case "cache":
+      return { risk: "isolation", why: "so this profile reads the primary account's model access and catalog" };
+    case "mcp-discovery-cache":
+      return { risk: "isolation", why: "so this profile reads the primary account's MCP discovery cache" };
+    case "stats-cache.json":
+      return { risk: "isolation", why: "so this profile reads and overwrites the primary account's /stats numbers" };
+    case "feedback":
+      return {
+        risk: "isolation",
+        why: "so this profile reads the primary account's feedback drafts, and can send one on its own account",
+      };
+    case "active-time.json":
+      return { risk: "isolation", why: "so this profile reads and writes the primary account's active time" };
+    default:
+      return undefined;
+  }
+}
 
 // State keyed by session id. `jobs/` holds the background-session records that the
 // background list reads (state, respawn flags, resume target) and `teams/` holds team
@@ -633,7 +855,19 @@ export const claudeAdapter: ToolAdapter & Required<Pick<ToolAdapter, "sharedSkip
   hasKeychainCredential: hasKeychain,
   hasFallbackCredential,
   sharedSkipSet: (mergeSessions) =>
-    mergeSessions ? new Set(BASE_SHARED_LINK_SKIP) : new Set([...BASE_SHARED_LINK_SKIP, ...SESSION_SCOPED]),
+    new Set([
+      ...BASE_SHARED_LINK_SKIP,
+      ...ACCOUNT_STATE,
+      ...ACCOUNT_DIR_STATE,
+      ...ACCOUNT_CACHES,
+      ...(mergeSessions ? [] : SESSION_SCOPED),
+    ]),
+  shouldSkipName: (name) =>
+    ACCOUNT_STATE_SIBLING.test(name) ||
+    ACCOUNT_DIR_STATE_SIBLING.test(name) ||
+    name.startsWith("daemon") ||
+    TEMP_LEFTOVER.test(name),
+  unsharedRisk: claudeUnsharedRisk,
   rewritesWhole: (name) => REWRITTEN_WHOLE.has(name),
   // postSetup is left undefined here — service.ts's syncPluginsJson is wired into the
   // Claude code path explicitly because it has cross-cutting plugin marketplace state.

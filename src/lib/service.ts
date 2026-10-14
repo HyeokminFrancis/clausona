@@ -21,6 +21,7 @@ import { constants, homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 import { checkBaseUrl, hasBareUserinfo, isAnthropicHost, sendsKeyInClear } from "../core/api-url.js";
+import { claudeDaemonRunning } from "../core/claude-daemon.js";
 import { carriesCredentialToken } from "../core/credential-token.js";
 import { acquireDirLock, removeHeldDirLocks } from "../core/dir-lock.js";
 import { countIssues, evaluateApiHealth, evaluateSymlinkHealth, missingEndpointRemedy } from "../core/doctor.js";
@@ -752,6 +753,45 @@ async function refuseWhileCodexRuns(configDir: string, moving: string[], retry: 
   }
   throw new Error(
     `Codex is running in ${shown} (pid ${running.join(", ")}), and this would move files it has open: ${moving.join(", ")}. Quit Codex in this profile and stop its app-server daemon with 'CODEX_HOME=${shown} codex app-server daemon stop', then run this again. Nothing was changed. To go ahead while it runs: ${retry}`,
+  );
+}
+
+/**
+ * Refuses, unless `force`, to link `configDir` while Claude Code's background daemon runs there,
+ * when that would take out the profile's link to the primary's `daemon/`. The daemon keeps its
+ * control key, roster and session tokens in the directory the link leads to: taken out under it,
+ * the profile's next client finds none of them and cannot reach it. `retry` is the command that
+ * goes ahead anyway. A look that got no answer refuses the same: the daemon may be running. The
+ * look never goes through the link, whose far end is the primary's daemon (claudeDaemonRunning).
+ */
+async function refuseWhileClaudeDaemonRuns(
+  adapter: ToolAdapter,
+  configDir: string,
+  primarySource: string,
+  mergeSessions: boolean,
+  retry: string,
+  force = false,
+) {
+  if (force || adapter.name !== "claude") return;
+  if (!(await unsharedLinks(adapter, configDir, primarySource, mergeSessions)).includes("daemon")) return;
+  const look = await claudeDaemonRunning(configDir);
+  if (look.running === false) return;
+  const shown = configDir.replace(homedir(), "~");
+  if (look.running === null) {
+    throw new Error(
+      `The look for Claude Code's background daemon in ${shown} got no answer: its control socket neither took the connection nor refused it. This would take out the link to the primary's daemon/ a running daemon keeps its control key, roster and session tokens in. Nothing was changed. Run this again, or, with the daemon stopped in this profile, go ahead without the look: ${retry}`,
+    );
+  }
+  // PowerShell on Windows, where an assignment before a command is not a thing; quoted, with a
+  // quote in the path doubled, so the path is taken as it is. The variable is cleared after:
+  // left set, every later `claude` in that window would run as this profile, since the shell
+  // hook steps aside while CLAUDE_CONFIG_DIR is set.
+  const stop =
+    process.platform === "win32"
+      ? `in PowerShell with \`$env:CLAUDE_CONFIG_DIR='${configDir.replaceAll("'", "''")}'; claude daemon stop; Remove-Item Env:CLAUDE_CONFIG_DIR\``
+      : `with 'CLAUDE_CONFIG_DIR=${shown} claude daemon stop'`;
+  throw new Error(
+    `Claude Code's background daemon is running in ${shown}${look.pid === undefined ? "" : ` (pid ${look.pid})`}, and this would take out the link to the primary's daemon/ it keeps its control key, roster and session tokens in. Stop it ${stop}, then run this again. Nothing was changed. To go ahead while it runs: ${retry}`,
   );
 }
 
@@ -1725,6 +1765,14 @@ export async function initializeRegistry(options: {
         restoreAll: false,
       });
       await refuseWhileCodexRuns(account.configDir, moving, "clausona init --auto --force", options.force);
+      await refuseWhileClaudeDaemonRuns(
+        adapter,
+        account.configDir,
+        toolPrimary,
+        merge,
+        "clausona init --auto --force",
+        options.force,
+      );
     }
     planned.push({ account, id, backupDir, kept });
   }
@@ -1985,17 +2033,82 @@ export async function getUsageSummary(profileId_: string | null, period: UsagePe
   );
 }
 
+/** The account id an account file names; undefined where it names none, or does not parse. */
+async function accountIdIn(file: string): Promise<string | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(file, "utf8")) as { oauthAccount?: { accountUuid?: unknown } } | null;
+    const id = parsed?.oauthAccount?.accountUuid;
+    return typeof id === "string" && id !== "" ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Copies of other accounts' account files in the primary's `backups/`, one finding per account.
+ * Claude Code saves a copy of `.claude.json` there as `.claude.json.backup.<ms>`, and while a
+ * profile linked the primary's `backups/`, the profile's copies landed there too. When the
+ * primary's `.claude.json` is lost, Claude Code suggests restoring the newest copy, which could be
+ * another account's. Each is named by the profile whose account it is, or as another account's;
+ * nothing from inside the files is said. Nothing is deleted: the finding says how.
+ */
+async function foreignAccountBackups(registry: Registry, primaryId: string, configDir: string): Promise<DoctorIssue[]> {
+  const home = homedir();
+  const own = await accountIdIn(claudeJsonPathForConfigDir({ homeDir: home, configDir }));
+  if (!own) return [];
+  const dir = path.join(configDir, "backups");
+  const names = (await readdir(dir).catch(() => [] as string[])).filter((name) =>
+    name.startsWith(".claude.json.backup."),
+  );
+  if (names.length === 0) return [];
+
+  const profiles = new Map<string, string>();
+  for (const [id, other] of Object.entries(registry.profiles)) {
+    if (id === primaryId || other.tool !== "claude" || other.kind === "api" || typeof other.configDir !== "string")
+      continue;
+    const account = await accountIdIn(claudeJsonPathForConfigDir({ homeDir: home, configDir: other.configDir }));
+    if (account && account !== own && !profiles.has(account)) profiles.set(account, id);
+  }
+  // By the profile each is of, "" for another account's.
+  const byProfile = new Map<string, string[]>();
+  for (const name of names.sort()) {
+    const account = await accountIdIn(path.join(dir, name));
+    if (!account || account === own) continue;
+    const profile = profiles.get(account) ?? "";
+    byProfile.set(profile, [...(byProfile.get(profile) ?? []), name]);
+  }
+
+  const shownDir = dir.replace(home, "~");
+  return [...byProfile.entries()]
+    .sort(([a], [b]) => (a === "" ? 1 : b === "" ? -1 : a < b ? -1 : a > b ? 1 : 0))
+    .map(([profile, files]) => {
+      const copies = files.length === 1 ? "1 copy" : `${files.length} copies`;
+      // Each name quoted whole, a sync tool's "(1)" or a quote in it included: after the `~` on
+      // POSIX, so the shell still expands it; in PowerShell, where `del` takes one path, as a list.
+      const remove =
+        process.platform === "win32"
+          ? `Remove-Item -LiteralPath ${files.map((name) => `'${path.join(dir, name).replaceAll("'", "''")}'`).join(",")}`
+          : `rm ${files.map((name) => path.join(shownDir, `'${name.replaceAll("'", "'\\''")}'`)).join(" ")}`;
+      return {
+        kind: "foreign_account_backup",
+        severity: "warning",
+        // "Probably": a primary once signed in to that account keeps its own older copies of it too.
+        message: `${shownDir} holds ${copies} of ${profile ? `${profile}'s` : "another account's"} .claude.json (${files.join(", ")}), probably saved there by ${profile ? "that profile while it" : "a profile that"} linked this folder. When .claude.json is lost, Claude Code suggests restoring the newest copy here, which could put that account in place of this one. Claude Code keeps the five newest copies, so ${files.length === 1 ? "this one goes" : "these go"} once it has saved five newer ones. ${files.length === 1 ? "It" : "They"} can be deleted now: ${remove}`,
+      } satisfies DoctorIssue;
+    });
+}
+
 /**
  * doctor's finding for a profile entry linked to the primary's that the profile is to keep for
- * itself, which repair unlinks. A tool that names the only entries it shares says what the
- * link does; for the other, it is a link made before the entry joined the skip set.
+ * itself, which repair unlinks: what the link does, where the tool says, and the repair. An
+ * entry the tool says nothing about is a link made before it joined the skip set.
  */
-function unsharedLinkIssue(adapter: ToolAdapter, name: string): DoctorIssue {
+function unsharedLinkIssue(adapter: ToolAdapter, name: string, id: string): DoctorIssue {
   const risk = adapter.unsharedRisk?.(name);
   if (!risk) return { kind: "stale_symlink", message: `${name} is symlinked to primary but should not be shared` };
   return {
     kind: risk.risk === "wrong_account" ? "wrong_account_link" : "shared_account_state",
-    message: `${name} links to the primary's, ${risk.why}`,
+    message: `${name} links to the primary's, ${risk.why}. \`clausona repair ${id}\` removes the link.`,
   };
 }
 
@@ -2202,7 +2315,7 @@ export async function doctorProfiles(
           // Items in skip set should NOT be symlinked to primary. Only what repair takes out is
           // reported: not the profile's own file that a primary entry links to.
           if (!profile.isPrimary && pointsToPrimary && (await holdsNothingOfItsOwn(targetPath))) {
-            issues.push(unsharedLinkIssue(adapter, entry.name));
+            issues.push(unsharedLinkIssue(adapter, entry.name, id));
           }
           continue;
         }
@@ -2279,6 +2392,10 @@ export async function doctorProfiles(
           symlinkNeeded,
         }),
       );
+    }
+
+    if (profile.isPrimary && profile.tool === "claude" && typeof profile.configDir === "string") {
+      issues.push(...(await foreignAccountBackups(registry, id, profile.configDir)));
     }
 
     // Check plugins/ consistency for non-primary claude profiles with a real plugins/ dir
@@ -2396,6 +2513,14 @@ export async function repairProfile(id: string, options: { force?: boolean } = {
     { restoreAll: true },
   );
   await refuseWhileCodexRuns(profile.configDir, moving, `clausona repair ${id} --force`, options.force);
+  await refuseWhileClaudeDaemonRuns(
+    profileAdapter,
+    profile.configDir,
+    primarySource,
+    mergeSessions,
+    `clausona repair ${id} --force`,
+    options.force,
+  );
 
   const repaired = await setupSharedLinks(profileAdapter, profile.configDir, primarySource, mergeSessions, backupDir);
   if (profile.tool === "claude") {
@@ -2457,6 +2582,14 @@ export async function updateProfileConfig(id: string, options: { mergeSessions: 
     `clausona config ${id} ${next ? "--merge-sessions" : "--separate-sessions"} --force`,
     options.force,
   );
+  await refuseWhileClaudeDaemonRuns(
+    updateAdapter,
+    profile.configDir,
+    primarySource,
+    next,
+    `clausona config ${id} ${next ? "--merge-sessions" : "--separate-sessions"} --force`,
+    options.force,
+  );
 
   // separated → merged: merge session files before symlinking
   if (next && profile.tool === "claude") {
@@ -2474,14 +2607,16 @@ export async function updateProfileConfig(id: string, options: { mergeSessions: 
     await setupPluginsDir(profile.configDir, primarySource, backupDir);
   }
 
-  // merged → separated: restore skip-set items from backup. A tool that names the only entries
-  // it shares has just had every other one unlinked whichever way it went, as repair does.
+  // Restore skip-set items from backup, whichever way the mode went, as repair does: the session
+  // state when sessions are separated again, and either way what the profile keeps for itself
+  // in every mode and had a link to the primary's in place of until now. A tool that names the
+  // only entries it shares has just had every other one unlinked whichever way it went too.
   if (updateAdapter.sharedAllow) {
     await settleUnshared(updateAdapter, profile.configDir, primarySource, backupDir, next, unlinked, {
       restoreAll: true,
     });
-  } else if (!next) {
-    await restoreSkippedFromBackup(updateAdapter, profile.configDir, primarySource, backupDir, false);
+  } else {
+    await restoreSkippedFromBackup(updateAdapter, profile.configDir, primarySource, backupDir, next);
   }
 
   return { name: id, mergeSessions: next, changed: true };

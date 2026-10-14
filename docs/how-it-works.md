@@ -95,6 +95,8 @@ When you register a new profile, clausona symlinks shared resources from your pr
 │                            Keychain refuses them (NOT shared)
 ├── .last-update-result.json, gh-pr-status-cache.json, .session-stats.json
 │                          ← own per-dir state and caches (NOT shared)
+├── policy-limits.json, remote-settings.json, state/, daemon/, ...
+│                          ← own account and org state (NOT shared, see the list below)
 ├── projects/              ← own session history (NOT shared by default)
 ├── jobs/                  ← own background sessions (follows projects/)
 ├── teams/                 ← own team records (follows projects/)
@@ -128,9 +130,11 @@ When you register a new profile, clausona symlinks shared resources from your pr
 └── ...                    ← anything else Codex keeps here (NOT shared)
 ```
 
-For claude the principle is that credentials and session data stay profile-specific and
-everything else is shared. Codex is the other way round, because each Codex release adds state
-that belongs to one account to its home. See [What a Codex profile shares](#what-a-codex-profile-shares) below.
+For claude the principle is that credentials, session data and what Claude Code keeps for one
+account stay profile-specific and everything else is shared. See [What a Claude profile
+shares](#what-a-claude-profile-shares) below. Codex is the other way round, because each Codex
+release adds state that belongs to one account to its home. See [What a Codex profile
+shares](#what-a-codex-profile-shares) below.
 
 On Windows, shared directories use junctions. Shared files use symbolic links when Windows Developer Mode is enabled.
 Without it, a file the tool saves whole - Claude Code's `settings.json`, `CLAUDE.md` and `keybindings.json`, Codex's
@@ -212,6 +216,88 @@ to set clausona up again. `~/.clausona/backups` holds no copy of it to restore. 
 that would otherwise stop with "clausona is not initialized" prints the same line instead,
 `clausona init` refuses to replace the file while it is there, and the dashboard shows the
 line instead of opening init.
+
+### What a Claude profile shares
+
+A claude profile links every entry of the primary's `~/.claude` except the ones below. Claude
+Code 2.1.299 keeps its own list of the entries in its config directory that are state rather
+than configuration, and clausona went through it one entry at a time.
+
+| Entry | In a profile | Why |
+|---|---|---|
+| `.claude.json`, `.claude-*-oauth.json`, `.config.json`, their backups, and `backups/` | own | The signed-in account and its MCP servers. `.config.json` is the legacy name, which Claude Code reads in place of `.claude.json` when it is there. `backups/` holds copies of `.claude.json`, and Claude Code offers the newest one to restore a lost file. |
+| `.credentials.json` | own | OAuth tokens outside macOS, and on macOS when the Keychain refuses them. |
+| `policy-limits.json`, `remote-settings.json`, their `.signature.json`, `.signature-iat.json`, `.stamp.json` and `.synced-at`, `remote-settings-consent.json`, `remote-settings-helper-consent` | own | The org's policy limits and remote managed settings, stamped with the identity they were fetched for, and what this account agreed to apply. |
+| `mcp-needs-auth-cache.json` | own | The MCP servers and claude.ai connectors that need this account's sign-in. |
+| `state/` | own | Per-account records, such as MCP discovery verdicts. It also holds the one-time consents Claude Code asks for on this device (device hooks, device MCP servers, cloud plugins), so each profile asks for those once more. |
+| `chrome/` | own | The Claude in Chrome host that Claude Code writes for its config directory. |
+| `daemon/` and every other name starting with `daemon`: `daemon.json`, `daemon.lock`, `daemon.status.json`, `daemon.scheduled.status.json`, `daemon.log`, `daemon-auth-status.json`, `daemon-auth-cooldown` | own | The background daemon: its control key, the roster of the sessions it runs, its lock and status, the workers it runs, its log and its sign-in state. `daemon.json` holds the scheduled tasks and the Remote Control folders, which the daemon runs on its own account: shared, every account's daemon would run them again. On Windows a profile linking the primary's `daemon/` reaches the primary's daemon, which runs on the primary's account. |
+| `telemetry/` | own | Events that failed to send, stamped with the account and org. A later run of the same session sends them again, on whichever account resumed it. |
+| `.session_ingress_token`, `hfi-auth.json` | own | Tokens of hosted sessions. |
+| `cache/`, `mcp-discovery-cache/`, `stats-cache.json`, `feedback/`, `active-time.json` | own | Caches and ledgers of the account Claude Code runs as: the models it was refused or served, MCP discovery, the `/stats` numbers, feedback drafts waiting to be sent, active time. Shared, two profiles overwrite each other's numbers, and a draft could go out on another account. |
+| `statsig/`, `image-cache/`, `.last-update-result.json`, `gh-pr-status-cache.json`, `.session-stats.json` | own | State and caches for one config directory. |
+| `plugins/` | own directory | Each entry links to the primary's, except the two JSON files that hold paths. |
+| `projects/`, `jobs/`, `teams/` | shared with merged sessions | One session's transcript and records, kept together. |
+| `sessions/`, `todos/`, `shell-snapshots/`, `file-history/`, `history.jsonl`, `tasks/`, `session-env/`, `plans/`, `paste-cache/`, `uploads/` | shared | So a session carries across accounts. |
+| A temp file a save left behind, `<file>.tmp.<suffix>` | never linked | It holds nothing a profile reads, and a link to one would stay for good. |
+| Everything else: `settings.json`, `CLAUDE.md`, `skills/`, `agents/`, `commands/`, ... | shared | Your configuration. |
+
+Some entries on Claude Code's list stay shared, because you write them or sessions refer to them,
+or because nothing showed that sharing them does harm: `usage-data/`, `debug/`, `loop.md` and the
+like. `ide/` is shared too: Claude Code finds a running IDE through it, and reads `~/.claude/ide`
+from every profile in any case.
+
+Scheduled tasks and Remote Control set up on the primary stay with the primary, in its
+`daemon.json`. A profile sets its own, with `claude daemon scheduled add` or `claude daemon
+remote-control add` run in that profile.
+
+A scheduled task or Remote Control folder that a profile added while clausona 0.8.0-beta or earlier
+linked its `daemon.json` was saved in the primary's, and stays there. After repair it runs only on
+the primary's account, and the profile runs nothing of it, with nothing said. To move one:
+
+1. On the primary, list them with `claude daemon scheduled list` and `claude daemon remote-control
+   list`.
+2. In the profile, add the profile's own again with `claude daemon scheduled add` or `claude daemon
+   remote-control add`.
+3. On the primary, remove them with `claude daemon scheduled remove <task-id>` or `claude daemon
+   remote-control remove <name-or-dir>`.
+
+Profiles set up by clausona 0.8.0-beta or earlier link the account entries above to the primary's.
+`clausona doctor` reports each such link with what the profile reads of the primary account's
+through it: `wrong_account_link` for the account files, the daemon's directory and lock, and the
+session tokens, and `shared_account_state` for the rest. `clausona repair <profile>` takes it out.
+A copy that Claude Code has already saved in the profile is the profile's own: doctor no longer
+reports it, and repair keeps it. If an earlier repair set the profile's own copy aside to put the
+link back, repair and the session-mode toggle, either way, bring the newest one back from
+`~/.clausona/backups/claude/<profile>/`.
+
+Repair, the session-mode toggle and `clausona init` refuse to take out a profile's `daemon/` link
+while the profile's background daemon runs. The daemon keeps its control key and roster in the
+directory the link leads to, and its clients could not reach it without them. clausona finds it by
+its control socket, `/tmp/cc-daemon-<uid>/<hash>/control.sock`, where the hash is of the profile's
+config directory, as Claude Code derives it. Stop the daemon with
+`CLAUDE_CONFIG_DIR=~/.claude-<profile> claude daemon stop` and run the command again, or pass
+`--force`. The next daemon starts with the profile's own `daemon/`.
+
+clausona never looks through the link itself: what it reaches is the primary's daemon, which keeps
+its own `~/.claude/daemon/` and goes on running whatever happens to the profile's link. On Windows
+the daemon's pipe is named by `daemon/pipe.key`, which through the link is the primary's file, so
+the pipe can't say whose daemon answers it. There clausona reads the profile's own `daemon.lock`
+instead: a file of the profile's own, not a link, naming a running process. Windows soon gives a
+dead daemon's pid to another program, so that process counts only if its command line is Claude
+Code's daemon (`claude ... daemon run`), which PowerShell reads. When PowerShell can't say, it still
+counts, and `--force` goes ahead. The stop command is then given for PowerShell:
+`$env:CLAUDE_CONFIG_DIR='<profile dir>'; claude daemon stop; Remove-Item Env:CLAUDE_CONFIG_DIR`.
+It clears the variable after: left set, every later `claude` in that window would run as that
+profile.
+
+While a profile linked the primary's `backups/`, Claude Code saved that profile's copies of
+`.claude.json` there, as `.claude.json.backup.<ms>`. When the primary's `.claude.json` is lost,
+Claude Code suggests restoring the newest copy in that folder, which could be another account's.
+`clausona doctor` notes such copies on the primary as `foreign_account_backup`, a warning. It names
+the profile whose account each copy is, or says another account's, and gives the command that
+deletes them. clausona never deletes them itself. Claude Code keeps only the five newest copies, so
+they also go once the primary has saved five of its own.
 
 ### What a Codex profile shares
 
