@@ -29,7 +29,8 @@ clausona also shows how much of your accounts' 5-hour and weekly plan limits is 
 Step-by-step guides, including how to do it by hand:
 [multiple Claude Code accounts](https://larcane97.github.io/clausona/guides/multiple-claude-code-accounts/),
 [multiple Codex CLI accounts](https://larcane97.github.io/clausona/guides/multiple-codex-cli-accounts/),
-and [the same in Korean](https://larcane97.github.io/clausona/ko/).
+and [the same in Korean](https://larcane97.github.io/clausona/ko/). Another guide covers
+[the skills, MCP servers and hooks each account loads](https://larcane97.github.io/clausona/guides/claude-code-skills-mcp-hooks/).
 
 ## Why
 
@@ -407,8 +408,8 @@ shared with your main `~/.codex`, and `codex resume` shows only the active accou
 Plugins — and the MCP servers they bring — `settings.json`, skills, commands and agents do:
 they are linked to your primary config directory, so what you install under one account is
 there under every account of that tool. MCP servers added with `claude mcp add` are the
-exception: Claude Code keeps those in each config directory's `.claude.json`, next to that
-account's sign-in, and clausona does not share that file. Add them to each profile, or put
+exception: Claude Code keeps those in each config directory's own `.claude.json`, which
+clausona does not share. Add them to each profile, or put
 them in a project's `.mcp.json`. Sign-ins are never shared, and session history stays with each
 account unless you merge sessions (below).
 
