@@ -19,27 +19,54 @@ export function keychainItemFor(profileId: string): string {
   return `clausona-${profileId}`;
 }
 
-type RunResult = { code: number; stdout: string };
+/** `timedOut` when the command was ended at its limit (run()'s `limitMs`). */
+type RunResult = { code: number; stdout: string; timedOut?: true };
 
 /**
- * Kills a running child and everything it started. On POSIX the child is the sh that leads the
- * command's process group (run() starts it so, ENDS_ITS_GROUP), and the whole group is killed: the
- * command, and a `sh -c` command's own children, which would outlive the shell, among them.
- * Windows kills the tree under its pid. Only while the child is still running: once it has exited,
- * its pid can be another process's. By then the sh has sent what the command left in the group a
- * TERM.
+ * Kills a running child. On POSIX, with `group`, the child is the sh that leads the command's
+ * process group (run() starts a detached command so, ENDS_ITS_GROUP), and the whole group is
+ * killed: the command, and a `sh -c` command's own children, which would outlive the shell, among
+ * them. Without, the child keeps the terminal in clausona's own process group, so only the child
+ * is killed. Windows kills the tree under its pid. Only while the child is still running: once it
+ * has exited, its pid can be another process's. By then the sh has sent what the command left in
+ * the group a TERM.
  */
-function killRunning(child: ChildProcess): void {
+function killRunning(child: ChildProcess, group: boolean): void {
   if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
   if (process.platform === "win32") {
     spawnCommand("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" }).on("error", () => {});
     return;
   }
   try {
-    process.kill(-child.pid, "SIGKILL");
+    process.kill(group ? -child.pid : child.pid, "SIGKILL");
   } catch {
     // Gone already.
   }
+}
+
+/** How long a command interrupted at its limit has to end before it is killed. */
+const KILL_GRACE_MS = 2_000;
+
+/**
+ * Ends a command that keeps the terminal, at its limit. On POSIX it is sent SIGINT, as Ctrl-C would
+ * send: a prompt that turned the terminal's echo off for a passphrase or a PIN turns it back on
+ * when interrupted, which SIGKILL and SIGTERM leave it no chance to do. If it is still running
+ * after KILL_GRACE_MS, it is killed. Each goes to its own pid alone, since its group is clausona's,
+ * and only while it is still running. Windows kills its tree at once, as killRunning does.
+ */
+function interrupt(child: ChildProcess): void {
+  if (process.platform === "win32") {
+    killRunning(child, false);
+    return;
+  }
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    process.kill(child.pid, "SIGINT");
+  } catch {
+    return;
+  }
+  const grace = setTimeout(() => killRunning(child, false), KILL_GRACE_MS);
+  child.once("exit", () => clearTimeout(grace));
 }
 
 /** The signals that end clausona from outside: Ctrl-C, a kill, a terminal closing. */
@@ -49,7 +76,7 @@ const ENDING_SIGNALS: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"
 const detachedChildren = new Set<ChildProcess>();
 
 const killDetached = () => {
-  for (const child of detachedChildren) killRunning(child);
+  for (const child of detachedChildren) killRunning(child, true);
 };
 
 /**
@@ -128,15 +155,40 @@ function onAbort(signal: AbortSignal, stop: () => void): () => void {
 const ENDS_ITS_GROUP = '"$@"; s=$?; trap "" TERM; kill -TERM 0 2>/dev/null; exit $s';
 
 /**
- * Runs `command` and resolves to its exit code and stdout. With a `signal`, the command starts
- * in a process group of its own, with no terminal, under an sh that ends what the command left
- * running in the group once it exits (ENDS_ITS_GROUP). Once the signal aborts, the group is
- * killed, if the sh is still running; the result is a failure at once, not when the output
- * closes, which a process left behind could still hold open: one that ignores TERM, or one outside
- * the group. Until then, clausona ending ends it too (endWithClausona). On Windows the command
- * starts in no group of its own, and what it leaves running when it exits keeps running.
+ * How long the output is still read once the command has exited. Normally it closes as the command
+ * exits; a job the command left running can hold it open for as long as the job runs.
  */
-function run(command: string, args: string[], input?: string, signal?: AbortSignal): Promise<RunResult> {
+const DRAIN_MS = 200;
+
+type RunOptions = {
+  /** Written to the command's stdin, which is otherwise not open. */
+  input?: string;
+  /** Bounds the run, the command started in a process group of its own for it. */
+  signal?: AbortSignal;
+  /**
+   * How long a command that keeps the terminal may run: past it, the command itself is ended
+   * (interrupt), if it is still running, and the result says so at once.
+   */
+  limitMs?: number;
+};
+
+/**
+ * Runs `command` and resolves to its exit code and stdout, once the command has exited: what it
+ * wrote is read for a short drain after that (DRAIN_MS), then taken, whether or not the output has
+ * closed, so a job it left running does not hold the result up.
+ *
+ * With a `signal`, the command starts in a process group of its own, with no terminal, under an sh
+ * that ends what the command left running in the group once it exits (ENDS_ITS_GROUP). Once the
+ * signal aborts, the group is killed, if the sh is still running; the result is a failure at once.
+ * Until then, clausona ending ends it too (endWithClausona). On Windows the command starts in no
+ * group of its own, and what it leaves running when it exits keeps running.
+ *
+ * Without one, the command keeps the terminal, in clausona's own process group, where it can ask
+ * for a PIN or a passphrase, and Ctrl-C stops it with clausona. What it leaves running when it
+ * exits keeps running: nothing can end it alone without its pid, which the command never gives.
+ */
+function run(command: string, args: string[], options: RunOptions = {}): Promise<RunResult> {
+  const { input, signal, limitMs } = options;
   return new Promise((resolve) => {
     if (signal?.aborted) {
       resolve({ code: 1, stdout: "" });
@@ -150,21 +202,50 @@ function run(command: string, args: string[], input?: string, signal?: AbortSign
     const release = detached ? endWithClausona(child) : () => {};
     let out = "";
     let settled = false;
+    let drain: NodeJS.Timeout | undefined;
     const finish = (result: RunResult) => {
       if (settled) return;
       settled = true;
+      clearTimeout(limit);
+      clearTimeout(drain);
       forget();
       release();
       resolve(result);
     };
-    const stop = () => {
-      killRunning(child);
+    /** Ends the run before the command has, once the command has been told to end: no key is read. */
+    const stop = (result: RunResult) => {
       child.stdout?.destroy();
-      finish({ code: 1, stdout: "" });
+      finish(result);
     };
-    const forget = signal ? onAbort(signal, stop) : () => {};
+    const forget = signal
+      ? onAbort(signal, () => {
+          killRunning(child, detached);
+          stop({ code: 1, stdout: "" });
+        })
+      : () => {};
+    const limit =
+      limitMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            interrupt(child);
+            stop({ code: 1, stdout: "", timedOut: true });
+          }, limitMs);
     child.stdout?.on("data", (chunk) => {
       out += chunk;
+    });
+    child.on("exit", (code) => {
+      if (settled) return;
+      clearTimeout(limit);
+      // A turn of the event loop after the timer reads what is already in the pipe, however late
+      // the timer ran.
+      drain = setTimeout(
+        () =>
+          setImmediate(() => {
+            child.stdout?.destroy();
+            finish({ code: code ?? 1, stdout: out });
+          }),
+        DRAIN_MS,
+      );
     });
     child.on("close", (code) => finish({ code: code ?? 1, stdout: out }));
     child.on("error", () => finish({ code: 1, stdout: "" }));
@@ -299,7 +380,7 @@ export async function writeKeychainItem(item: KeychainItem, value: string): Prom
   const line = addGenericPasswordLine(item, hex);
   const { code } =
     Buffer.byteLength(line) <= SECURITY_MAX_LINE
-      ? await run("security", ["-i"], `${line}\n`)
+      ? await run("security", ["-i"], { input: `${line}\n` })
       : await run("security", ["add-generic-password", "-U", "-s", item.service, "-a", item.account, "-X", hex]);
   if (code !== 0) throw new Error(`could not write Keychain item '${item.service}'`);
 
@@ -349,12 +430,9 @@ async function readStoredSecret(
   signal?: AbortSignal,
 ): Promise<string | null> {
   if ((backend ?? detectBackend()) === "keychain") {
-    const { code, stdout } = await run(
-      "security",
-      ["find-generic-password", "-s", keychainItemFor(profileId), "-w"],
-      undefined,
+    const { code, stdout } = await run("security", ["find-generic-password", "-s", keychainItemFor(profileId), "-w"], {
       signal,
-    );
+    });
     return code === 0 && stdout.trim() !== "" ? stdout.trim() : null;
   }
   const values = await readSecretsFile();
@@ -373,15 +451,17 @@ async function readStoredSecret(
  * key in that slot.
  *
  * `signal` bounds a key that a command or the Keychain gives: once it aborts, what was started
- * for it is killed, and the key is not read.
+ * for it is killed, and the key is not read. Without one, a key command keeps the terminal, where
+ * it can prompt, and `limitMs` bounds it instead: past it, the command itself is interrupted, and
+ * killed if it goes on running (interrupt), and the key is not read.
  */
 export async function resolveSecret(
   profileId: string,
   source: SecretSource,
   backend?: SecretBackend,
-  options: { signal?: AbortSignal } = {},
+  options: { signal?: AbortSignal; limitMs?: number } = {},
 ): Promise<string> {
-  const { signal } = options;
+  const { signal, limitMs } = options;
   // A hand edit can leave anything in the slot, or nothing. Doctor calls such a source unknown
   // and never resolves it, so launch does not read the store for it either: a profile would
   // otherwise work while doctor reported it broken. Not quoted, since it can hold anything.
@@ -412,12 +492,13 @@ export async function resolveSecret(
   if (source.source === "command") {
     const shell = process.platform === "win32" ? "powershell" : "/bin/sh";
     const args = process.platform === "win32" ? ["-NoProfile", "-Command", source.run] : ["-c", source.run];
-    const { code, stdout } = await run(shell, args, undefined, signal);
+    const { code, stdout, timedOut } = await run(shell, args, { signal, limitMs });
     if (signal?.aborted) throw new Error("the key was not read in time");
     // The command line is not quoted, so the message says where it is instead - profiles.json,
     // the one place it is shown - and what replaces it. Not `config --edit`: that opens the
     // env map, and the command lives in the endpoint block.
     const remedy = `run it yourself to see why - it is in ~/.clausona/profiles.json - or replace it with 'clausona config ${profileId} --key-from command:"<command>"'`;
+    if (timedOut) throw new Error(`secret command did not finish in ${(limitMs ?? 0) / 1000} s - ${remedy}`);
     if (code !== 0) throw new Error(`secret command exited with ${code} - ${remedy}`);
     const first = stdout.split(/\r?\n/)[0]?.trim() ?? "";
     if (first === "") throw new Error(`secret command produced no output - ${remedy}`);
