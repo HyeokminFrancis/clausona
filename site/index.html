@@ -70,7 +70,7 @@
         "name": "Does clausona switch accounts when one reaches its limit?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "No. You choose the account a terminal uses. clausona shows how much of your accounts' limits is left."
+          "text": "A running session never moves to another account. With a route, clausona picks the account when a run starts. clausona run --route main gets one that still has quota left. clausona use and clausona run <profile> leave the choice to you. Keep the accounts to what they're for, such as work and personal use, within Anthropic's and OpenAI's terms."
         }
       },
       {
@@ -86,7 +86,7 @@
         "name": "What does clausona send over the network?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "clausona has no server and no telemetry. It reads an account's plan usage from that account's provider, and it renews a lapsed sign-in token when it has to. The dashboard also asks GitHub whether a newer clausona release is out."
+          "text": "clausona has no server and no telemetry. It reads an account's plan usage, or an API profile's spend, from that account's provider, and it renews a lapsed sign-in token when it has to. The dashboard also asks GitHub whether a newer clausona release is out."
         }
       }
     ]
@@ -247,7 +247,7 @@
           </div>
           <div>
             <dt>When clausona itself runs</dt>
-            <dd>Only after you change something, such as <code>csn use</code> or a plugin install. Starting clausona takes about a third of a second. That's why ordinary launches skip it.</dd>
+            <dd>Starting clausona takes about a third of a second, so a plain <code>claude</code> or <code>codex</code> launch skips it. It runs on the first launch after you change something, such as <code>csn use</code> or a plugin install, and on every launch of an API profile. <code>clausona run</code> starts it every time, routed or not.</dd>
           </div>
           <div>
             <dt>What it installs</dt>
@@ -328,6 +328,14 @@ claude --continue    <span class="c"># the latest conversation in this folder</s
             <dd><code>clausona list</code> and the dashboard show your 5-hour and weekly limits side by side, with the time left until they reset.</dd>
           </div>
           <div>
+            <dt>Routing</dt>
+            <dd><code>clausona run --route main</code> starts on an account in the <a href="https://github.com/larcane97/clausona/blob/main/docs/routing.md">route</a> that still has quota left, and says which one it got.</dd>
+          </div>
+          <div>
+            <dt>Extensions</dt>
+            <dd>The <a href="https://github.com/larcane97/clausona/blob/main/docs/extensions.md">Extensions screen</a> shows the skills, MCP servers and hooks each account loads in a project. You can turn one off or delete it, and undo the last change.</dd>
+          </div>
+          <div>
             <dt>API profiles</dt>
             <dd>A Claude Code profile can use the Anthropic API, a gateway such as OpenRouter, or a model you serve yourself. It switches like any account.</dd>
           </div>
@@ -370,11 +378,11 @@ claude --continue    <span class="c"># the latest conversation in this folder</s
         <h3>Is my sign-in shared between accounts?</h3>
         <p>No. Credentials stay with their account. MCP servers added with <code>claude mcp add</code> live next to the sign-in, so they stay with the account too.</p>
         <h3>Does clausona switch accounts when one reaches its limit?</h3>
-        <p>No. You choose the account a terminal uses. clausona shows how much of your accounts' limits is left.</p>
+        <p>A running session never moves to another account. With <a href="https://github.com/larcane97/clausona/blob/main/docs/routing.md">a route</a>, clausona picks the account when a run starts. <code>clausona run --route main</code> gets one that still has quota left. <code>clausona use</code> and <code>clausona run &lt;profile&gt;</code> leave the choice to you. Keep the accounts to what they're for, such as work and personal use, within Anthropic's and OpenAI's terms.</p>
         <h3>Does it proxy or modify claude and codex?</h3>
         <p>No. The real binaries run unmodified, with the account's config directory set for that one run. If you set <code>CLAUDE_CONFIG_DIR</code> or <code>CODEX_HOME</code> yourself, clausona steps aside in that shell.</p>
         <h3>What does clausona send over the network?</h3>
-        <p>clausona has no server and no telemetry. It reads an account's plan usage from that account's provider, and it renews a lapsed sign-in token when it has to. The dashboard also asks GitHub whether a newer clausona release is out.</p>
+        <p>clausona has no server and no telemetry. It reads an account's plan usage, or an API profile's spend, from that account's provider, and it renews a lapsed sign-in token when it has to. The dashboard also asks GitHub whether a newer clausona release is out.</p>
       </div>
     </section>
   </main>
