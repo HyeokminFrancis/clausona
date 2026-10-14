@@ -1,10 +1,11 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { getEventListeners } from "node:events";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildSync } from "esbuild";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 import { SPAWN_TIMEOUT_MS, SPAWNING_TEST_TIMEOUT_MS } from "../test-timeouts.js";
 import type { SecretSource } from "../types.js";
@@ -476,26 +477,28 @@ describe("resolveSecret", () => {
   );
 
   /**
-   * doctor's check: a key command that keeps the terminal, run with a limit of 60 s on a fake clock,
-   * which is moved on once the command has written its pid. `run` writes it, and `check` is given
-   * the read, the pid, the signals sent so far and a way to wait on the real clock for it to end.
-   * The test's own bound, on the real clock, fails a read that goes on past the limit rather than
-   * hanging. Whatever happens, the command does not outlive the test: the fake clock is moved past
-   * the limit and its grace, and then the pid, if it is still running, is killed.
+   * doctor's check: a key read with a limit of 60 s on a fake clock, which is moved on once the
+   * command `start` runs has written its pids to $CLAUSONA_TEST_PIDS, one a line, `count` of them,
+   * its own first. `check` is given the read, the pids, the signals sent so far and a way to wait
+   * on the real clock for every pid to end. The test's own bound, on the real clock, fails a read
+   * that goes on past the limit rather than hanging. Whatever happens, nothing the command started
+   * outlives the test: the fake clock is moved past the limit and its grace, and then each pid it
+   * wrote that is still running, and was not seen to end, is killed.
    */
   async function atLimit(
-    run: string,
+    start: () => Promise<string>,
     check: (at: {
       read: Promise<string>;
-      pid: number;
+      pids: number[];
       signals: () => unknown[];
       gone: () => Promise<boolean>;
     }) => Promise<void>,
+    count = 1,
   ) {
     const dir = mkdtempSync(path.join(tmpdir(), "clausona-key-command-"));
     temps.push(dir);
-    const pids = path.join(dir, "pids");
-    vi.stubEnv("CLAUSONA_TEST_PIDS", pids);
+    const file = path.join(dir, "pids");
+    vi.stubEnv("CLAUSONA_TEST_PIDS", file);
     const alive = (pid: number) => {
       try {
         process.kill(pid, 0);
@@ -506,9 +509,13 @@ describe("resolveSecret", () => {
     };
     const written = () => {
       try {
-        return Number(readFileSync(pids, "utf8").trim());
+        return readFileSync(file, "utf8")
+          .trim()
+          .split("\n")
+          .map(Number)
+          .filter((pid) => pid > 0);
       } catch {
-        return 0;
+        return [];
       }
     };
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -520,20 +527,20 @@ describe("resolveSecret", () => {
     const kill = vi.spyOn(process, "kill");
     let ended = false;
     try {
-      const read = resolveSecret("claude:x", { source: "command", run }, undefined, { limitMs: 60_000 });
+      const read = start();
       const started = Date.now();
-      while (written() === 0 && Date.now() - started < 20_000) await sleep(50);
-      const pid = written();
-      expect(pid).toBeGreaterThan(0);
+      while (written().length < count && Date.now() - started < 20_000) await sleep(50);
+      const pids = written();
+      expect(pids).toHaveLength(count);
       await check({
         read: Promise.race([read, waited]),
-        pid,
+        pids,
         // Only what was sent: alive() checks with 0.
         signals: () => kill.mock.calls.filter(([, signal]) => signal !== 0),
         gone: async () => {
           const since = Date.now();
-          while (alive(pid) && Date.now() - since < 10_000) await sleep(50);
-          ended = !alive(pid);
+          while (pids.some(alive) && Date.now() - since < 10_000) await sleep(50);
+          ended = !pids.some(alive);
           return ended;
         },
       });
@@ -542,20 +549,24 @@ describe("resolveSecret", () => {
       vi.advanceTimersByTime(60_000 + 2_000);
       kill.mockRestore();
       vi.useRealTimers();
-      // The command is this test's own, by the pid it wrote, and was not seen to end.
-      const pid = written();
-      if (!ended && pid > 0 && alive(pid)) process.kill(pid, "SIGKILL");
+      // What the command started is this test's own, by the pids it wrote, and was not seen to end.
+      if (!ended) for (const pid of written()) if (alive(pid)) process.kill(pid, "SIGKILL");
     }
   }
 
+  /** A key command's read as `clausona doctor` makes it. */
+  const doctorRead = (run: string) => () =>
+    resolveSecret("claude:x", { source: "command", run }, undefined, { limitMs: 60_000 });
+
   // At doctor's limit the command is interrupted, as Ctrl-C would, so a prompt can turn the
-  // terminal's echo back on: its own pid alone (its group is clausona's), and the key is not read.
+  // terminal's echo back on: never its group, which is clausona's, and the key is not read.
   it.skipIf(windows)(
     "interrupts a key command that keeps the terminal once its limit passes, and sends nothing once it has ended",
     { timeout: SPAWNING_TEST_TIMEOUT_MS },
     async () => {
       // Its own pid, which exec hands on to the sleep; SIGINT ends it.
-      await atLimit('echo $$ > "$CLAUSONA_TEST_PIDS"; exec sleep 600', async ({ read, pid, signals, gone }) => {
+      const run = 'echo $$ > "$CLAUSONA_TEST_PIDS"; exec sleep 600';
+      await atLimit(doctorRead(run), async ({ read, pids: [pid], signals, gone }) => {
         vi.advanceTimersByTime(60_000);
         await expect(read).rejects.toThrow(/^secret command did not finish in 60 s - /);
         expect(signals()).toEqual([[pid, "SIGINT"]]);
@@ -573,7 +584,7 @@ describe("resolveSecret", () => {
     async () => {
       // One that ignores SIGINT, its pid written once it does.
       const run = 'trap "" INT; echo $$ > "$CLAUSONA_TEST_PIDS"; exec sleep 600';
-      await atLimit(run, async ({ read, pid, signals, gone }) => {
+      await atLimit(doctorRead(run), async ({ read, pids: [pid], signals, gone }) => {
         vi.advanceTimersByTime(60_000);
         await expect(read).rejects.toThrow(/^secret command did not finish in 60 s - /);
         expect(signals()).toEqual([[pid, "SIGINT"]]);
@@ -586,6 +597,210 @@ describe("resolveSecret", () => {
         ]);
         expect(await gone()).toBe(true);
       });
+    },
+  );
+
+  // A command that is not a single program - a pipeline, `cmd1; cmd2` - leaves its children in
+  // clausona's own group, holding the prompt. At the limit they are ended with it, one by one.
+  it.skipIf(windows)(
+    "ends what a key command started along with it once its limit passes",
+    { timeout: SPAWNING_TEST_TIMEOUT_MS },
+    async () => {
+      // The shell, then the child it waits on; the `:` after it keeps the shell from exec'ing it.
+      const run = 'echo $$ > "$CLAUSONA_TEST_PIDS"; sh -c \'echo $$ >> "$CLAUSONA_TEST_PIDS"; exec sleep 600\'; :';
+      await atLimit(
+        doctorRead(run),
+        async ({ read, pids: [shell, child], signals, gone }) => {
+          vi.advanceTimersByTime(60_000);
+          await expect(read).rejects.toThrow(/^secret command did not finish in 60 s - /);
+          expect(signals()).toEqual(
+            expect.arrayContaining([
+              [shell, "SIGINT"],
+              [child, "SIGINT"],
+            ]),
+          );
+          // A shell can hold off SIGINT until its child has ended; its grace ends it then.
+          vi.advanceTimersByTime(2_000);
+          expect(await gone()).toBe(true);
+          // Every signal went to one of them, and none to a group.
+          for (const [pid] of signals() as Array<[number, string]>) expect([shell, child]).toContain(pid);
+        },
+        2,
+      );
+    },
+  );
+
+  // The Keychain read waits on macOS's own dialog asking whether clausona may read the key; left
+  // unanswered, doctor ends it at its limit. A stand-in `security` stands in for one never answered.
+  it.skipIf(windows)(
+    "ends a Keychain read that has not answered once doctor's limit passes",
+    { timeout: SPAWNING_TEST_TIMEOUT_MS },
+    async () => {
+      const bin = mkdtempSync(path.join(tmpdir(), "clausona-security-stand-in-"));
+      temps.push(bin);
+      writeFileSync(path.join(bin, "security"), '#!/bin/sh\necho $$ > "$CLAUSONA_TEST_PIDS"\nexec sleep 600\n', {
+        mode: 0o755,
+      });
+      vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH ?? ""}`);
+      const read = () => resolveSecret("claude:x", { source: "keychain" }, "keychain", { limitMs: 60_000 });
+      await atLimit(read, async ({ read, pids: [pid], signals, gone }) => {
+        vi.advanceTimersByTime(60_000);
+        await expect(read).rejects.toThrow(/^the Keychain did not answer in 60 s - /);
+        expect(signals()).toEqual([[pid, "SIGINT"]]);
+        expect(await gone()).toBe(true);
+      });
+    },
+  );
+
+  // The Health check screen holds the terminal in raw mode: a key command there runs in a group of
+  // its own with no terminal, as a spend read does, and one that needs the terminal fails at once.
+  it.skipIf(windows)(
+    "reads a key without the terminal for the dashboard, and says to check one that prompts with doctor",
+    { timeout: SPAWNING_TEST_TIMEOUT_MS },
+    async () => {
+      const own = execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8" }).trim();
+      const options = { limitMs: 60_000, terminal: false };
+      // Bounded here, so that a read that waits on the terminal fails rather than hangs.
+      const unbound = new AbortController();
+      const waited = sleep(SPAWN_TIMEOUT_MS, undefined, { signal: unbound.signal }).then(() => {
+        throw new Error("the read waited on the terminal");
+      });
+      waited.catch(() => {});
+      try {
+        const group = await Promise.race([
+          resolveSecret("claude:x", { source: "command", run: "ps -o pgid= -p $$" }, undefined, options),
+          waited,
+        ]);
+        expect(group).not.toBe(own);
+        const prompt = 'printf "PIN: " > /dev/tty; read v < /dev/tty; echo "$v"';
+        await expect(
+          Promise.race([resolveSecret("claude:x", { source: "command", run: prompt }, undefined, options), waited]),
+        ).rejects.toThrow(
+          /^secret command .* - it ran without a terminal here, so if it asks for a PIN or a passphrase, run 'clausona doctor' to check it$/,
+        );
+      } finally {
+        unbound.abort();
+      }
+    },
+  );
+
+  /**
+   * The real resolveSecret in a node of its own, bundled once for every test that uses it, whose
+   * stderr this test reads: what a key command writes to stderr, passed through, can only be seen
+   * from outside the process that ran it. It reads the command from $CLAUSONA_TEST_RUN and
+   * resolveSecret's options from $CLAUSONA_TEST_OPTIONS, and prints `key:<key>` or
+   * `error:<message>`. Its stderr is a pipe, which `tty` has it take for a terminal, as clausona's
+   * is when a person runs it. Its directory is not one of `temps`, which go after each test, but
+   * goes once they are all done.
+   */
+  let harnessDir: string | undefined;
+  let bundled: string | undefined;
+  afterAll(() => {
+    if (harnessDir) rmSync(harnessDir, { recursive: true, force: true });
+    harnessDir = undefined;
+    bundled = undefined;
+  });
+  function inNode(
+    run: string,
+    options: object,
+    { tty = false }: { tty?: boolean } = {},
+  ): { stdout: string; stderr: string; error?: Error } {
+    if (!bundled) {
+      const dir = mkdtempSync(path.join(tmpdir(), "clausona-key-harness-"));
+      harnessDir = dir;
+      const entry = path.join(dir, "harness.ts");
+      writeFileSync(
+        entry,
+        [
+          `import { resolveSecret } from ${JSON.stringify(path.join(import.meta.dirname, "secrets.ts"))};`,
+          'if (process.env.CLAUSONA_TEST_STDERR_TTY === "1") Object.defineProperty(process.stderr, "isTTY", { value: true });',
+          'const options = JSON.parse(process.env.CLAUSONA_TEST_OPTIONS ?? "{}");',
+          'resolveSecret("claude:x", { source: "command", run: process.env.CLAUSONA_TEST_RUN ?? "" }, undefined, options).then(',
+          '  (key) => process.stdout.write("key:" + key),',
+          '  (error) => process.stdout.write("error:" + error.message),',
+          ");",
+        ].join("\n"),
+      );
+      bundled = path.join(dir, "harness.mjs");
+      buildSync({
+        entryPoints: [entry],
+        bundle: true,
+        platform: "node",
+        format: "esm",
+        outfile: bundled,
+        logLevel: "silent",
+      });
+    }
+    // Bounded, as spawnSync waits for its pipes to close as well as for the node to exit.
+    const ran = spawnSync(process.execPath, [bundled], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CLAUSONA_TEST_RUN: run,
+        CLAUSONA_TEST_OPTIONS: JSON.stringify(options),
+        CLAUSONA_TEST_STDERR_TTY: tty ? "1" : "",
+      },
+      timeout: SPAWN_TIMEOUT_MS,
+    });
+    return { stdout: ran.stdout, stderr: ran.stderr, ...(ran.error ? { error: ran.error } : {}) };
+  }
+
+  // A tool that prompts or reports on stderr: at a launch and in `clausona doctor` it reaches the
+  // terminal, as git's credential helpers' does; the dashboard and a spend read keep it out, and so
+  // does a stderr that is not a terminal.
+  it.skipIf(windows)(
+    "passes a key command's stderr through to a terminal where it keeps the terminal, and nowhere else",
+    { timeout: SPAWNING_TEST_TIMEOUT_MS },
+    () => {
+      const run = "echo stderr-marker >&2; echo KEY";
+      const launch = inNode(run, {}, { tty: true });
+      expect(launch.stdout).toBe("key:KEY");
+      expect(launch.stderr).toContain("stderr-marker");
+      expect(inNode(run, { limitMs: 60_000 }, { tty: true }).stderr).toContain("stderr-marker");
+      const dashboard = inNode(run, { limitMs: 60_000, terminal: false }, { tty: true });
+      expect(dashboard.stdout).toBe("key:KEY");
+      expect(dashboard.stderr).not.toContain("stderr-marker");
+      const piped = inNode(run, {});
+      expect(piped.stdout).toBe("key:KEY");
+      expect(piped.stderr).not.toContain("stderr-marker");
+    },
+  );
+
+  // A job the key command leaves running keeps the stderr it was given. Where clausona's own is a
+  // pipe read to its end - the Windows hook's `2>&1`, a `| tee` - the reader would wait out the job,
+  // as it waited for stdout before the key was read on exit.
+  it.skipIf(windows)(
+    "lets no job a key command left hold clausona's stderr when it is not a terminal",
+    { timeout: SPAWNING_TEST_TIMEOUT_MS },
+    () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "clausona-key-command-"));
+      temps.push(dir);
+      const pids = path.join(dir, "pids");
+      vi.stubEnv("CLAUSONA_TEST_PIDS", pids);
+      const alive = (pid: number) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      try {
+        const ran = inNode('sleep 600 & echo $! > "$CLAUSONA_TEST_PIDS"; echo KEY', {});
+        // Its stderr closed with the node: spawnSync did not wait out its bound for the job.
+        expect(ran.error).toBeUndefined();
+        expect(ran.stdout).toBe("key:KEY");
+      } finally {
+        // The job is this test's own, by the pid it wrote, and is left running at a launch.
+        const job = (() => {
+          try {
+            return Number(readFileSync(pids, "utf8").trim());
+          } catch {
+            return 0;
+          }
+        })();
+        if (job > 0 && alive(job)) process.kill(job, "SIGKILL");
+      }
     },
   );
 });
