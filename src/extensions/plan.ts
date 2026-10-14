@@ -15,6 +15,7 @@ import {
   NO_PROJECT_KEYS,
   ONE_ACCOUNT_KEYS,
   ownValue,
+  PARENT_EVERYWHERE_REASON,
   type Reach,
   type Refusal,
   type RefusalCode,
@@ -39,7 +40,9 @@ import {
   CODEX_REFUSED_KEY,
   claudeFlag,
   claudeSkillOverride,
+  codexNearest,
   codexTrusted,
+  codexTrustFolder,
   codexWorktreeRuns,
   isManagedSetting,
   isMcpjsonServer,
@@ -70,6 +73,12 @@ export type PlanLine = {
   account?: string;
   /** "link only, target kept", "changes the repo". */
   note?: string;
+  /**
+   * Show `note` on a line of its own under the change, as `runs` is: a sentence that ends in the
+   * file to fix ("stays off in this project until Codex can read …"), which the note column would
+   * cut first. JSON has it in `note` all the same.
+   */
+  noteBelow?: true;
   tracked: boolean;
   /** Row keys. */
   rows: string[];
@@ -274,9 +283,25 @@ function chosenIn(run: Run, profile: string | undefined): boolean {
 
 /** The refusal `unreadable` when the inventory could not read `file`, the one this row changes. */
 function unreadableAt(run: Run, row: ScopeRow, file: string): Outcome | undefined {
+  // A project's config.toml Codex refuses for a value of the wrong type clausona reads and edits.
+  if (run.inv.facts.codexConfigRefused.some((r) => r.readable && r.project !== undefined && samePath(r.file, file))) {
+    return undefined;
+  }
   return run.inv.warnings.some((warning) => samePath(warning.file, file))
     ? refused(run, row, "unreadable", { "~file": tilde(file, run.inv.homeDir) })
     : undefined;
+}
+
+/**
+ * The note a Codex change in `project` gets where Codex refuses the project's config.toml, which
+ * keeps every Codex row off there whatever the change: "stays off in this project until Codex can
+ * read ~/repos/app/.codex/config.toml". Undefined where Codex reads it.
+ */
+function refusedNote(run: Run, project: string | undefined): string | undefined {
+  if (project === undefined) return undefined;
+  const refusal = run.inv.facts.codexConfigRefused.find((r) => r.project !== undefined && samePath(r.project, project));
+  if (refusal === undefined) return undefined;
+  return `stays off ${whereFor(run.ctx, "here", project)} until Codex can read ${tilde(refusal.file, run.inv.homeDir)}`;
 }
 
 const knownFiles = new WeakMap<Inventory, Set<string>>();
@@ -322,6 +347,7 @@ function lineFor(
     create?: boolean;
     account?: string | undefined;
     note?: string | undefined;
+    noteBelow?: boolean;
   } = {},
 ): PlanLine {
   return {
@@ -330,6 +356,7 @@ function lineFor(
     what,
     ...(more.account !== undefined ? { account: more.account } : {}),
     ...(more.note !== undefined ? { note: more.note } : {}),
+    ...(more.note !== undefined && more.noteBelow === true ? { noteBelow: true as const } : {}),
     tracked: false,
     rows: [row.key],
   };
@@ -372,8 +399,11 @@ function tomlChange(
   expect: Expect[],
   what: string,
   create: boolean,
+  /** Where Codex refuses the project's config.toml: that the row stays off there, under the line. */
+  note?: string,
 ): FileChange {
-  return { kind: "toml", file, edits, expect, create, lines: [lineFor(run, row, file, what, { create })] };
+  const line = lineFor(run, row, file, what, { create, note, noteBelow: true });
+  return { kind: "toml", file, edits, expect, create, lines: [line] };
 }
 
 function removal(
@@ -455,7 +485,7 @@ function planRow(run: Run, row: ScopeRow): Outcome {
   // Deleting what clausona kept writes nothing under the worktree's .codex folder.
   const runs = codexWorktreeRuns(run.inv, item);
   if (runs !== undefined && !(verb === "rm" && item.stashed)) {
-    if (!codexTrusted(run.inv, loc.project)) return refused(run, row, "codex-untrusted");
+    if (!codexTrusted(run.inv, codexTrustFolder(item))) return refused(run, row, "codex-untrusted");
     return refused(run, row, "codex-worktree-hook", { "~file": tilde(runs, run.inv.homeDir) });
   }
   // A hook in a config.toml: clausona keeps hooks it takes out as JSON, and changes no TOML hook.
@@ -576,6 +606,8 @@ function planCodexSkill(run: Run, row: ScopeRow): Outcome {
   const where = whereFor(run.ctx, reach, seen);
   const out = outcome(seen);
   const label = "name" in selector ? selector.name : tilde(selector.path, inv.homeDir);
+  // Where Codex refuses the project's config.toml, the skill stays off there whatever this writes.
+  const refusal = refusedNote(run, here ? seen : run.ctx.project);
   const write = (enabled: boolean | null): Outcome =>
     adding(
       out,
@@ -587,6 +619,7 @@ function planCodexSkill(run: Run, row: ScopeRow): Outcome {
         [{ type: "skill-config", selector, enabled: entry?.enabled ?? null }],
         enabled === null ? `skills.config ${label} removed` : `skills.config ${label} → ${enabled ? "on" : "off"}`,
         true,
+        refusal,
       ),
     );
   if (verb === "off") {
@@ -602,12 +635,21 @@ function planCodexSkill(run: Run, row: ScopeRow): Outcome {
     }
     return byName?.enabled === false ? write(null) : unchanged(out, row, "not off in Codex's config.toml");
   }
-  if (stateHere(inv, item, run.ctx.project).value !== "off") return unchanged(out, row, `already on ${where}`);
+  // With the config refused, what the entries say: a path entry, else the name entry.
+  const switchedOff = refusal !== undefined ? (entry ?? byName)?.enabled === false : undefined;
+  if (switchedOff === false) return unchanged(out, row, refusal ?? "");
+  if (switchedOff === undefined && stateHere(inv, item, run.ctx.project).value !== "off") {
+    return unchanged(out, row, `already on ${where}`);
+  }
   // A path entry wins over a name one: it goes, unless the name entry would then turn it off.
   return write(entry !== undefined && byName?.enabled !== false ? null : true);
 }
 
-/** The other skill that is the folder this copy is, through a link, and is not in the action. */
+/**
+ * The other skill that is the folder this copy is, through a link, and is not in the action. A
+ * row listed at this very path is no such other: it is this folder as a project below reads it
+ * (Parent folders), which the one removal takes away too.
+ */
 function sameFolder(run: Run, copy: Extension): Extension | undefined {
   const key = folderKey(copy);
   const real = copy.realFolder ?? copy.location.file;
@@ -615,6 +657,7 @@ function sameFolder(run: Run, copy: Extension): Extension | undefined {
     (other) =>
       other.kind === "skill" &&
       other.id !== copy.id &&
+      !samePath(other.location.file, copy.location.file) &&
       !other.link?.broken &&
       !run.inAction.has(other.id) &&
       (folderKey(other) === key || samePath(other.link?.target, real)),
@@ -1204,7 +1247,7 @@ function planCodexMcp(run: Run, row: ScopeRow): Outcome {
         false,
       ),
     );
-  const write = (out: Outcome, file: string, enabled: boolean | null, create: boolean): Outcome => {
+  const write = (out: Outcome, file: string, enabled: boolean | null, create: boolean, note?: string): Outcome => {
     const read = codexMcpEntry(inv, file, name);
     return adding(
       out,
@@ -1222,6 +1265,7 @@ function planCodexMcp(run: Run, row: ScopeRow): Outcome {
         ],
         enabled === null ? `mcp_servers.${name}.enabled removed` : `mcp_servers.${name}.enabled → ${enabled}`,
         create,
+        note,
       ),
     );
   };
@@ -1231,18 +1275,44 @@ function planCodexMcp(run: Run, row: ScopeRow): Outcome {
     if (unreadable) return unreadable;
     const out = outcome(project);
     const where = whereFor(run.ctx, "here", project);
-    const off = stateOf(inv, item, project).value === "off";
-    if (verb === "off") return off ? unchanged(out, row, `already off ${where}`) : write(out, file, false, create);
-    if (!off) return unchanged(out, row, `already on ${where}`);
+    // What it is with no switch in this file: the nearest parent folder's .codex, else the user's.
+    const parent = codexNearest(
+      inv,
+      inv.facts.codexMcpEnabled.filter((e) => e.name === name && e.layer !== undefined),
+      project,
+    );
     const userOff = codexMcpEntry(inv, inv.places.codexConfig, name)?.enabled === false;
-    return write(out, file, userOff ? true : null, create);
+    const underOff = parent ? !parent.enabled : userOff;
+    // Where Codex refuses the project's config.toml, it stays off there whatever this writes, and
+    // whether it is off is what the switches say.
+    const refusal = refusedNote(run, project);
+    const own = codexMcpEntry(inv, file, name)?.enabled;
+    const off = refusal !== undefined ? (own ?? !underOff) === false : stateOf(inv, item, project).value === "off";
+    if (verb === "off") {
+      return off ? unchanged(out, row, `already off ${where}`) : write(out, file, false, create, refusal);
+    }
+    if (!off) return unchanged(out, row, refusal ?? `already on ${where}`);
+    return write(out, file, underOff ? true : null, create, refusal);
   };
   if (item.location.scope === "project") {
     const project = item.location.project;
-    if (project === undefined || !codexTrusted(inv, project)) return refused(run, row, "codex-untrusted");
+    const layer = item.location.layer;
+    if (project === undefined || !codexTrusted(inv, layer ?? project)) return refused(run, row, "codex-untrusted");
     if (verb === "rm") return deleteServer();
-    if (reach === "everywhere") return refused(run, row, "codex-project-everywhere");
-    return inProject(own, project, false);
+    if (reach === "everywhere") {
+      const out = refused(run, row, "codex-project-everywhere");
+      const refusal = out.refused[0];
+      // A parent folder's: say whose it is.
+      if (layer !== undefined && refusal) {
+        refusal.reason = PARENT_EVERYWHERE_REASON.replace("{~file}", tilde(own, inv.homeDir));
+      }
+      return out;
+    }
+    if (layer === undefined) return inProject(own, project, false);
+    // A parent folder's server is switched here in the project's own config.toml, which Codex
+    // merges over every parent's, as a user server is.
+    if (!codexTrusted(inv, project)) return refused(run, row, "codex-untrusted");
+    return inProject(codexProjectConfig(project), project, true);
   }
   if (verb === "rm") return deleteServer();
   if (reach === "everywhere") {
@@ -1253,10 +1323,12 @@ function planCodexMcp(run: Run, row: ScopeRow): Outcome {
     if (verb === "off") return off ? unchanged(out, row, "already off in every project") : write(out, own, false, true);
     // This project's own config, which Codex reads where it trusts the project, still turns it off.
     const project = run.ctx.project;
-    const here = inv.facts.codexMcpEnabled.find(
-      (entry) => entry.name === name && entry.project !== undefined && samePath(entry.project, project),
+    const here = codexNearest(
+      inv,
+      inv.facts.codexMcpEnabled.filter((entry) => entry.name === name),
+      project,
     );
-    if (here?.enabled === false && codexTrusted(inv, project)) {
+    if (here?.enabled === false) {
       note(out, stillOff(run, project, `mcp_servers.${name}.enabled`, here.file));
     }
     return off ? write(out, own, null, true) : unchanged(out, row, "not off in Codex's config.toml");
@@ -1282,7 +1354,7 @@ function planHook(run: Run, row: ScopeRow): Outcome {
   const { verb, reach } = run.action;
   if (verb !== "rm" && reach === "here") return refused(run, row, "hook-here");
   const loc = item.location;
-  const untrusted = loc.tool === "codex" && loc.scope === "project" && !codexTrusted(inv, loc.project);
+  const untrusted = loc.tool === "codex" && loc.scope === "project" && !codexTrusted(inv, codexTrustFolder(item));
   // Deleting what clausona kept writes nothing under the project's .codex folder.
   if (untrusted && !(verb === "rm" && item.stashed)) return refused(run, row, "codex-untrusted");
   const place = item.hook;

@@ -475,8 +475,18 @@ function nothingToList(command: ExtensionsCommand, scope: Scope, tools: ToolName
       return project === undefined
         ? "No project — pick one with --project <path>."
         : "Nothing in this project's own files.";
-    case "parents":
-      return "No .mcp.json in the folders above this project.";
+    case "parents": {
+      const mcpjson = tools.includes("claude") && command === "mcp";
+      if (!tools.includes("codex")) {
+        return mcpjson
+          ? "No .mcp.json in the folders above this project."
+          : `Only Codex has ${noun} in Parent folders.`;
+      }
+      if (mcpjson) return `No .mcp.json in the folders above this project, and no .codex folder there has ${noun}.`;
+      return command === "skills"
+        ? "No .agents/skills or .codex/skills in a folder above this project."
+        : `No .codex folder above this project has ${noun}.`;
+    }
     case "plugins":
       return `No plugin brings ${noun}.`;
     case "builtin":
@@ -903,7 +913,7 @@ function changeLines(lines: PlanLine[], talk: Talk): string[] {
     fileWords(line.file, talk.homeDir, talk.env.stashDir),
     line.what,
     line.account === undefined ? "" : shortProfile(line.account),
-    line.note ?? "",
+    line.noteBelow ? "" : (line.note ?? ""),
   ]);
   const used = [0, 1, 2, 3].filter((c) => c === 0 || cells.some((row) => row[c] !== ""));
   // The path gives way first, from its middle; then the note; what changes last.
@@ -915,8 +925,13 @@ function changeLines(lines: PlanLine[], talk: Talk): string[] {
     [0],
   ).flatMap(([file = "", ...rest], at) => {
     const text = `      ${[dimPath(file), ...rest].join(" ".repeat(GAP))}`.trimEnd();
-    const runs = lines[at]?.runs;
-    return runs === undefined ? [text] : [text, `        runs ${tildeIn(runs, talk.homeDir)}`];
+    const line = lines[at];
+    // Under the change, whole: what it runs, and a note that ends in the file to fix.
+    const below = [
+      ...(line?.runs !== undefined ? [`        runs ${tildeIn(line.runs, talk.homeDir)}`] : []),
+      ...(line?.noteBelow && line.note !== undefined ? [`        ${line.note}`] : []),
+    ];
+    return [text, ...below];
   });
 }
 
@@ -1229,6 +1244,7 @@ export async function runExtensionsCommand(
     homeDir: deps.homeDir,
     registry: deps.registry,
     cwd: options.project ?? deps.cwd,
+    ...(options.project !== undefined ? { project: options.project } : {}),
     ...(deps.managedSettings !== undefined ? { managedSettings: deps.managedSettings } : {}),
     ...(deps.mcpjsonStop !== undefined ? { mcpjsonStop: deps.mcpjsonStop } : {}),
   });

@@ -29,7 +29,9 @@ and `work`, the projects `~/app` and `~/site`, and a plugin `kit@demo`.
 Everything is seen from one project. It is the git root that holds the current directory, or
 the directory itself outside a repository. The home folder can be the project too.
 `--project <path>` looks from another one, and on the screen the project list picks one (see
-[On the screen](#on-the-screen)). At the filesystem root there is no project.
+[On the screen](#on-the-screen)). A path given to `--project` is resolved the same way, unless
+Claude Code or Codex recorded that very path as a project: then that folder is the project,
+even inside a repository. At the filesystem root there is no project.
 
 The other projects are the folders that Claude Code or Codex recorded in any account and that
 still exist.
@@ -59,7 +61,7 @@ worked out from the others.
 |---|---|---|---|
 | Loaded | `loaded` | every tool and kind | `what Claude Code loads in ~/app, in at least one account` |
 | Project | `project` | every tool and kind | the project's own files, listed below |
-| Parent folders | `parents` | Claude MCP | `.mcp.json in ~/repos · loads here too` |
+| Parent folders | `parents` | Claude MCP; Codex skills, MCP and hooks | Claude: `.mcp.json in ~/repos · loads here too`; Codex: `.codex in ~/repos · loads here too`, for skills `.agents/skills and .codex/skills in ~/repos · loads here too` |
 | Global | `global` | every tool and kind | the user's own files, listed below, then `· loads in every project` |
 | Cloud | `cloud` | Claude skills | `skills on your claude.ai accounts, different per account` |
 | Plugins | `plugins` | every tool and kind | `plugins that bring skills, installed for you or for this project` |
@@ -79,7 +81,7 @@ Project and Global are these files. The header names the folders it found.
 | Claude skills | `.claude/skills` and `.claude/commands` | `~/.claude/skills` and `~/.claude/commands`, and an account's own `skills` and `commands` folders |
 | Claude MCP | `.mcp.json`, and each account's entry for the project in `.claude.json` | user servers in each account's `.claude.json` |
 | Claude hooks | `.claude/settings.json` and `.claude/settings.local.json` | `~/.claude/settings.json` |
-| Codex skills | `.agents/skills` | `~/.agents/skills` and the `skills` folder of Codex's home |
+| Codex skills | `.agents/skills` and `.codex/skills` | `~/.agents/skills` and the `skills` folder of Codex's home |
 | Codex MCP | `.codex/config.toml` | `config.toml` in Codex's home |
 | Codex hooks | `.codex/hooks.json`, and `[hooks]` in `.codex/config.toml` | `hooks.json` in Codex's home, and `[hooks]` in its `config.toml` |
 
@@ -97,9 +99,9 @@ The screen lists the scopes of each tool and kind in this order:
 | Claude skills | Loaded, Project, Global, Cloud, Plugins, Built-in, Not used in 90 days |
 | Claude MCP | Loaded, Project, Parent folders, Global, Plugins, Managed |
 | Claude hooks | Loaded, Project, Global, Plugins, Managed |
-| Codex skills | Loaded, Project, Global, Plugins, Built-in |
-| Codex MCP | Loaded, Project, Global, Plugins |
-| Codex hooks | Loaded, Project, Global, Plugins |
+| Codex skills | Loaded, Project, Parent folders, Global, Plugins, Built-in |
+| Codex MCP | Loaded, Project, Parent folders, Global, Plugins |
+| Codex hooks | Loaded, Project, Parent folders, Global, Plugins |
 
 The screen always shows Loaded and Project, and the others only when they hold something.
 Loaded has no line of its own there: it is the project row, the list's first line.
@@ -113,6 +115,26 @@ Some scopes need a word more:
 - Parent folders: Claude Code reads `.mcp.json` in the project and in every folder above
   it, past the home folder too, up to the filesystem root. So does clausona: a `.mcp.json` in
   `/Users` or `C:\Users` is listed here. The header names each folder, nearest first.
+- Parent folders for Codex: Codex started in a project reads the `.codex` folder of each folder
+  from the project's root down to the project. The root is the nearest folder at or above the
+  project with a `.git`, or with one of the `project_root_markers` your `config.toml` sets;
+  with `project_root_markers = []` there is none, and no folder above is read. Codex reads each
+  folder's `.codex` by that folder's own trust (see Codex's trust under
+  [States and tags](#states-and-tags)), and never its own home. So does clausona: what such a
+  folder's `config.toml` and `hooks.json` hold is listed here, each row with its file, as in
+  `~/repos/.codex/config.toml`. Codex's skills come from the same folders, whatever their trust:
+  each folder's `.agents/skills` and `.codex/skills`, from the root down to the project, and
+  none from a folder below the project or beside it. Codex run as one profile leaves that
+  profile's own home out, so where the primary's home, `~/.codex`, is in a folder from the root
+  down (the home folder is the root, say), the other profiles read it as such a folder: its hooks
+  run a second time for them, under that file's key. clausona lists those rows with the profiles
+  that read them (`Profiles` in the details, `accounts` in JSON). Its `config.toml` and
+  `skills`, which every profile links to the primary's, add nothing there, as Codex merges and
+  lists them once. clausona treats a repository's root as the project wherever in
+  it you start, so this is mostly a folder above a repository that a marker of yours makes the
+  root, or a project recorded inside one. Look from such a project with `--project` and its
+  path, or pick it in the screen's project list; from anywhere else its rows are under Other
+  projects.
 - Cloud: the skills Claude Code downloaded from each account's claude.ai skills, under
   `skills/synced` in the skills folder that account loads: `~/.claude/skills/synced` for the
   accounts that share the primary's, and its own for an account whose skills folder is its own.
@@ -204,7 +226,10 @@ its name, and the copies below it don't start either. Their details say why, as 
 Codex takes a server a trusted project's `.codex/config.toml` defines over your own of the same
 name: it merges the project's table over yours, and starts that one. So there your copy is
 `hidden by Project copy`, and Loaded has the project's. A project Codex does not trust leaves
-yours in place.
+yours in place. A folder above the project whose `.codex` Codex reads (Parent folders) merges
+the same way, over yours and under the project's: from the root down, the nearest table merged
+last. So your copy is `hidden by Parent folders copy` there, a parent's copy is
+`hidden by Project copy` under the project's own, and an `enabled` nearer the project wins.
 
 The copy that loses is tagged with the scope of the one that wins: `hidden by Global copy` for
 a Global skill, `hidden by Project copy` for a local server or this project's `.mcp.json`,
@@ -313,6 +338,10 @@ The switches are read from these places:
   by key: the project's `command` with your `args`, and `env` from both, the project's winning
   where both set a key; a list such as `args` is the project's whole when it sets one. Runs,
   the details and the JSON `summary` show that merged server, which is what Codex starts.
+  A trusted project's table that changes one of your servers without a `command` or `url`, say
+  `args` alone, is that server's Project copy too, merged the same way; a change to it goes to
+  that table. A table that sets only `enabled` is a switch, and no copy. In an untrusted project
+  neither counts.
 - Codex's trust: Codex looks for a `[projects."<folder>"]` with a `trust_level` in its
   `config.toml` in three places, and the first it finds decides. First the project's folder,
   then its project root: the nearest folder at or above it with a `.git`, or with one of the
@@ -363,9 +392,10 @@ The switches are read from these places:
   (letters, digits, `_` and `|`) as a Rust regex, and skips the whole group when it cannot:
   its hooks are tagged `invalid matcher`. Rust's regex is not JavaScript's: it has no
   lookaround (`(?=…)`) or backreferences, and takes `(?i)` and `\pL`. clausona checks the
-  matcher as Rust's parser does, so it tags only what Codex skips for sure; a matcher Rust
-  parses and then cannot compile, such as an unknown `\p{…}` name or one past its size limit,
-  is not tagged. Codex
+  matcher as Rust's regex crate does: its parser, the `\p{…}` names its Unicode tables know,
+  what could match invalid UTF-8 under `(?-u)`, nesting past 250 deep, and the size limit where
+  a pattern is past it for sure (`a{400000}`). It tags only what Codex skips for sure; a pattern
+  only compiling it could tell is past the size limit, such as `\w[^a]{100000}`, is not tagged. Codex
   also runs the hooks a `config.toml` holds, as `[[hooks.<Event>]]` tables, beside that folder's
   `hooks.json`: Codex's own and a trusted project's. Their key holds the `config.toml`'s path.
   clausona lists them and their trust, and leaves changing them to `/hooks` in Codex
@@ -380,7 +410,29 @@ The switches are read from these places:
   Loaded. Their details name the main checkout's file, and clausona does not change them
   (`codex-worktree-hook`). In a worktree Codex does not trust, it runs neither, so their details
   and refusals say that first (`codex-untrusted`). This is only for a worktree with a `.codex`
-  folder of its own: Codex runs no project hooks in one without.
+  folder of its own: Codex runs no project hooks in one without. The same goes for each folder
+  above the project whose `.codex` Codex reads (Parent folders): in a worktree the main
+  checkout's hooks at that place run, and the worktree's own there are tagged the same way.
+
+### What isn't modelled
+
+A few rare Codex cases clausona does not follow:
+
+- A hook matcher past Codex's size limit that clausona cannot size without compiling it. clausona
+  counts the least a pattern takes, so it tags `a{400000}`, but not one whose size depends on
+  more than that: a repeated class, such as `[ab]{200000}`, `\w` or `\p{Greek}` thousands of
+  times, an optional or case-insensitive repeat (`a{0,200000}`, `(?i)a{200000}`), or one right
+  at the limit (`b{327680}*`). Codex skips the group; clausona lists its hooks as running.
+- A few rare front matter forms Codex refuses: a `:` right before `,`, `[`, `]`, `{` or `}`
+  in a value inside `[…]` or `{…}`, a value there that starts with `:`, a `[…]` or `{…}` used
+  as a key, and a tag on a value that Codex quotes and reads again. clausona reads those skills
+  as fine.
+- The primary's Codex home read as a parent folder's `.codex` by the other profiles. Its own
+  rows are listed with those profiles, but what it changes in their other rows is not shown,
+  and neither is a refusal only they would meet.
+- A Codex profile whose own folder is a project's `.codex`. Codex run as that profile reads it as
+  its own configuration, not the project's; clausona lists that project's rows for every
+  profile.
 
 ### Tags
 
@@ -402,13 +454,13 @@ column shows the first; JSON `tags` has them all.
 | `pending approval` | A `.mcp.json` server that no account has approved in this project, or a Codex hook not trusted yet with `/hooks`, or changed since it was. |
 | `hidden by Project copy` | In every account that has it, a same-name copy in Project wins: the account's local server, or this project's `.mcp.json`. For Codex, a server this project's `.codex/config.toml` defines, where Codex trusts the project. |
 | `hidden by Global copy` | In every account that has it, a same-name skill in Global wins: the primary's, or the account's own. |
-| `hidden by Parent folders copy` | In every account that has it, a same-name `.mcp.json` copy in a parent folder wins. |
+| `hidden by Parent folders copy` | In every account that has it, a same-name `.mcp.json` copy in a parent folder wins. For Codex, a same-name server in a parent folder's `.codex/config.toml` that Codex reads for the project, with none in the project's own. |
 | `unused` | A Claude skill the rule below calls unused. |
 | `no front matter` | A skill whose `SKILL.md` has no front matter. Claude Code loads it under its folder's name, with no description, so it has only the skill's first non-empty line to tell when to use it: a quiet note, the skill still loads. Codex skips it, with no front matter between `---` lines, so a Codex one is not in Loaded. For Codex, a `SKILL.md` that starts with a byte order mark has none either. |
-| `invalid front matter` | A Codex skill whose front matter is not YAML Codex reads: say, a quoted description with more text after its closing quote, a description line that runs on to the next line unindented, or a description written as a list. Codex skips it, so it is not in Loaded. A description with a `: ` in it is fine: Codex quotes it and reads it again, and so does clausona. Tags, anchors and aliases, `?` keys, flow collections over several lines and `---` or `...` markers are read as Codex reads them, so a `description: !` or a second document counts. A few rare forms, such as a `%TAG` directive, are not checked, and read as fine. |
+| `invalid front matter` | A Codex skill whose front matter is not YAML Codex reads: say, a quoted description with more text after its closing quote, a description line that runs on to the next line unindented, or a description written as a list. Codex skips it, so it is not in Loaded. A description with a `: ` in it is fine: Codex quotes it and reads it again, and so does clausona. Tags (and the handles a `%TAG` directive sets), anchors and aliases, `?` keys, flow collections over several lines, block scalars as keys, and `%`, `---` or `...` lines are read as Codex reads them, so a `description: !`, a second document or an alias to no anchor counts. A few rare forms, such as a flow collection used as a key, are not checked, and read as fine (see [What isn't modelled](#what-isnt-modelled)). The name and description shown are the ones Codex gives the skill. |
 | `name too long` | A Codex skill whose name is over 64 characters. Codex skips it, so it is not in Loaded. |
 | `no description` | A Codex skill whose front matter has no `description`, or one that is empty or only spaces. Codex skips it, so it is not in Loaded. |
-| `main checkout's runs` | A Codex hook in a linked git worktree's own `.codex` folder. Codex runs the main checkout's hooks there instead, so it is not in Loaded. Its details name the main checkout's file. |
+| `main checkout's runs` | A Codex hook in a linked git worktree's own `.codex` folder, the project's or a folder's above it. Codex runs the main checkout's hooks there instead, so it is not in Loaded. Its details name the main checkout's file. |
 | `invalid hooks file` | A Codex hook in a hooks file with more than `hooks` and a `description` at its top, such as its events, or a `$schema`, or with a hook Codex cannot read, such as a `command` that is not a string. Codex skips the whole file, so the hook does not run. |
 | `not supported` | A Codex hook of a kind Codex does not run: a prompt or an agent hook, or an MCP tool hook on `SessionEnd`. Codex skips it, whatever its trust, so it is not in Loaded. |
 | `empty command` | A Codex command hook whose command is empty or only spaces. Codex skips it, and runs the rest of its file, so it is not in Loaded. |
@@ -555,7 +607,7 @@ this page online, at its JSON, [Ids and row keys](#ids-and-row-keys) and
 |---|---|
 | `--scope <scope>` | For `ls`, the scope to list, `loaded` by default. For `show`, `off`, `on`, `visibility` and `rm`, the one scope to look in. |
 | `--tool <tool>` | `claude` or `codex`. Both by default. |
-| `--project <path>` | Look from another project, and make a change there. A relative path is read from the current directory, and a leading `~` is the home folder, so `--project '~/app'` works without a shell. It must be a directory, and its git root is used, as for the current directory. |
+| `--project <path>` | Look from another project, and make a change there. A relative path is read from the current directory, and a leading `~` is the home folder, so `--project '~/app'` works without a shell. It must be a directory, and its git root is used, as for the current directory, unless Claude Code or Codex recorded that very path as a project (on Windows in any case of its letters): then it is used as it is. |
 | `--account <name>` | MCP only. In Loaded, the default scope, keep the rows that load for this Claude account; in any other scope, the rows it has, on or off. With `off`, `on` and `rm`, change this account only. Give it more than once for several accounts. It takes `work` or `claude:work`, lists Claude rows only, and cannot be used with `--tool codex`. |
 | `--id <id>` | `show`, `off`, `on`, `visibility` and `rm`. A row key or a copy's id, from `ls --json`. `off`, `on` and `rm` take it more than once, for several rows; `show` and `visibility` take one. |
 | `--everywhere` | `off`, `on` and `visibility`: in every project, not only this one. Hooks always change everywhere, so for them it changes nothing. See [Off and on](#off-and-on). |
@@ -581,7 +633,7 @@ exits 2.
 |---|---|---|---|---|
 | `loaded` | Loaded, the default | ✓ | ✓ | ✓ |
 | `project` | Project | ✓ | ✓ | ✓ |
-| `parents` | Parent folders | | ✓ | |
+| `parents` | Parent folders | ✓ | ✓ | ✓ |
 | `global` | Global | ✓ | ✓ | ✓ |
 | `cloud` | Cloud | ✓ | | |
 | `plugins` | Plugins | ✓ | ✓ | ✓ |
@@ -701,7 +753,10 @@ same when a plugin updates; a copy's id holds the plugin's install folder, which
 hook's id holds its place in its file (`#<group>.<index>`), which moves when hooks above it are
 added or removed. In a linked worktree, the main checkout's Codex hooks are the worktree's rows:
 their id holds the worktree's path, with `main:` before the place, as in
-`hook:codex:project:<worktree>:Stop#main:0.0`.
+`hook:codex:project:<worktree>:Stop#main:0.0`. What a folder above a Codex project holds
+(Parent folders) is that project's rows too: the owner part is the project's path with `#up<N>`
+after it, N folders up (`#up1.codex` for that folder's `.codex/skills`, `#.codex` for the
+project's own), and a hook's place has `up<N>:` before it.
 
 `--id`, and a name given as an id, take a row key or the id of any copy. For `show`, a copy's
 id picks its whole row. A change takes that copy alone, so `csn mcp rm --id` with one account's
@@ -744,12 +799,26 @@ the sections it reads, against Codex's types:
 - `plugins` and their servers' `enabled`;
 - `projects` and each `trust_level` (`trusted` or `untrusted`, as written).
 
-A trusted project's `config.toml` is checked merged over yours, as Codex merges them. So a
-switch for a server you do not define is a server with no transport, which Codex refuses too.
+A trusted project's `config.toml` is checked merged over yours, as Codex merges them, and over
+each parent folder's that Codex reads for the project. So a switch for a server you do not
+define is a server with no transport, which Codex refuses too, while a parent's table with no
+`command` that the project's own completes is no problem. The warning names the first file,
+from yours down, whose table the merge cannot read. A parent folder's file Codex refuses refuses
+every project below it, one Codex does not trust too, and the warning names each.
 When Codex refuses a trusted project's file, it loads no config in that project, yours
-included: the warning says so, and every Codex row is off in that project ("off here (Codex
-cannot read this project's .codex/config.toml)"). An untrusted project's file Codex leaves alone,
-one that is not valid TOML too.
+included: the warning says so, naming the project by its path, and every Codex row is off in
+that project ("off here (Codex cannot read this project's .codex/config.toml)"). A file several
+projects read, such as a main checkout's that its worktrees read too, gets one warning per
+cause, naming each project Codex loads no config in. An untrusted project's file Codex leaves
+alone, one that is not valid TOML too.
+
+A trusted project's file Codex refuses for a value of the wrong type is one clausona still
+reads: what it holds is listed, off in that project, and a change can go to it. So in that
+project `skills on` and `off` write your `config.toml` as anywhere, and `mcp off` and `on` here
+write the project's file. Under each change, on a line of its own so the file is never cut off,
+the plan says the row `stays off in this project until Codex can read <file>` (in JSON, the
+line's `note`). A file that is not valid TOML clausona
+cannot change either, and a change to it is refused (`unreadable`).
 
 In a linked worktree Codex checks the worktree's own `config.toml` with the main checkout's
 `[hooks]` (and `[hooks.state]`) in place of the worktree's, and nothing else of the main
@@ -914,6 +983,13 @@ nothing new to approve, and its plan says nothing of it. A server turned off in 
 `.claude/settings.json` stays off whatever is written here, so `on` is refused and the reason
 names that file. `visibility` writes `skillOverrides.<name>` as off does, with the level as the
 value.
+
+A folder above the project whose `.codex` Codex reads (Parent folders) changes none of where a
+change goes. Off and on here write the project's own `.codex/config.toml`, for a server a
+parent folder defines too: Codex merges that file over every parent's, so its `enabled` wins,
+and on writes `enabled = true` there over a parent's `false`. Deleting a parent folder's server
+deletes it from that folder's `config.toml`, and taking out a parent folder's hook takes it out
+of that folder's `hooks.json`, for every project below it.
 
 A Codex project skill's `[[skills.config]]` entry names its `SKILL.md` by a path, and Codex
 takes any path that leads there, through a link or not: Codex's own UI writes the real one. So
@@ -1174,7 +1250,9 @@ other accounts' copies too. Where Claude Code and Codex have recorded no project
 says `Run csn in a project.` instead, since `p` has none to pick. Where git did not answer in
 time, `tracked` says
 `Git did not answer in time whether it tracks it in <project>, so this may change the repo.`
-instead, with the same hints: it counts as tracked.
+instead, with the same hints: it counts as tracked. For a server a parent folder's `.codex`
+defines, `codex-project-everywhere` says
+`It is defined in <file>, for the projects below that folder.` instead, with the same hints.
 
 ## JSON
 
@@ -1565,7 +1643,7 @@ csn skills ls --scope project --json
 ```
 
 Read `name` and `file`, the skill's folder. Claude's come from `.claude/skills` and
-`.claude/commands`, Codex's from `.agents/skills`. A Claude skill tagged
+`.claude/commands`, Codex's from `.agents/skills` and `.codex/skills`. A Claude skill tagged
 `hidden by Global copy` is defined here, but a Global skill of the same name loads instead.
 
 ### Which Claude skills haven't been used in 90 days?

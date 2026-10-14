@@ -7,7 +7,7 @@ import { loadInventory } from "../inventory.js";
 import { type Collector, emptyFacts, type Warning } from "../model.js";
 import { stateOf } from "../state.js";
 import { TestHome } from "../test-home.js";
-import { codexProjectRecords, loadCodexContext, readCodex } from "./codex.js";
+import { codexProjectRecords, loadCodexContext, ProjectRefusals, readCodex } from "./codex.js";
 import { addCodexHookTrust, codexHomeHooksFile } from "./codex-hooks.js";
 
 const homes: TestHome[] = [];
@@ -86,6 +86,52 @@ describe("readCodex", () => {
         ["exa", "project", false],
       ]),
     );
+  });
+
+  it("names a skill as Codex does, its name tagged or aliased, and refuses one whose name that makes too long", async () => {
+    const h = new TestHome();
+    homes.push(h);
+    h.codex("personal", ".codex");
+    // Codex 0.159.3's skills/list: "x", "description", the folder's name, and "invalid name:
+    // exceeds maximum length of 64 characters".
+    const skill = (folder: string, front: string) =>
+      h.write(`.agents/skills/${folder}/SKILL.md`, `---\n${front}\n---\nbody\n`);
+    skill("tagged", "name: !!str x\ndescription: d");
+    skill("keyed", "&k description: d\nname: *k");
+    skill("folder", "name: !!null ~\ndescription: d");
+    skill("long", `name: &n ${"n".repeat(65)}\ndescription: d\nother: *n`);
+    const out: Collector = { items: [], facts: emptyFacts(), warnings: [] };
+    const ctx = await loadCodexContext(h.registry, h.home, out.warnings);
+    if (!ctx) throw new Error("no codex context");
+    await readCodex(ctx, [], out);
+    const skills = out.items.filter((i) => i.kind === "skill" && i.location.scope === "global");
+    expect(skills.map((i) => [path.basename(i.location.file), i.name, i.codexError]).sort()).toEqual([
+      ["folder", "folder", undefined],
+      ["keyed", "description", undefined],
+      ["long", "n".repeat(65), "name too long"],
+      ["tagged", "x", undefined],
+    ]);
+  });
+
+  it("shows a description of any length whole, as Codex lists it", async () => {
+    const h = new TestHome();
+    homes.push(h);
+    h.codex("personal", ".codex");
+    // Codex 0.159.3's skills/list gave each whole: 5,000 characters, 1,025 two-byte ones, and
+    // 1,023 with two emoji after them; only its whitespace made one space.
+    const long = "a".repeat(5000);
+    const wide = "é".repeat(1025);
+    const emoji = `${"a".repeat(1023)}😀😀`;
+    h.write(".agents/skills/long/SKILL.md", `---\nname: long\ndescription: ${long}\n---\n`);
+    h.write(".agents/skills/wide/SKILL.md", `---\nname: wide\ndescription: ${wide}\n---\n`);
+    h.write(".agents/skills/emoji/SKILL.md", `---\nname: emoji\ndescription: ${emoji}\n---\n`);
+    h.write(".agents/skills/spaced/SKILL.md", `---\nname: spaced\ndescription: ${"a".repeat(1020)}    b    c\n---\n`);
+    const out: Collector = { items: [], facts: emptyFacts(), warnings: [] };
+    const ctx = await loadCodexContext(h.registry, h.home, out.warnings);
+    if (!ctx) throw new Error("no codex context");
+    await readCodex(ctx, [], out);
+    const shown = Object.fromEntries(out.items.filter((i) => i.kind === "skill").map((i) => [i.name, i.description]));
+    expect(shown).toEqual({ long, wide, emoji, spaced: `${"a".repeat(1020)} b c` });
   });
 
   it("reads a project table that only switches a server as that switch, not as a second server", async () => {
@@ -992,13 +1038,23 @@ describe("readCodex", () => {
       projects.map((p) => ({ path: p, tools: ["codex"], profiles: [] })),
       out,
     );
-    const said = "has an MCP server Codex cannot read, so Codex loads no config in this project";
+    // Each names the project Codex then loads no config in, by its path.
+    const said = (p: string) =>
+      `has an MCP server Codex cannot read, so Codex loads no config in ${path.join("~", "repos", p)}`;
     expect(out.warnings.map((w) => [path.basename(path.dirname(path.dirname(w.file))), w.message]).sort()).toEqual([
-      ["bad", said],
-      ["orphan", said],
+      ["bad", said("bad")],
+      ["orphan", said("orphan")],
     ]);
-    // The switch of a server the user defines still counts.
-    expect(out.facts.codexMcpEnabled.map((e) => [e.name, e.enabled])).toEqual([["good", false]]);
+    // The switch of a server the user defines still counts; orphan's, in a file Codex refuses that
+    // clausona reads, is listed too, and holds nothing there.
+    expect(out.facts.codexMcpEnabled.map((e) => [e.name, e.enabled]).sort()).toEqual([
+      ["good", false],
+      ["other", false],
+    ]);
+    expect(out.facts.codexConfigRefused.map((r) => [path.basename(r.project ?? ""), r.readable]).sort()).toEqual([
+      ["bad", true],
+      ["orphan", true],
+    ]);
   });
 
   it("records where Codex refuses a config.toml: the user's everywhere, a trusted project's there", async () => {
@@ -1038,15 +1094,18 @@ describe("readCodex", () => {
       ["types", "types"],
     ]);
     const says = Object.fromEntries(out.warnings.map((w) => [name(w.file), w.message]));
-    expect(says.types).toBe("has an MCP server Codex cannot read, so Codex loads no config in this project");
-    expect(says.syntax).toMatch(
-      /^is not valid TOML( at line \d+, column \d+)?, so Codex loads no config in this project$/,
-    );
-    expect(says.big).toBe("has an integer too large for 64 bits, so Codex loads no config in this project");
+    const where = (p: string) => `so Codex loads no config in ${path.join("~", "repos", p)}`;
+    expect(says.types).toBe(`has an MCP server Codex cannot read, ${where("types")}`);
+    expect(says.syntax?.startsWith("is not valid TOML") && says.syntax.endsWith(`, ${where("syntax")}`)).toBe(true);
+    expect(says.big).toBe(`has an integer too large for 64 bits, ${where("big")}`);
     expect(says.untrusted).toMatch(/^is not valid TOML( at line \d+, column \d+)?$/);
+    // types's file Codex refuses for a wrong type, which clausona reads and lists: off there.
     expect(
-      out.items.filter((i) => i.kind === "mcp").map((i) => i.location.project && path.basename(i.location.project)),
-    ).toEqual(["fine"]);
+      out.items
+        .filter((i) => i.kind === "mcp")
+        .map((i) => i.location.project && path.basename(i.location.project))
+        .sort(),
+    ).toEqual(["fine", "types"]);
     // A user config.toml Codex refuses keeps all of its config out, in every project.
     const user = new TestHome();
     homes.push(user);
@@ -1074,6 +1133,49 @@ describe("readCodex", () => {
     const message = out.warnings[0]?.message ?? "";
     expect(message).toMatch(/^is not valid TOML( at line \d+, column \d+)?$/);
     expect(message).not.toContain("abc123");
+  });
+});
+
+describe("ProjectRefusals", () => {
+  const realPlatform = process.platform;
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+  });
+  const cause = { refused: "has a hook Codex cannot read", parse: false };
+  const warned = (notes: [string, string][]) => {
+    const refusals = new ProjectRefusals();
+    for (const [file, place] of notes) refusals.note(file, cause, place);
+    const warnings: Warning[] = [];
+    refusals.warn(warnings, "/nowhere");
+    return warnings;
+  };
+
+  it("warns once of a file its readers spell apart in case on Windows, under one spelling whatever the order", () => {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    // A main checkout's config.toml: as its own project, by Codex's lower-cased trust key; from a
+    // worktree, as git spells the main checkout.
+    const own: [string, string] = ["c:\\users\\me\\repos\\main\\.codex\\config.toml", "c:\\users\\me\\repos\\main"];
+    const fromWorktree: [string, string] = [
+      "C:\\Users\\Me\\repos\\main\\.codex\\config.toml",
+      "C:\\Users\\Me\\repos\\main-wt",
+    ];
+    for (const notes of [
+      [own, fromWorktree],
+      [fromWorktree, own],
+    ]) {
+      const warnings = warned(notes);
+      expect(warnings.map((w) => w.file)).toEqual(["C:\\Users\\Me\\repos\\main\\.codex\\config.toml"]);
+      expect(warnings[0]?.message).toMatch(/^has a hook Codex cannot read, so Codex loads no config in .+ and .+$/);
+    }
+  });
+
+  it("keeps two files apart that differ in case where the filesystem does", () => {
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    const warnings = warned([
+      ["/home/me/repos/main/.codex/config.toml", "/home/me/repos/main"],
+      ["/home/me/repos/Main/.codex/config.toml", "/home/me/repos/Main"],
+    ]);
+    expect(warnings).toHaveLength(2);
   });
 });
 

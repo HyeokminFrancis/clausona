@@ -30,6 +30,7 @@ import {
 import {
   CODEX_REFUSED_KEY,
   codexTrusted,
+  codexTrustFolder,
   codexWorktreeRuns,
   isMcpjsonServer,
   MANAGED_MCP_KEY,
@@ -381,7 +382,7 @@ const PROJECT_FILES: Record<ToolName, Record<ItemKind, (here: string) => string>
     hook: (here) => `.claude/settings.json and .claude/settings.local.json in ${here}`,
   },
   codex: {
-    skill: (here) => `.agents/skills in ${here}`,
+    skill: (here) => `.agents/skills and .codex/skills in ${here}`,
     mcp: (here) => `.codex/config.toml in ${here}`,
     hook: (here) => `.codex/hooks.json and .codex/config.toml in ${here}`,
   },
@@ -424,13 +425,16 @@ function sentence(scope: ScopeId, tool: ToolName, kind: ItemKind, inv: Inventory
       if (here === undefined) return inv.projects.length === 0 ? "no project" : "no project · pick one with p";
       return PROJECT_FILES[tool][kind](here);
     case "parents": {
-      // Nearest first, as Claude Code lets the nearest file win a name.
-      const dirs = [...new Set(inScope(inv, tool, kind, "parents", project).map((i) => i.location.project ?? ""))]
+      // Nearest first, as Claude Code lets the nearest file win a name, and Codex merges the nearest last.
+      const folder = (i: Extension) => (tool === "codex" ? i.location.layer : i.location.project) ?? "";
+      const dirs = [...new Set(inScope(inv, tool, kind, "parents", project).map(folder))]
         .sort((a, b) => b.length - a.length)
         .map((dir) => tilde(dir, inv.homeDir));
+      const file = tool === "claude" ? ".mcp.json" : kind === "skill" ? ".agents/skills and .codex/skills" : ".codex";
+      const some = tool === "claude" ? ".mcp.json files" : kind === "skill" ? "skills folders" : ".codex folders";
       return dirs.length === 0
-        ? ".mcp.json files in folders above this project · load here too"
-        : `.mcp.json in ${fewPlaces(dirs)} · loads here too`;
+        ? `${some} in folders above this project · ${kind === "hook" ? "run" : "load"} here too`
+        : `${file} in ${fewPlaces(dirs)} · ${loads} here too`;
     }
     case "global": {
       if (tool === "claude" && kind === "mcp")
@@ -481,6 +485,8 @@ function settingPlace(inv: Inventory, item: Extension, project: string | undefin
   const whose = here === undefined || samePath(here, project) ? "this project's" : `${projectName(here, inv)}'s`;
   // An account's .claude.json holds an entry per project, wherever the file is.
   const inside = here !== undefined && !isClaudeJson(file) && isWithin(file, here);
+  // A parent folder's .codex, or a main checkout's, which Codex reads for the project: by its path.
+  if (!inside && !isClaudeJson(file)) return tilde(file, inv.homeDir);
   return `${whose} ${inside ? path.relative(here, file) : `entry in ${tilde(file, inv.homeDir)}`}`;
 }
 
@@ -640,10 +646,13 @@ function loadedLines(inv: Inventory, row: ScopeRow, project: string | undefined)
   if (state.value === "pending-approval") return [{ label: "Loaded", text: "pending approval here", tone: "warning" }];
   const own = item.location.project;
   const where = own === undefined ? "every project" : samePath(own, project) ? "this project" : projectName(own, inv);
-  // Codex profiles share one configuration: no account to name, but a profile's own skills folder.
+  // Codex profiles share one configuration: no account to name, but a profile's own skills
+  // folder, and the profiles that read a parent folder's .codex that is another one's home.
   if (item.location.tool === "codex") {
-    const profile = item.location.profile;
-    return [{ label: "Loaded", text: `on in ${where}${profile ? `, for profile ${shortProfile(profile)}` : ""}` }];
+    const who = item.location.profile !== undefined ? [item.location.profile] : (item.location.accounts ?? []);
+    const profiles =
+      who.length === 0 ? "" : `, for profile${who.length > 1 ? "s" : ""} ${who.map(shortProfile).join(", ")}`;
+    return [{ label: "Loaded", text: `on in ${where}${profiles}` }];
   }
   const who = perAccount?.map((a) => a.profile) ?? rowAccounts(inv, row);
   if (who === undefined || inv.claudeProfiles.every((p) => who.includes(p))) {
@@ -761,6 +770,7 @@ function skillLines(inv: Inventory, row: ScopeRow, project: string | undefined, 
     // Each account's copy is a folder of its own; the first stands for them.
     const more = row.items.length - 1;
     if (more > 0) lines.push({ label: "", text: `and ${more} more ${more === 1 ? "copy" : "copies"}`, tone: "muted" });
+    lines.push(...codexProfileLines(item));
   }
   if (item.link) {
     const broken = item.link.broken;
@@ -843,7 +853,19 @@ function mcpLines(inv: Inventory, row: ScopeRow, project: string | undefined): D
         : "";
     lines.push({ label: i === 0 ? "File" : "", text: `${tilde(loc.file, inv.homeDir)}${whose}${entry}` });
   });
+  lines.push(...codexProfileLines(firstOf(row)));
   return lines;
+}
+
+/**
+ * Which Codex profiles read a row only some do: one a parent folder's `.codex` holds, where that
+ * folder is another profile's home, which Codex leaves out for that one.
+ */
+function codexProfileLines(item: Extension): DetailLine[] {
+  const loc = item.location;
+  if (loc.tool !== "codex" || loc.accounts === undefined) return [];
+  const who = loc.accounts.map(shortProfile).join(", ");
+  return [{ label: "Profiles", text: `${who}, not the profile whose own Codex folder this is` }];
 }
 
 /**
@@ -857,7 +879,11 @@ function trustLines(inv: Inventory, row: ScopeRow, project: string | undefined):
   const ignored =
     untrustedOwn(inv, firstOf(row)) ||
     inv.facts.codexMcpEnabled.some(
-      (entry) => entry.project !== undefined && samePath(entry.project, here) && entry.name === row.name,
+      (entry) =>
+        entry.project !== undefined &&
+        entry.layer === undefined &&
+        samePath(entry.project, here) &&
+        entry.name === row.name,
     );
   return ignored ? [{ label: "Trust", text: CODEX_UNTRUSTED, tone: "warning" }] : [];
 }
@@ -872,7 +898,7 @@ const UNTRUSTED_OFF: Partial<Record<Extension["kind"], string>> = {
 
 /**
  * Whether an item is a Codex project's own hook or server, in a project Codex does not trust, so
- * does not load.
+ * does not load - one a parent folder's `.codex` holds by that folder's trust.
  */
 function untrustedOwn(inv: Inventory, item: Extension): boolean {
   const loc = item.location;
@@ -880,7 +906,7 @@ function untrustedOwn(inv: Inventory, item: Extension): boolean {
     (item.kind === "hook" || item.kind === "mcp") &&
     loc.tool === "codex" &&
     loc.scope === "project" &&
-    !codexTrusted(inv, loc.project)
+    !codexTrusted(inv, codexTrustFolder(item))
   );
 }
 
@@ -889,7 +915,7 @@ function hookLines(inv: Inventory, row: ScopeRow, project: string | undefined): 
   const lines: DetailLine[] = [{ label: "When", text: hookWhen(item).replace(/^When /, "") }];
   const runs = item.summary?.command ?? item.summary?.prompt;
   if (runs) lines.push({ label: "Runs", text: tildeIn(runs, inv.homeDir) });
-  lines.push({ label: "File", text: tilde(item.location.file, inv.homeDir) });
+  lines.push({ label: "File", text: tilde(item.location.file, inv.homeDir) }, ...codexProfileLines(item));
   // A plugin's hook is off with its plugin: say where, as for any item that is off.
   if (stateHere(inv, item, project).value !== "on" || item.codexError) lines.push(...loadedLines(inv, row, project));
   if (untrustedOwn(inv, item)) lines.push({ label: "Trust", text: CODEX_UNTRUSTED, tone: "warning" });

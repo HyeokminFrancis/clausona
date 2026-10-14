@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,6 +11,7 @@ import { type ExtensionsCommand, runExtensionsCommand } from "./cli.js";
 import { scopeSentence } from "./describe.js";
 import { loadInventory } from "./inventory.js";
 import { tilde } from "./present.js";
+import { pathKey } from "./read.js";
 import { scopesFor } from "./scopes.js";
 import { codexCanonical } from "./sources/codex-trust.js";
 import { TestHome } from "./test-home.js";
@@ -322,6 +323,18 @@ describe("skills ls", () => {
     expect(await run(h, app, "hooks", ["ls", "--scope", "global"])).toMatch(
       /^0 hooks · Global · project .+\n\nNo Global hooks\.$/,
     );
+    // Parent folders: .mcp.json for Claude Code, a parent's .codex for Codex.
+    const parents = async (command: ExtensionsCommand, ...tool: string[]) =>
+      (await run(h, app, command, ["ls", "--scope", "parents", ...tool])).split("\n\n")[1];
+    expect(await parents("mcp", "--tool", "claude")).toBe("No .mcp.json in the folders above this project.");
+    expect(await parents("mcp")).toBe(
+      "No .mcp.json in the folders above this project, and no .codex folder there has MCP servers.",
+    );
+    expect(await parents("hooks")).toBe("No .codex folder above this project has hooks.");
+    expect(await parents("hooks", "--tool", "claude")).toBe("Only Codex has hooks in Parent folders.");
+    expect(await parents("skills", "--tool", "codex")).toBe(
+      "No .agents/skills or .codex/skills in a folder above this project.",
+    );
   });
 });
 
@@ -369,9 +382,9 @@ describe("ls with no project (Review Focus 3)", () => {
 describe("ls options", () => {
   it("refuses a value or a scope that does not apply, as bad usage", async () => {
     const { h, app } = seed();
-    expect(await failure(run(h, app, "skills", ["ls", "--scope", "parents"]))).toMatchObject({
+    expect(await failure(run(h, app, "skills", ["ls", "--scope", "managed"]))).toMatchObject({
       code: 2,
-      message: "--scope parents does not apply to skills.",
+      message: "--scope managed does not apply to skills.",
     });
     expect(await failure(run(h, app, "hooks", ["ls", "--scope", "cloud"]))).toMatchObject({ code: 2 });
     expect(await failure(run(h, app, "mcp", ["ls", "--scope", "unused"]))).toMatchObject({ code: 2 });
@@ -411,7 +424,7 @@ describe("ls options", () => {
     expect(JSON.parse(scope.stdout ?? "")).toEqual({
       version: 1,
       error: "usage",
-      message: "--scope takes loaded, project, global, cloud, plugins, builtin, other, unused or all.",
+      message: "--scope takes loaded, project, parents, global, cloud, plugins, builtin, other, unused or all.",
     });
     const missing = await failure(run(h, app, "skills", ["show", "nope", "--json"]));
     expect(missing.code).toBe(1);
@@ -437,9 +450,9 @@ describe("ls options", () => {
   it("takes every scope each command has", async () => {
     const { h, app } = seed();
     const scopes: Record<ExtensionsCommand, string[]> = {
-      skills: ["loaded", "project", "global", "cloud", "plugins", "builtin", "other", "unused", "all"],
+      skills: ["loaded", "project", "parents", "global", "cloud", "plugins", "builtin", "other", "unused", "all"],
       mcp: ["loaded", "project", "parents", "global", "plugins", "managed", "other", "all"],
-      hooks: ["loaded", "project", "global", "plugins", "managed", "other", "all"],
+      hooks: ["loaded", "project", "parents", "global", "plugins", "managed", "other", "all"],
     };
     for (const [command, list] of Object.entries(scopes) as [ExtensionsCommand, string[]][]) {
       for (const scope of list) {
@@ -491,6 +504,30 @@ describe("ls options", () => {
     const fromWeb = await run(h, app, "skills", ["ls", "--project", "~/repos/web"]);
     expect(fromWeb).toBe(await run(h, app, "skills", ["ls", "--project", web]));
     expect(JSON.parse(await run(h, app, "skills", ["ls", "--project=~", "--json"])).project).toBe(h.home);
+  });
+
+  it("stands in a project recorded inside a repository when --project names it by that path", async () => {
+    const { h } = seed();
+    // A repository (h.project makes its .git), and two folders in it.
+    const mono = h.project("repos/mono");
+    const [sub, other] = [h.path("repos", "mono", "sub"), h.path("repos", "mono", "other")];
+    for (const dir of [sub, other]) mkdirSync(dir, { recursive: true });
+    // Codex recorded sub (a table with no trust_level records it and decides nothing); other no one did.
+    h.write(".codex/config.toml", `[projects.${JSON.stringify(sub)}]\n`);
+    const projectOf = async (at: string, cwd = h.home) =>
+      JSON.parse(await run(h, cwd, "skills", ["ls", "--project", at, "--json"])).project;
+    expect(await projectOf(sub)).toBe(sub);
+    expect(await projectOf("~/repos/mono/sub")).toBe(sub);
+    expect(await projectOf("sub", mono)).toBe(sub);
+    // Any other folder in the repository is the repository, as the current directory is.
+    expect(await projectOf(other)).toBe(mono);
+    expect(JSON.parse(await run(h, sub, "skills", ["ls", "--json"])).project).toBe(mono);
+    // On Windows a path matches in any case, as there a folder does.
+    if (process.platform === "win32") expect(await projectOf(sub.toUpperCase())).toBe(sub);
+    // Through a link it is the recorded project too, by its real path, as the current one is found.
+    h.link("repos/mono", "links/mono");
+    expect(await projectOf(h.path("links", "mono", "sub"))).toBe(sub);
+    expect(await projectOf(h.path("links", "mono", "other"))).toBe(h.path("links", "mono"));
   });
 });
 
@@ -1141,6 +1178,39 @@ describe("Codex hooks and Codex's trust", () => {
     expect(there.items.map((i: { name: string; scope: string }) => [i.name, i.scope])).toEqual([["shared", "global"]]);
   });
 
+  it("shows a user server a trusted project's table changes without a command as Codex runs it there", async () => {
+    const { h, app, web } = seed();
+    h.write(
+      ".codex/config.toml",
+      `[projects.${JSON.stringify(app)}]\ntrust_level = "trusted"\n\n[mcp_servers.exa]\ncommand = "npx"\nargs = ["-y", "exa"]\nenv = { A = "1" }\n`,
+    );
+    // Codex 0.159.3's config/read in app: exa runs npx --p, env A; in web, untrusted, npx -y exa.
+    h.write("repos/app/.codex/config.toml", '[mcp_servers.exa]\nargs = ["--p"]\n');
+    h.write("repos/web/.codex/config.toml", '[mcp_servers.exa]\nargs = ["--p"]\n');
+    type Row = { name: string; scope: string; summary: Record<string, string>; tags: string[] };
+    const rows = async (cwd: string) =>
+      (JSON.parse(await run(h, cwd, "mcp", ["ls", "--tool", "codex", "--scope", "all", "--json"])).items as Row[]).map(
+        (i) => [i.scope, i.summary.command, i.tags],
+      );
+    expect(await rows(app)).toEqual([
+      ["project", "npx --p", []],
+      ["global", "npx -y exa", ["hidden by Project copy"]],
+    ]);
+    // From web app's copy is another project's.
+    expect(await rows(web)).toEqual([
+      ["global", "npx -y exa", []],
+      ["other", "npx --p", []],
+    ]);
+    // A change goes to app's own table, as for any project copy.
+    const off = JSON.parse(await run(h, app, "mcp", ["off", "exa", "--tool", "codex", "--dry-run", "--json"]));
+    expect(off.changes.map((c: { file: string; what: string }) => [c.file, c.what])).toEqual([
+      [path.join(app, ".codex", "config.toml"), "mcp_servers.exa.enabled → false"],
+    ]);
+    // A table that only switches it is that switch, and no copy.
+    h.write("repos/app/.codex/config.toml", "[mcp_servers.exa]\nenabled = false\n");
+    expect(await rows(app)).toEqual([["global", "npx -y exa", ["off here"]]]);
+  });
+
   it("shows a trusted project's server merged over the user's, as Codex runs it, and an untrusted one's as written", async () => {
     const { h, app, web } = seed();
     h.write(
@@ -1160,6 +1230,291 @@ describe("Codex hooks and Codex's trust", () => {
     expect(there.items.map((i: { summary: Record<string, string> }) => i.summary)).toEqual([
       { transport: "stdio", command: "web-shared", env: "B" },
     ]);
+  });
+
+  /**
+   * A home whose project root, for Codex, is ~/repos (a `.hg` marker there), above app and web:
+   * Codex reads ~/repos/.codex for both, by ~/repos's own trust - and ~/repos, whose entry that
+   * is, is a project too. `user` goes after the markers.
+   */
+  const parentHome = (user: (projects: { app: string; web: string }) => string) => {
+    const seeded = seed();
+    const { h } = seeded;
+    const repos = h.path("repos");
+    h.write("repos/.hg/requires", "");
+    h.write(
+      ".codex/config.toml",
+      `project_root_markers = [".hg"]\n\n[projects.${JSON.stringify(repos)}]\ntrust_level = "trusted"\n\n${user(seeded)}`,
+    );
+    return { ...seeded, repos, parentFile: path.join(repos, ".codex", "config.toml") };
+  };
+
+  it("lists what a parent folder's .codex holds under Parent folders with its file, merged as Codex merges it", async () => {
+    const { h, app, web, parentFile } = parentHome(
+      ({ web }) =>
+        `[projects.${JSON.stringify(web)}]\ntrust_level = "untrusted"\n\n[mcp_servers.shared]\ncommand = "user-shared"\n`,
+    );
+    h.write(
+      "repos/.codex/config.toml",
+      '[mcp_servers.rootsrv]\ncommand = "root"\n\n[mcp_servers.shared]\ncommand = "root-shared"\nargs = ["--root"]\n',
+    );
+    h.write("repos/.codex/hooks.json", { hooks: { Stop: [{ hooks: [{ type: "command", command: "root-hook" }] }] } });
+    h.write(
+      "repos/app/.codex/config.toml",
+      '[mcp_servers.subsrv]\ncommand = "sub"\n\n[mcp_servers.shared]\nenv = { S = "1" }\n',
+    );
+    h.write("repos/app/.codex/hooks.json", {
+      hooks: { Stop: [{ hooks: [{ type: "command", command: "sub-hook" }] }] },
+    });
+    h.write("repos/web/.codex/config.toml", '[mcp_servers.websrv]\ncommand = "web"\n');
+    type Row = { name: string; file: string; state: string; tags: string[]; summary: Record<string, string> };
+    const rows = async (cwd: string, scope: string, command: ExtensionsCommand = "mcp") =>
+      (
+        JSON.parse(await run(h, cwd, command, ["ls", "--tool", "codex", "--scope", scope, "--json"])).items as Row[]
+      ).map((i) => [i.name, i.file, i.state, i.tags, i.summary.command]);
+    const appFile = path.join(app, ".codex", "config.toml");
+    // What Codex 0.159.3's config/read gave started in a folder below a trusted root: the root's
+    // rootsrv, the folder's subsrv, and shared as root-shared --root with the folder's env S.
+    expect(await rows(app, "parents")).toEqual([
+      ["rootsrv", parentFile, "on", [], "root"],
+      ["shared", parentFile, "on", ["hidden by Project copy"], "root-shared --root"],
+    ]);
+    expect(await rows(app, "project")).toEqual([
+      ["shared", appFile, "on", [], "root-shared --root"],
+      ["subsrv", appFile, "on", [], "sub"],
+    ]);
+    const shared = JSON.parse(await run(h, app, "mcp", ["ls", "--tool", "codex", "--scope", "project", "--json"]));
+    expect(shared.items[0].summary).toMatchObject({ env: "S" });
+    const table = await run(h, app, "mcp", ["ls", "--tool", "codex", "--scope", "parents"], 160);
+    expect(table).toMatch(/^rootsrv\s+~[\\/]repos[\\/]\.codex[\\/]config\.toml\s/m);
+    expect(firstLine(table)).toMatch(/^2 MCP servers · Parent folders · /);
+    // The screen lists them in a scope of their own, after Project and before Global.
+    const inv = await loadInventory(h.inventoryOptions(app));
+    expect(scopesFor(inv, "codex", "mcp", app, NOW).map((s) => s.id)).toEqual([
+      "loaded",
+      "project",
+      "parents",
+      "global",
+    ]);
+    expect(scopeSentence("parents", "codex", "hook", inv, app)).toBe(
+      `PARENT FOLDERS — .codex in ${tilde(h.path("repos"), h.home)} · runs here too`,
+    );
+    // Codex lists both folders' hooks.
+    expect((await rows(app, "parents", "hooks")).map((r) => r[1])).toEqual([
+      path.join(h.path("repos"), ".codex", "hooks.json"),
+    ]);
+    expect((await rows(app, "project", "hooks")).map((r) => r[1])).toEqual([path.join(app, ".codex", "hooks.json")]);
+    // Where Codex does not trust the folder but trusts the root, it reads the root's alone.
+    expect(await rows(web, "parents")).toEqual([
+      ["rootsrv", parentFile, "on", [], "root"],
+      ["shared", parentFile, "on", [], "root-shared --root"],
+    ]);
+    expect(await rows(web, "project")).toEqual([
+      ["websrv", path.join(web, ".codex", "config.toml"), "off", ["off"], "web"],
+    ]);
+    expect(await run(h, web, "mcp", ["show", "rootsrv"])).not.toMatch(/^Trust/m);
+    // Your shared gives way to the nearest copy Codex reads: app's own in app, the root's in web.
+    const userFile = h.path(".codex", "config.toml");
+    expect(await rows(app, "global")).toEqual([["shared", userFile, "on", ["hidden by Project copy"], "user-shared"]]);
+    expect(await rows(web, "global")).toEqual([
+      ["shared", userFile, "on", ["hidden by Parent folders copy"], "user-shared"],
+    ]);
+  });
+
+  it("reads no parent folder's .codex Codex does not trust, nor any where no marker is above", async () => {
+    // The root's own entry says untrusted, app's trusted: Codex reads app's alone.
+    const { h, app, repos } = parentHome(({ app }) => `[projects.${JSON.stringify(app)}]\ntrust_level = "trusted"\n`);
+    h.write(
+      ".codex/config.toml",
+      `project_root_markers = [".hg"]\n\n[projects.${JSON.stringify(repos)}]\ntrust_level = "untrusted"\n\n[projects.${JSON.stringify(app)}]\ntrust_level = "trusted"\n`,
+    );
+    h.write("repos/.codex/config.toml", '[mcp_servers.rootsrv]\ncommand = "root"\n');
+    h.write("repos/app/.codex/config.toml", '[mcp_servers.subsrv]\ncommand = "sub"\n');
+    const names = async (scope: string) =>
+      JSON.parse(await run(h, app, "mcp", ["ls", "--tool", "codex", "--scope", scope, "--json"])).items.map(
+        (i: { name: string }) => i.name,
+      );
+    expect(await names("parents")).toEqual([]);
+    expect(await names("project")).toEqual(["subsrv"]);
+    // With no marker, Codex's project root is the folder it starts in: no parent is read, and the
+    // root's entry is no longer app's.
+    h.write(
+      ".codex/config.toml",
+      `project_root_markers = []\n\n[projects.${JSON.stringify(repos)}]\ntrust_level = "trusted"\n\n[projects.${JSON.stringify(app)}]\ntrust_level = "trusted"\n`,
+    );
+    expect(await names("parents")).toEqual([]);
+    expect(await names("loaded")).toEqual(["subsrv"]);
+  });
+
+  it("refuses with Codex a parent's config.toml that does not parse, and a project's it makes unreadable", async () => {
+    const { h, app, web, repos, parentFile } = parentHome(() => "");
+    const warnings = async () =>
+      JSON.parse(await run(h, app, "mcp", ["ls", "--tool", "codex", "--json"])).warnings.map(
+        (w: { file: string; message: string }) => [w.file, w.message],
+      );
+    // Codex 0.159.3 refused the root's file for every folder below it, as for the root itself.
+    h.write("repos/.codex/config.toml", "[mcp_servers.bad\n");
+    const said = await warnings();
+    expect(said).toHaveLength(1);
+    expect(said[0][0]).toBe(parentFile);
+    expect(said[0][1]).toMatch(/^is not valid TOML at line \d+, column \d+, so Codex loads no config in /);
+    const all = `${tilde(repos, h.home)}, ${tilde(app, h.home)} and ${tilde(web, h.home)}`;
+    expect(said[0][1].endsWith(all)).toBe(true);
+    // Merged, as Codex checks it: the root's server with app's args of the wrong type is app's to fix.
+    h.write("repos/.codex/config.toml", '[mcp_servers.shared]\ncommand = "root-shared"\n');
+    h.write("repos/app/.codex/config.toml", '[mcp_servers.shared]\nargs = "x"\n');
+    const appFile = path.join(app, ".codex", "config.toml");
+    expect(await warnings()).toEqual([
+      [appFile, `has an MCP server Codex cannot read, so Codex loads no config in ${tilde(app, h.home)}`],
+    ]);
+    // And the root's table with no command, which app's command completes, is no problem in app.
+    // In the root and in web nothing completes it: Codex refuses it there, as the root's.
+    h.write("repos/.codex/config.toml", '[mcp_servers.shared]\nenv = { A = "1" }\n');
+    h.write("repos/app/.codex/config.toml", '[mcp_servers.shared]\ncommand = "sub-shared"\n');
+    expect(await warnings()).toEqual([
+      [
+        parentFile,
+        `has an MCP server Codex cannot read, so Codex loads no config in ${tilde(repos, h.home)} and ${tilde(web, h.home)}`,
+      ],
+    ]);
+    const project = JSON.parse(await run(h, app, "mcp", ["ls", "--tool", "codex", "--scope", "project", "--json"]));
+    expect(project.items.map((i: { summary: Record<string, string> }) => i.summary)).toEqual([
+      { transport: "stdio", command: "sub-shared", env: "A" },
+    ]);
+  });
+
+  it("reads the primary's Codex home as a parent folder's .codex for the other profiles alone", async () => {
+    const { h, app } = seed();
+    // The home is the project root (a .hg marker), so its .codex is above app: the primary's own
+    // home, which a second profile, linking its config.toml, hooks.json and skills, reads too.
+    h.write(".hg/requires", "");
+    h.write(
+      ".codex/config.toml",
+      `project_root_markers = [".hg"]\n\n[projects.${JSON.stringify(h.home)}]\ntrust_level = "trusted"\n\n[mcp_servers.exa]\ncommand = "npx"\n`,
+    );
+    const hooksFile = h.path(".codex", "hooks.json");
+    h.write(".codex/hooks.json", { hooks: { Stop: [{ hooks: [{ type: "command", command: "home-hook" }] }] } });
+    h.skill(".codex/skills", "askill");
+    type Row = { name: string; file: string; accounts?: string[]; summary: Record<string, string> };
+    const rows = async (command: ExtensionsCommand) =>
+      (
+        JSON.parse(await run(h, app, command, ["ls", "--tool", "codex", "--scope", "parents", "--json"])).items as Row[]
+      ).map((i) => [i.summary.command ?? i.name, i.file, i.accounts]);
+    // The primary leaves its own home out, as Codex 0.159.3 does with CODEX_HOME.
+    expect(await rows("hooks")).toEqual([]);
+    h.codex("work", ".codex-work");
+    h.link(".codex/skills", ".codex-work/skills");
+    // A file link; on Windows, where a test may not make one, a hard link, which is the same file.
+    for (const name of ["config.toml", "hooks.json"]) {
+      const [target, link] = [h.path(".codex", name), h.path(".codex-work", name)];
+      if (process.platform === "win32") linkSync(target, link);
+      else symlinkSync(target, link);
+    }
+    // Codex run as work listed the hook a second time, under ~/.codex's key; the servers and
+    // skills it merged in or listed once, the files being its own.
+    expect(await rows("hooks")).toEqual([["home-hook", hooksFile, ["codex:work"]]]);
+    expect(await rows("mcp")).toEqual([]);
+    expect(await rows("skills")).toEqual([]);
+    const shown = await run(h, app, "hooks", ["show", "Stop", "--scope", "parents"]);
+    expect(shown).toMatch(/^File\s+~[\\/]\.codex[\\/]hooks\.json$/m);
+    expect(shown).toMatch(/^Profiles\s+work, not the profile whose own Codex folder this is$/m);
+    // A profile whose config.toml is its own takes the primary's servers from there too, and the
+    // primary's reading, which the states are, is as it was.
+    rmSync(h.path(".codex-work", "config.toml"));
+    h.write(".codex-work/config.toml", 'project_root_markers = [".hg"]\n');
+    expect(await rows("mcp")).toEqual([["npx", h.path(".codex", "config.toml"), ["codex:work"]]]);
+    const global = JSON.parse(await run(h, app, "mcp", ["ls", "--tool", "codex", "--scope", "global", "--json"]));
+    expect(global.items.map((i: { name: string; tags: string[] }) => [i.name, i.tags])).toEqual([["exa", []]]);
+  });
+
+  it("lists the skills folders Codex reads from the project root down, whatever the trust", async () => {
+    const { h, app, repos } = parentHome(() => "");
+    // The root's own entry says untrusted, and app has none: skills/list still listed them all.
+    h.write(
+      ".codex/config.toml",
+      `project_root_markers = [".hg"]\n\n[projects.${JSON.stringify(repos)}]\ntrust_level = "untrusted"\n`,
+    );
+    const root = h.skill("repos/.agents/skills", "rootskill");
+    const rootCodex = h.skill("repos/.codex/skills", "rcskill");
+    const own = h.skill("repos/app/.agents/skills", "subskill");
+    const ownCodex = h.skill("repos/app/.codex/skills", "scskill");
+    h.skill("repos/app/deep/.agents/skills", "deepskill");
+    type Row = { name: string; file: string; state: string };
+    const rows = async (scope: string) =>
+      (
+        JSON.parse(await run(h, app, "skills", ["ls", "--tool", "codex", "--scope", scope, "--json"])).items as Row[]
+      ).map((i) => [i.name, i.file, i.state]);
+    // What Codex 0.159.3's skills/list gave started in a folder below the root, the root untrusted.
+    expect(await rows("parents")).toEqual([
+      ["rcskill", rootCodex, "on"],
+      ["rootskill", root, "on"],
+    ]);
+    expect(await rows("project")).toEqual([
+      ["scskill", ownCodex, "on"],
+      ["subskill", own, "on"],
+    ]);
+    const loaded = JSON.parse(await run(h, app, "skills", ["ls", "--tool", "codex", "--json"])).items;
+    expect(loaded.map((i: { name: string }) => i.name)).toEqual([
+      "eli5",
+      "rcskill",
+      "rootskill",
+      "scskill",
+      "subskill",
+    ]);
+    // With no marker, Codex reads the project's own alone.
+    h.write(".codex/config.toml", "project_root_markers = []\n");
+    expect(await rows("parents")).toEqual([]);
+  });
+
+  it("deletes a skill a project below also lists under Parent folders, as the one folder it is", async () => {
+    const { h, app, repos } = parentHome(() => "");
+    // ~/repos, recorded by its trust entry, is a project with the skill as its own; app sees it from below.
+    const folder = h.skill("repos/.agents/skills", "rootskill");
+    for (const [cwd, scope] of [
+      [repos, "project"],
+      [app, "parents"],
+    ] as const) {
+      const plan = JSON.parse(
+        await run(h, cwd, "skills", ["rm", "rootskill", "--tool", "codex", "--scope", scope, "--dry-run", "--json"]),
+      );
+      expect(plan.refused).toEqual([]);
+      expect(plan.changes.map((c: { file: string }) => c.file)).toEqual([folder]);
+    }
+  });
+
+  it("switches a parent folder's server in the project's own config.toml, and deletes it in the parent's", async () => {
+    const { h, app, parentFile } = parentHome(() => '[mcp_servers.u]\ncommand = "u"\n');
+    h.write(
+      "repos/.codex/config.toml",
+      '[mcp_servers.rootsrv]\ncommand = "root"\n\n[mcp_servers.u]\nenabled = false\n',
+    );
+    const appFile = path.join(app, ".codex", "config.toml");
+    const plan = async (args: string[]) =>
+      JSON.parse(await run(h, app, "mcp", [...args, "--tool", "codex", "--dry-run", "--json"])).changes.map(
+        (c: { file: string; what: string }) => [c.file, c.what],
+      );
+    // Codex 0.159.3 left u off below the root that turns it off, and on where the folder turns it on.
+    const state = async () =>
+      JSON.parse(await run(h, app, "mcp", ["ls", "--tool", "codex", "--scope", "global", "--json"])).items.map(
+        (i: { name: string; state: string; tags: string[] }) => [i.name, i.state, i.tags],
+      );
+    expect(await state()).toEqual([["u", "off", ["off here"]]]);
+    expect(await run(h, app, "mcp", ["show", "u"])).toMatch(/~[\\/]repos[\\/]\.codex[\\/]config\.toml/);
+    expect(await plan(["on", "u"])).toEqual([[appFile, "mcp_servers.u.enabled → true"]]);
+    expect(await plan(["off", "rootsrv"])).toEqual([[appFile, "mcp_servers.rootsrv.enabled → false"]]);
+    expect(await plan(["rm", "rootsrv"])).toEqual([[parentFile, "[mcp_servers.rootsrv] deleted"]]);
+    // Everywhere is refused, as for a project's server, naming the file that defines it.
+    const everywhere = JSON.parse(
+      await run(h, app, "mcp", ["off", "rootsrv", "--everywhere", "--tool", "codex", "--dry-run", "--json"]),
+    );
+    expect(everywhere.refused.map((r: { code: string; reason: string }) => [r.code, r.reason])).toEqual([
+      [
+        "codex-project-everywhere",
+        `It is defined in ${tilde(parentFile, h.home)}, for the projects below that folder. Leave out --everywhere.`,
+      ],
+    ]);
+    h.write("repos/app/.codex/config.toml", "[mcp_servers.u]\nenabled = true\n");
+    expect(await state()).toEqual([["u", "on", []]]);
   });
 
   it.skipIf(!hasGit)(
@@ -1409,14 +1764,108 @@ describe("Codex hooks and Codex's trust", () => {
       ]);
       // git names the main checkout by its real path, and Codex reads its hooks there.
       const mainFile = realpathSync.native(path.join(main, ".codex", "config.toml"));
-      const fromWorktree = listed.warnings.filter((w: { message: string }) => w.message.includes("worktree"));
-      expect(fromWorktree.map((w: { file: string; message: string }) => [w.file, w.message])).toEqual([
-        [mainFile, `has a hook Codex cannot read, so Codex loads no config in the worktree ${tilde(wt, h.home)}`],
-      ]);
+      // One line per cause: the worktree's, and the main checkout's own, a recorded project too,
+      // which on Windows spells the file by Codex's lower-cased key: one file all the same. In
+      // either order: projects come in path order, which that spelling changes on Windows.
+      const place = (p: string) => tilde(p, h.home);
+      expect(listed.warnings.map((w: { file: string; message: string }) => [pathKey(w.file), w.message])).toEqual(
+        expect.arrayContaining([
+          [pathKey(mainFile), `has a hook Codex cannot read, so Codex loads no config in ${place(wt)}`],
+          [
+            pathKey(mainFile),
+            `has an MCP server Codex cannot read, so Codex loads no config in ${place(codexTrustKey(main))}`,
+          ],
+        ]),
+      );
+      expect(listed.warnings).toHaveLength(2);
       const id = listed.items.find((i: { name: string }) => i.name === "eli5").id;
       expect(await run(h, wt, "skills", ["show", "--id", id])).toContain(
         `off here (Codex cannot read ${tilde(mainFile, h.home)})`,
       );
+    },
+    SPAWNING_TEST_TIMEOUT_MS,
+  );
+
+  it.skipIf(!hasGit)(
+    "warns once of a main checkout's config.toml Codex refuses, naming the main checkout and its worktree",
+    async () => {
+      const { h } = seed();
+      const { main, wt } = worktreeHome(h, "");
+      const mainFile = path.join(realpathSync.native(path.join(main, ".codex")), "config.toml");
+      const places = `${tilde(codexTrustKey(main), h.home)} and ${tilde(wt, h.home)}`;
+      // The main checkout reads its file by Codex's key, on Windows lower-cased, and the worktree as
+      // git spells it: one file, one line.
+      const warnings = async () =>
+        JSON.parse(await run(h, wt, "skills", ["ls", "--tool", "codex", "--json"])).warnings.map(
+          (w: { file: string; message: string }) => [pathKey(w.file), w.message],
+        );
+      // A hook Codex cannot read refuses both, the main checkout as its own project and its worktree.
+      h.write(
+        "repos/main/.codex/config.toml",
+        '[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "echo main"\ntimeout = 30.0\n',
+      );
+      expect(await warnings()).toEqual([
+        [pathKey(mainFile), `has a hook Codex cannot read, so Codex loads no config in ${places}`],
+      ]);
+      // And one that does not parse: one parse warning.
+      h.write("repos/main/.codex/config.toml", "[x\n");
+      const said = await warnings();
+      expect(said).toHaveLength(1);
+      expect(said[0][1]).toMatch(/^is not valid TOML at line \d+, column \d+, so Codex loads no config in /);
+      expect(said[0][1].endsWith(places)).toBe(true);
+    },
+    SPAWNING_TEST_TIMEOUT_MS,
+  );
+
+  it.skipIf(!hasGit)(
+    "runs a worktree's main checkout's hooks for a folder above the project too, and none of the worktree's own there",
+    async () => {
+      const { h } = seed();
+      const { main, wt } = worktreeHome(h, "");
+      const sub = path.join(wt, "sub");
+      const stop = (command: string) => ({ hooks: { Stop: [{ hooks: [{ type: "command", command }] }] } });
+      const toml = (command: string) =>
+        `[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "${command}"\n`;
+      h.write("repos/main/.codex/hooks.json", stop("main-root"));
+      h.write("repos/main/.codex/config.toml", `[mcp_servers.mainsrv]\ncommand = "main"\n\n${toml("main-root-toml")}`);
+      h.write("repos/main/sub/.codex/hooks.json", stop("main-sub"));
+      h.write("repos/main-wt/.codex/hooks.json", stop("wt-root"));
+      h.write("repos/main-wt/.codex/config.toml", `[mcp_servers.wtsrv]\ncommand = "wt"\n\n${toml("wt-root-toml")}`);
+      h.write("repos/main-wt/sub/.codex/hooks.json", stop("wt-sub"));
+      // Codex recorded sub, a folder of the worktree, which --project then stands in.
+      h.write(
+        ".codex/config.toml",
+        `[projects.${JSON.stringify(codexTrustKey(main))}]\ntrust_level = "trusted"\n\n[projects.${JSON.stringify(sub)}]\n`,
+      );
+      type Row = { id: string; state: string; tags: string[]; summary: { command: string } };
+      const rows = async (command: ExtensionsCommand, scope: string) =>
+        (
+          JSON.parse(await run(h, wt, command, ["ls", "--tool", "codex", "--scope", scope, "--project", sub, "--json"]))
+            .items as Row[]
+        ).map((i) => [i.summary.command, i.tags]);
+      // What Codex 0.159.3's hooks/list gave started in the worktree's sub: the main checkout's
+      // at the worktree's root and at sub, and the worktree's own servers.
+      expect(await rows("hooks", "parents")).toEqual([
+        ["wt-root", ["main checkout's runs"]],
+        ["wt-root-toml", ["main checkout's runs"]],
+        ["main-root", ["pending approval"]],
+        ["main-root-toml", ["pending approval"]],
+      ]);
+      expect(await rows("hooks", "project")).toEqual([
+        ["wt-sub", ["main checkout's runs"]],
+        ["main-sub", ["pending approval"]],
+      ]);
+      expect((await rows("mcp", "parents")).map((r) => r[0])).toEqual(["wt"]);
+      // The worktree's own, above the project too: refused, naming the main checkout's file.
+      const listed: Row[] = JSON.parse(
+        await run(h, wt, "hooks", ["ls", "--tool", "codex", "--scope", "parents", "--project", sub, "--json"]),
+      ).items;
+      const own = listed.find((i) => i.summary.command === "wt-root")?.id ?? "";
+      const shownAt = tilde(path.join(realpathSync.native(path.join(main, ".codex")), "hooks.json"), h.home);
+      const off = JSON.parse(await run(h, wt, "hooks", ["off", "--id", own, "--project", sub, "--dry-run", "--json"]));
+      expect(off.refused.map((r: { code: string; reason: string }) => [r.code, r.reason])).toEqual([
+        ["codex-worktree-hook", `Codex runs the hooks in ${shownAt} in this worktree. Change them there.`],
+      ]);
     },
     SPAWNING_TEST_TIMEOUT_MS,
   );
@@ -1506,6 +1955,59 @@ describe("Codex hooks and Codex's trust", () => {
     expect(await run(h, app, "hooks", ["show", "--id", json.items[0].id])).toMatch(
       /^Loaded\s+no, Codex skips a hook whose command is empty$/m,
     );
+  });
+
+  it("plans a skill switch in a project whose config.toml Codex refuses, noting it stays off there", async () => {
+    const { h, app } = seed();
+    h.write(
+      ".codex/config.toml",
+      `[projects.${JSON.stringify(app)}]\ntrust_level = "trusted"\n\n[[skills.config]]\nname = "eli5"\nenabled = false\n`,
+    );
+    h.write("repos/app/.codex/config.toml", "[mcp_servers.p]\ncommand = 5\n");
+    h.skill("repos/app/.agents/skills", "proj");
+    const own = tilde(path.join(app, ".codex", "config.toml"), h.home);
+    const user = h.path(".codex", "config.toml");
+    const noted = `stays off in this project until Codex can read ${own}`;
+    const lines = async (args: string[]) =>
+      JSON.parse(await run(h, app, "skills", [...args, "--tool", "codex", "--dry-run", "--json"])).changes.map(
+        (c: { file: string; what: string; note: string | null }) => [c.file, c.what, c.note],
+      );
+    // The user config.toml, as anywhere: the name entry goes, and the path entry is made.
+    expect(await lines(["on", "eli5", "--everywhere"])).toEqual([[user, "skills.config eli5 removed", noted]]);
+    const skillFile = tilde(path.join(app, ".agents", "skills", "proj", "SKILL.md"), h.home);
+    expect(await lines(["off", "proj"])).toEqual([[user, `skills.config ${skillFile} → off`, noted]]);
+  });
+
+  it("plans a server switch in a project whose config.toml Codex refuses but clausona reads, noting it stays off", async () => {
+    const { h, app } = seed();
+    h.write(
+      ".codex/config.toml",
+      `[projects.${JSON.stringify(app)}]\ntrust_level = "trusted"\n\n[mcp_servers.exa]\ncommand = "npx"\n`,
+    );
+    const file = path.join(app, ".codex", "config.toml");
+    const plan = (verb: string) =>
+      run(h, app, "mcp", [verb, "exa", "--tool", "codex", "--dry-run", "--json"]).then(JSON.parse);
+    // A wrong type, which Codex refuses: the file reads, so the switch is planned in it.
+    h.write("repos/app/.codex/config.toml", "[mcp_servers.p]\ncommand = 5\n");
+    const off = await plan("off");
+    expect(off.refused).toEqual([]);
+    expect(
+      off.changes.map((c: { file: string; what: string; note: string | null }) => [c.file, c.what, c.note]),
+    ).toEqual([
+      [
+        file,
+        "mcp_servers.exa.enabled → false",
+        `stays off in this project until Codex can read ${tilde(file, h.home)}`,
+      ],
+    ]);
+    // In the text, on a line of its own under the change, so the file to fix is never cut off.
+    const text = (await run(h, app, "mcp", ["off", "exa", "--tool", "codex", "--dry-run"], 100)).split("\n");
+    const at = text.findIndex((line) => line.includes("mcp_servers.exa.enabled → false"));
+    expect(text[at]?.trimEnd().endsWith("mcp_servers.exa.enabled → false")).toBe(true);
+    expect(text[at + 1]).toBe(`        stays off in this project until Codex can read ${tilde(file, h.home)}`);
+    // Not valid TOML: clausona cannot edit it either.
+    h.write("repos/app/.codex/config.toml", "[mcp_servers.p\n");
+    expect((await plan("off")).refused.map((r: { code: string }) => r.code)).toEqual(["unreadable"]);
   });
 
   it("loads nothing of Codex in a trusted project whose config.toml Codex refuses, and says so", async () => {

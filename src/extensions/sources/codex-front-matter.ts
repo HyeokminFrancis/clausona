@@ -7,22 +7,24 @@
  * none, it refuses too.
  *
  * Not a YAML parser: a check of the block mappings, sequences and scalars front matter is written
- * in, flow collections over one line or several, tags, anchors and aliases, explicit `? ` keys and
- * the `---` and `...` document markers. It says a front matter does not read only where libyaml
- * refuses it, or serde finds the three fields of the wrong shape - each rule as Codex's
- * skills/list showed it; for what it does not follow - a `%TAG` directive, an explicit key in a
- * flow collection, a block scalar as a key, an alias to the node it sits in - it says nothing, and
- * the skill reads as it did before.
+ * in, flow collections over one line or several, tags (with `%TAG` handles), anchors and aliases,
+ * explicit `? ` keys in a block and in a flow collection, and the `%` directives and `---` and
+ * `...` markers. It says a front matter does not read only where libyaml refuses it, or serde finds
+ * the three fields of the wrong shape - each rule as Codex's skills/list showed it; for what it
+ * does not follow - an alias, in a value checked on its own, to the node it sits in, a tag there
+ * - it says nothing, and the skill reads as it did before.
  */
 
 /**
  * A node's shape: what the three fields' types turn on. A scalar says whether it is plain, its
- * tag, and whether it is null or blank as it stands; an alias, the node it names, if one is
- * anchored before it.
+ * tag, and whether it is null or blank as it stands, and keeps its value - all its lines, its
+ * escapes read - as far as the name and the description shown need it: their whitespace Codex
+ * collapses (`sanitize_single_line`), so a line break is a space here. An alias names the node it
+ * stands for, if one is anchored before it.
  */
 type Shape =
   | { kind: "empty"; tag?: string }
-  | { kind: "scalar"; text: string; null: boolean; blank: boolean; plain: boolean; tag?: string }
+  | { kind: "scalar"; text: string; value: string; null: boolean; blank: boolean; plain: boolean; tag?: string }
   | { kind: "seq" }
   | { kind: "map"; entries: Entry[] }
   | { kind: "alias"; target?: Shape; open: boolean };
@@ -39,24 +41,64 @@ class Unknown extends Error {}
 const NULL_TAG = "tag:yaml.org,2002:null";
 
 /**
- * Why Codex does not load a SKILL.md whose front matter is `block`, if it does not: the front
- * matter is not valid YAML, or it has no description - none, a null one, or one of whitespace
- * alone - which Codex checks after the name's length.
+ * What Codex reads of a SKILL.md's front matter, `block`: why it does not load the skill, if it
+ * does not - the front matter is not valid YAML, or it has no description (none, a null one, or
+ * one of whitespace alone), which Codex checks after the name's length - and, where it reads the
+ * front matter, the `name` and `description` it gives the skill, each on one line as
+ * `sanitize_single_line` makes it; no name where the field is none or empty, as Codex then takes
+ * the folder's. `followed` is false where this check says nothing (Unknown), and then only that.
  */
-export function codexFrontMatterError(block: string): "invalid front matter" | "no description" | undefined {
+export type CodexFrontMatter = {
+  error?: "invalid front matter" | "no description";
+  name?: string;
+  description?: string;
+  followed: boolean;
+};
+
+export function codexFrontMatter(block: string): CodexFrontMatter {
   try {
     let root = read(block);
     if (root === undefined) {
       const repaired = repairedFields(block);
       if (repaired !== undefined) root = read(repaired);
     }
-    if (root === undefined) return "invalid front matter";
-    const description = root === "empty" ? undefined : fieldOf(root, "description");
-    return description === undefined || stringField(description) !== "text" ? "no description" : undefined;
+    if (root === undefined) return { error: "invalid front matter", followed: true };
+    const map = root;
+    const field = (name: string) => (map === "empty" ? undefined : fieldOf(map, name));
+    const description = field("description");
+    const error = description === undefined || stringField(description) !== "text" ? "no description" : undefined;
+    const name = rustSingleLine(stringOf(field("name")) ?? "");
+    const shown = rustSingleLine(stringOf(description) ?? "");
+    return {
+      ...(error ? { error } : {}),
+      ...(name ? { name } : {}),
+      ...(shown ? { description: shown } : {}),
+      followed: true,
+    };
   } catch (error) {
-    if (error instanceof Unknown) return undefined;
+    if (error instanceof Unknown) return { followed: false };
     throw error;
   }
+}
+
+/** Why Codex does not load a SKILL.md whose front matter is `block`, if it does not (codexFrontMatter). */
+export function codexFrontMatterError(block: string): "invalid front matter" | "no description" | undefined {
+  return codexFrontMatter(block).error;
+}
+
+/** A field's string as serde gets it, undefined for none: a null, or no value at all. */
+function stringOf(shape: Shape | undefined): string | undefined {
+  if (shape === undefined) return undefined;
+  const node = resolved(shape);
+  if (node.kind === "empty") return node.tag === undefined ? undefined : "";
+  if (node.kind !== "scalar") return undefined;
+  if (node.plain && (node.tag === NULL_TAG || (node.tag === undefined && node.null))) return undefined;
+  return node.value;
+}
+
+/** Codex's `sanitize_single_line`: the words of `text`, split at Rust's whitespace, joined by one space. */
+function rustSingleLine(text: string): string {
+  return text.split(RUST_SPACES).filter(Boolean).join(" ");
 }
 
 /** The front matter's mapping, or "empty" for one with no node at all; undefined where Codex fails to read it. */
@@ -72,27 +114,24 @@ function read(text: string): MapShape | "empty" | undefined {
 }
 
 /**
- * An alias as serde reads it where it deserializes one: the node it names, or a refusal ("unknown
- * anchor") where none is anchored before it. One inside the node it names, this does not follow.
+ * An alias as serde reads it where it deserializes one: the node it names. One with no anchor
+ * before it serde's loader refuses wherever it is ("unknown anchor"), so the reader refuses it as
+ * it reads it. One inside the node it names - a collection - this does not follow here.
  */
 function resolved(shape: Shape): Exclude<Shape, { kind: "alias" }> {
   if (shape.kind !== "alias") return shape;
-  if (shape.open) throw new Unknown();
-  if (shape.target === undefined) throw new Invalid();
+  if (shape.open || shape.target === undefined) throw new Unknown();
   return resolved(shape.target);
 }
 
 /**
  * A mapping's keys as serde takes them for a struct's fields: a scalar's text, an empty key as
- * "", and no sequence or mapping, which is no field name. Each value it deserializes too, so an
- * alias among them must name a node.
+ * "", and no sequence or mapping, which is no field name.
  */
 function fieldNames(map: MapShape): [string, Shape][] {
   return map.entries.map(({ key, value }) => {
     const k = resolved(key);
-    resolved(value);
     if (k.kind === "seq" || k.kind === "map") throw new Invalid();
-    if (k.tag === NULL_TAG) throw new Unknown();
     return [k.kind === "empty" ? "" : k.text, value];
   });
 }
@@ -126,6 +165,8 @@ function fieldsRead(root: MapShape): boolean {
  * (an empty one too). Any other tag leaves the scalar's text, `~` and `null` included.
  */
 function stringField(shape: Shape): "none" | "blank" | "text" | "invalid" {
+  // An alias inside the node it names stands for a collection, which no string is.
+  if (shape.kind === "alias" && shape.open) return "invalid";
   const node = resolved(shape);
   if (node.kind === "seq" || node.kind === "map") return "invalid";
   if (node.kind === "empty") {
@@ -174,6 +215,7 @@ const RUST_SPACE = "\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\
 const RUST_TRIM_START = new RegExp(`^[${RUST_SPACE}]+`);
 const RUST_TRIM_END = new RegExp(`[${RUST_SPACE}]+$`);
 const RUST_WHITESPACE = new RegExp(`^[${RUST_SPACE}]$`);
+const RUST_SPACES = new RegExp(`[${RUST_SPACE}]+`);
 
 /** `text` trimmed as Rust's `trim` does. */
 export function rustTrim(text: string): string {
@@ -242,13 +284,13 @@ function repairedFields(front: string): string | undefined {
 
 /**
  * Whether a value starting `[`, `{`, `@` or a backtick parses as a YAML document of its own, as
- * serde_yaml's Value takes it: a mapping in it holds each key once. A tag, an anchor or an alias
- * in it, this does not follow.
+ * serde_yaml's Value takes it: a mapping in it holds each key once, and an alias names an anchor
+ * before it in the value. A tag in it, this does not follow.
  */
 function flowParses(scalar: string): boolean {
   if (scalar[0] === "@" || scalar[0] === "`") return false;
   try {
-    const flow = new Flow([scalar], 0, 0, { unique: true });
+    const flow = new Flow([scalar], 0, 0, { unique: true, handles: DEFAULT_HANDLES });
     flow.collection();
     const rest = scalar.slice(flow.col);
     if (isRestBlank(rest)) return true;
@@ -274,12 +316,19 @@ const VERBATIM_URI = /^[0-9A-Za-z_\-;/?:@&=+$.!~*'(),[\]]$/;
 /** What may follow an anchor or an alias's name, beside a blank (scan_anchor). */
 const AFTER_ANCHOR = "?:,]}%@`";
 
+/** Tag handles and the prefixes they stand for: `!` and `!!` by default, and any a `%TAG` directive sets. */
+type Handles = ReadonlyMap<string, string>;
+const DEFAULT_HANDLES: Handles = new Map([
+  ["!", "!"],
+  ["!!", "tag:yaml.org,2002:"],
+]);
+
 /**
- * A tag at the start of `text`, as libyaml scans it (scan_tag): `!<uri>`, `!!suffix`, `!suffix`
- * or `!` alone; then a blank or the line's end, or a `,` in a flow collection. A handle other
- * than `!` and `!!` is undefined without a `%TAG` directive.
+ * A tag at the start of `text`, as libyaml scans it (scan_tag): `!<uri>`, `!handle!suffix`,
+ * `!suffix` or `!` alone; then a blank or the line's end, or a `,` in a flow collection. A handle
+ * `handles` does not hold is undefined, which the parser refuses.
  */
-function scanTag(text: string, flow: boolean): { tag: string; length: number } {
+function scanTag(text: string, flow: boolean, handles: Handles): { tag: string; length: number } {
   let k: number;
   let tag: string;
   if (text[1] === "<") {
@@ -291,14 +340,16 @@ function scanTag(text: string, flow: boolean): { tag: string; length: number } {
     let h = 1;
     while (WORD.test(text[h] ?? "")) h++;
     if (text[h] === "!") {
-      if (h > 1) throw new Invalid();
+      const prefix = handles.get(text.slice(0, h + 1));
+      if (prefix === undefined) throw new Invalid();
       const suffix = scanUri(text, h + 1, false);
       if (suffix.length === 0) throw new Invalid();
-      tag = `tag:yaml.org,2002:${suffix.value}`;
+      tag = `${prefix}${suffix.value}`;
       k = suffix.end;
     } else {
+      // `!` alone is the non-specific tag, which no directive changes.
       const suffix = scanUri(text, 1, false);
-      tag = suffix.length === 0 ? "!" : `!${suffix.value}`;
+      tag = suffix.length === 0 ? "!" : `${handles.get("!") ?? "!"}${suffix.value}`;
       k = suffix.end;
     }
   }
@@ -361,17 +412,18 @@ function scanName(text: string, k: number): { name: string; end: number } {
 
 /**
  * A node's tag and anchor at the start of `text`, either first, each at most once, and what
- * follows them past blanks. In a block, a name followed by an indicator, which libyaml allows,
- * this does not follow.
+ * follows them past blanks. In a block, libyaml scans an indicator right after an anchor's name as
+ * a token of its own: `,`, `]`, `}`, `%`, `@` and a backtick cannot go there, and `:` or `?` with
+ * a character after it starts a plain scalar; one with a blank after it, this does not follow.
  */
-function properties(text: string, flow: boolean): Properties {
+function properties(text: string, flow: boolean, handles: Handles): Properties {
   let rest = text;
   let tag: string | undefined;
   let anchor: string | undefined;
   for (;;) {
     if (rest[0] === "!") {
       if (tag !== undefined) throw new Invalid();
-      const scanned = scanTag(rest, flow);
+      const scanned = scanTag(rest, flow, handles);
       tag = scanned.tag;
       rest = rest.slice(scanned.length);
     } else if (rest[0] === "&") {
@@ -379,7 +431,11 @@ function properties(text: string, flow: boolean): Properties {
       const scanned = scanName(rest, 1);
       anchor = scanned.name;
       rest = rest.slice(scanned.end);
-      if (!flow && rest !== "" && !isBlank(rest[0])) throw new Unknown();
+      if (!flow && rest !== "" && !isBlank(rest[0])) {
+        const indicator = rest[0] === ":" || rest[0] === "?";
+        if (!indicator) throw new Invalid();
+        if (rest.length === 1 || isBlank(rest[1])) throw new Unknown();
+      }
     } else break;
     rest = rest.replace(/^[ \t]+/, "");
   }
@@ -409,6 +465,8 @@ class Reader {
   private started = false;
   /** The marker line peek() stopped at, the document ending there. */
   private ended: number | undefined;
+  /** The tag handles, with those the document's `%TAG` directives set. */
+  private handles: Handles = DEFAULT_HANDLES;
 
   constructor(lines: string[]) {
     this.lines = lines;
@@ -437,9 +495,9 @@ class Reader {
     if (text[0] === "[" || text[0] === "{") {
       this.i = j + 1;
       root = this.flow(text);
-    } else if ((text[0] === "!" || text[0] === "&") && !this.isKey(text)) {
+    } else if ((text[0] === "!" || text[0] === "&") && this.rootProperties(text)) {
       // Properties for the whole document: the mapping below, or a flow collection after them.
-      const props = properties(text, false);
+      const props = properties(text, false, this.handles);
       this.i = j + 1;
       root = this.propertied(props, -1, true);
     } else {
@@ -450,27 +508,56 @@ class Reader {
     return this.end(root);
   }
 
+  /** Whether a first line that starts with properties is the whole document's: a flow collection after them, or nothing. */
+  private rootProperties(text: string): boolean {
+    const { rest } = properties(text, false, this.handles);
+    return rest[0] === "[" || rest[0] === "{" || !this.isKey(text);
+  }
+
   /**
-   * `%` directives at the start: each `%YAML 1.1` or `1.2` this follows, before the `---` that
-   * must come after them; any other, such as a `%TAG`, not.
+   * `%` directives at the start, as libyaml scans them, and the `---` that must come after them:
+   * a `%YAML` of 1.1 or 1.2, once, and `%TAG` handles (`!`, `!!` or `!name!`) each with a
+   * prefix, each handle once. Any other directive libyaml refuses. The handles they set are the
+   * document's.
    */
   private directives(first: number | undefined): number | undefined {
     let j = first;
     let any = false;
+    let version = false;
+    const set = new Map<string, string>();
     while (j !== undefined && (this.lines[j] ?? "").startsWith("%")) {
-      if (any || !/^%YAML[ \t]+1\.[12][ \t]*(#.*)?$/.test(this.lines[j] ?? "")) throw new Unknown();
       any = true;
+      const line = this.lines[j] ?? "";
+      const name = /^%([0-9A-Za-z_-]*)/.exec(line)?.[1] ?? "";
+      const rest = line.slice(1 + name.length);
+      if (name === "YAML") {
+        const parts = /^[ \t]+(\d{1,9})\.(\d{1,9})(.*)$/.exec(rest);
+        const after = parts?.[3] ?? "";
+        if (!parts || version || (after !== "" && !isBlank(after[0])) || !isRestBlank(after)) throw new Invalid();
+        if (Number(parts[1]) !== 1 || (Number(parts[2]) !== 1 && Number(parts[2]) !== 2)) throw new Invalid();
+        version = true;
+      } else if (name === "TAG") {
+        const parts = /^[ \t]+(!|!!|![0-9A-Za-z_-]+!)[ \t]+(.*)$/.exec(rest);
+        if (!parts) throw new Invalid();
+        const [, handle = "", value = ""] = parts;
+        const prefix = scanUri(value, 0, true);
+        const after = value.slice(prefix.end);
+        if (prefix.length === 0 || (after !== "" && !isBlank(after[0])) || !isRestBlank(after)) throw new Invalid();
+        if (set.has(handle)) throw new Invalid();
+        set.set(handle, prefix.value);
+      } else throw new Invalid();
       this.i = j + 1;
       j = this.peek();
     }
     if (any && (j === undefined || !/^---([ \t]|$)/.test(this.lines[j] ?? ""))) throw new Invalid();
+    this.handles = new Map([...DEFAULT_HANDLES, ...set]);
     return j;
   }
 
   /** What follows `--- ` on its line: properties for the node below, a flow collection, or a scalar Codex wants no root of. */
   private markerContent(rest: string): Shape {
     const c = rest[0] ?? "";
-    if (c === "!" || c === "&") return this.propertied(properties(rest, false), -1, true);
+    if (c === "!" || c === "&") return this.propertied(properties(rest, false, this.handles), -1, true);
     if (c === "[" || c === "{") return this.flow(rest);
     if (c === "*") return this.alias(rest);
     if (/^[0-9A-Za-z'"|>-]/.test(rest) || isExplicitKey(rest)) throw new Invalid();
@@ -528,7 +615,7 @@ class Reader {
     if (isExplicitKey(text)) return true;
     if (text[0] === "[" || text[0] === "{") return false;
     try {
-      key(text);
+      key(text, this.handles);
       return true;
     } catch (error) {
       if (error instanceof Invalid) return false;
@@ -547,7 +634,7 @@ class Reader {
         entries.push(this.explicit(j, n, text));
         continue;
       }
-      const { name, rest, props } = key(text);
+      const { name, rest, props } = key(text, this.handles);
       this.i = j + 1;
       const keyShape = name.alias !== undefined ? this.aliasNamed(name.alias) : this.keyScalar(name, props);
       const value = rest.replace(/^[ \t]+/, "");
@@ -564,6 +651,7 @@ class Reader {
     const shape: Shape = {
       kind: "scalar",
       text: name.text,
+      value: name.text,
       null: false,
       blank: false,
       plain: name.plain,
@@ -655,14 +743,15 @@ class Reader {
    */
   private inline(n: number, text: string, compact: boolean): Shape {
     const c = text[0] ?? "";
-    if (c === "!" || c === "&") return this.propertied(properties(text, false), n, compact);
+    if (c === "!" || c === "&") return this.propertied(properties(text, false, this.handles), n, compact);
     if (c === "*") return this.alias(text);
     if (c === '"' || c === "'") return this.quoted(text);
     if (c === "|" || c === ">") return this.block(n, text);
     if (c === "[" || c === "{") return this.flow(text);
     // An entry, or an explicit key, on a key's own line.
     if (isEntry(text) || isExplicitKey(text)) throw new Invalid();
-    if (c === ":" && (text.length === 1 || isBlank(text[1]))) throw new Unknown();
+    // A value indicator where a node starts: a mapping with no key before it, which libyaml refuses.
+    if (c === ":" && (text.length === 1 || isBlank(text[1]))) throw new Invalid();
     if ("@`%,]}".includes(c)) throw new Invalid();
     return this.plain(n, text);
   }
@@ -688,8 +777,7 @@ class Reader {
   }
 
   private aliasNamed(name: string): Shape {
-    const target = this.anchors.done.get(name);
-    return { kind: "alias", ...(target !== undefined ? { target } : {}), open: this.anchors.open.has(name) };
+    return aliasOf(this.anchors, name);
   }
 
   /**
@@ -699,7 +787,7 @@ class Reader {
   private flow(text: string): Shape {
     const line = this.i - 1;
     const start = (this.lines[line] ?? "").length - text.length;
-    const flow = new Flow(this.lines, line, start, { unique: false, anchors: this.anchors });
+    const flow = new Flow(this.lines, line, start, { unique: false, anchors: this.anchors, handles: this.handles });
     const shape = flow.collection();
     this.i = flow.line + 1;
     const rest = (this.lines[flow.line] ?? "").slice(flow.col);
@@ -718,6 +806,7 @@ class Reader {
     const first = plainLine(text);
     let ended = first.comment;
     let lines = 1;
+    let value = first.text;
     while (!ended && this.i < this.lines.length) {
       const line = this.lines[this.i] ?? "";
       const lead = /^[ \t]*/.exec(line)?.[0] ?? "";
@@ -733,10 +822,13 @@ class Reader {
       }
       if (lead.length <= n || MARKER.test(line)) break;
       this.i++;
-      ended = plainLine(rest).comment;
+      const next = plainLine(rest);
+      ended = next.comment;
+      value += ` ${next.text}`;
       lines++;
     }
-    return { kind: "scalar", text: first.text, null: lines === 1 && NULL.test(first.text), blank: false, plain: true };
+    const isNull = lines === 1 && NULL.test(first.text);
+    return { kind: "scalar", text: first.text, value, null: isNull, blank: false, plain: true };
   }
 
   /** A quoted scalar from the line just read, over as many lines as it takes; then nothing but a comment. */
@@ -745,6 +837,7 @@ class Reader {
     let line = text;
     let k = 1;
     let content = "";
+    let value = "";
     for (;;) {
       if (k >= line.length) {
         // On to the next line, which libyaml reads at any indentation.
@@ -752,14 +845,20 @@ class Reader {
         if (next === undefined || MARKER.test(next)) throw new Invalid();
         this.i++;
         line = next;
+        // libyaml drops a continued line's leading blanks.
         k = 0;
+        while (isBlank(line[k])) k++;
         content += " ";
+        // An escaped line break joins the lines with nothing between them.
+        if (value.endsWith(ESCAPED_BREAK)) value = value.slice(0, -ESCAPED_BREAK.length);
+        else value += " ";
         continue;
       }
       const ch = line[k] ?? "";
       if (q === "'" && ch === "'") {
         if (line[k + 1] === "'") {
           content += "'";
+          value += "'";
           k += 2;
           continue;
         }
@@ -768,16 +867,19 @@ class Reader {
       if (q === '"' && ch === '"') break;
       if (q === '"' && ch === "\\") {
         const length = escapeLength(line, k);
-        content += escapeBlank(line.slice(k, k + length)) ? " " : "x";
+        const sequence = line.slice(k, k + length);
+        content += escapeBlank(sequence) ? " " : "x";
+        value += escaped(sequence);
         k += length;
         continue;
       }
       content += ch;
+      value += ch;
       k++;
     }
     // libyaml takes a `#` right after the closing quote for a comment too.
     if (!isRestBlank(line.slice(k + 1))) throw new Invalid();
-    return { kind: "scalar", text: content, null: false, blank: rustTrim(content) === "", plain: false };
+    return { kind: "scalar", text: content, value, null: false, blank: rustTrim(content) === "", plain: false };
   }
 
   /**
@@ -792,6 +894,8 @@ class Reader {
     let indent = given === undefined ? undefined : n + Number(given);
     let longest = 0;
     let blank = true;
+    const content: string[] = [];
+    let leading = 0;
     for (let j = this.i; j < this.lines.length; j++) {
       const line = this.lines[j] ?? "";
       const spaces = line.length - line.replace(/^ +/, "").length;
@@ -799,6 +903,7 @@ class Reader {
       const text = line.slice(spaces);
       if (text === "") {
         longest = Math.max(longest, spaces);
+        if (content.length === 0) leading++;
         continue;
       }
       indent ??= Math.max(longest, spaces, n + 1);
@@ -808,11 +913,36 @@ class Reader {
         break;
       }
       blank = false;
+      content.push(line.slice(indent));
       this.i = j + 1;
     }
     // Trailing blank lines are the scalar's too; leaving them to be skipped reads the same.
-    return { kind: "scalar", text: "", null: false, blank, plain: false };
+    return {
+      kind: "scalar",
+      text: blockText(content, leading, indicators[1] ?? ""),
+      value: content.join(" "),
+      null: false,
+      blank,
+      plain: false,
+    };
   }
+}
+
+/**
+ * A block scalar's text as a key: one line of content with a `-` header is that line, which can
+ * name a field; any other has a line break in it, which no field's name has.
+ */
+function blockText(content: string[], leading: number, indicators: string): string {
+  const one = leading === 0 && content.length === 1;
+  return one && indicators.includes("-") ? (content[0] ?? "") : `\n${content.join("\n")}`;
+}
+
+/** An alias as the anchors so far name it: one with no anchor before it libyaml's loader refuses. */
+function aliasOf(anchors: Anchors, name: string): Shape {
+  const target = anchors.done.get(name);
+  const open = anchors.open.has(name);
+  if (target === undefined && !open) throw new Invalid();
+  return { kind: "alias", ...(target !== undefined ? { target } : {}), open };
 }
 
 /**
@@ -820,7 +950,10 @@ class Reader {
  * scalar's text, or an alias's name. A key that starts with `?` or `:` and no blank after is a
  * plain one; a flow collection as a key this does not follow.
  */
-function key(text: string): {
+function key(
+  text: string,
+  handles: Handles,
+): {
   name: { text: string; plain: boolean; alias?: string };
   rest: string;
   props?: Properties;
@@ -828,7 +961,7 @@ function key(text: string): {
   let props: Properties | undefined;
   let line = text;
   if (line[0] === "!" || line[0] === "&") {
-    props = properties(line, false);
+    props = properties(line, false, handles);
     line = props.rest;
     if (isRestBlank(line)) throw new Invalid();
   }
@@ -901,6 +1034,39 @@ function escapeLength(line: string, k: number): number {
   return 2 + digits;
 }
 
+/** What a value keeps for a backslash at a line's end, which the line break after it then drops. */
+const ESCAPED_BREAK = "\u0000break";
+
+/** What libyaml makes of an escape in a double-quoted scalar. */
+function escaped(sequence: string): string {
+  if (sequence === "\\") return ESCAPED_BREAK;
+  const e = sequence[1] ?? "";
+  const named: Record<string, string> = {
+    "0": "\0",
+    a: "\x07",
+    b: "\b",
+    t: "\t",
+    "\t": "\t",
+    n: "\n",
+    v: "\v",
+    f: "\f",
+    r: "\r",
+    e: "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    N: "\u0085",
+    _: "\u00a0",
+    L: "\u2028",
+    P: "\u2029",
+  };
+  const plain = named[e];
+  if (plain !== undefined) return plain;
+  const code = Number.parseInt(sequence.slice(2), 16);
+  return Number.isFinite(code) && code <= 0x10ffff ? String.fromCodePoint(code) : "";
+}
+
 /** Whether an escape stands for whitespace, as Rust's `trim` takes it. */
 function escapeBlank(sequence: string): boolean {
   return (
@@ -925,23 +1091,34 @@ const FLOW_INDICATORS = ",[]{}";
 /**
  * A flow collection from `lines[line][col]`, over as many lines as it takes, as libyaml reads
  * one: a line break and a comment are blanks there, a tab too, and a plain or quoted scalar goes
- * on over lines. `unique`: a mapping must hold each key once, as serde_yaml's Value wants it.
- * Without `anchors` - a value checked as a document of its own - a tag, an anchor or an alias it
- * does not follow. A document marker in it, or an explicit key, neither.
+ * on over lines, and a `?` starts an explicit key, a line break before its `:` allowed. A document
+ * marker in it libyaml refuses. `unique`: a mapping must hold each key once, as serde_yaml's Value
+ * wants it. Without `anchors` - a value checked as a document of its own - its anchors are its
+ * own, and a tag it does not follow.
  */
 class Flow {
   line: number;
   col: number;
   private readonly lines: string[];
   private readonly unique: boolean;
-  private readonly anchors: Anchors | undefined;
+  private readonly anchors: Anchors;
+  private readonly handles: Handles;
+  /** A value checked as a document of its own, whose tags this does not follow. */
+  private readonly alone: boolean;
 
-  constructor(lines: string[], line: number, col: number, options: { unique: boolean; anchors?: Anchors }) {
+  constructor(
+    lines: string[],
+    line: number,
+    col: number,
+    options: { unique: boolean; anchors?: Anchors; handles: Handles },
+  ) {
     this.lines = lines;
     this.line = line;
     this.col = col;
     this.unique = options.unique;
-    this.anchors = options.anchors;
+    this.alone = options.anchors === undefined;
+    this.anchors = options.anchors ?? { done: new Map(), open: new Set() };
+    this.handles = options.handles;
   }
 
   /** The character at the position: "\n" at a line's end with a line after it, undefined at the end of all. */
@@ -954,7 +1131,7 @@ class Flow {
   private nextLine(): void {
     this.line++;
     this.col = 0;
-    if (MARKER.test(this.lines[this.line] ?? "")) throw new Unknown();
+    if (MARKER.test(this.lines[this.line] ?? "")) throw new Invalid();
   }
 
   /** Past blanks, line breaks and comments; whether it went past a line break. */
@@ -982,20 +1159,30 @@ class Flow {
       if (c === undefined) throw new Invalid();
       if (c === close) break;
       if (c === ",") throw new Unknown();
-      const first = this.node();
+      // In a flow collection libyaml takes every `?` for an explicit key.
+      const explicit = c === "?";
+      if (explicit) {
+        this.col++;
+        this.skip();
+      }
+      const ahead = this.ch();
+      const first: Shape =
+        explicit && (ahead === undefined || ahead === ":" || ahead === "," || ahead === close)
+          ? { kind: "empty" }
+          : this.node();
       const broke = this.skip();
       let value: Shape = { kind: "empty" };
       if (this.ch() === ":") {
-        // A key ends on its own line: a `:` after a line break follows none.
-        if (broke) throw new Invalid();
+        // An implicit key ends on its own line: a `:` after a line break follows none.
+        if (broke && !explicit) throw new Invalid();
         this.col++;
         value = this.node();
         this.skip();
       }
       if (open === "{") {
-        if (first.kind !== "scalar") throw new Unknown();
-        if (this.unique && entries.some(({ key }) => key.kind === "scalar" && key.text === first.text)) {
-          throw new Invalid();
+        if (this.unique) {
+          if (first.kind !== "scalar") throw new Unknown();
+          if (entries.some(({ key }) => key.kind === "scalar" && key.text === first.text)) throw new Invalid();
         }
         entries.push({ key: first, value });
       }
@@ -1019,8 +1206,9 @@ class Flow {
     if (c === "[" || c === "{") return this.collection();
     if (c === '"' || c === "'") return this.quoted();
     if (c === "!" || c === "&") {
-      if (this.anchors === undefined) throw new Unknown();
-      const props = properties(text.slice(this.col), true);
+      if (this.alone && c === "!") throw new Unknown();
+      const props = properties(text.slice(this.col), true, this.handles);
+      if (this.alone && props.tag !== undefined) throw new Unknown();
       this.col = text.length - props.rest.length;
       if (props.anchor !== undefined) this.anchors.open.add(props.anchor);
       const next = this.ch();
@@ -1034,11 +1222,11 @@ class Flow {
       return shape;
     }
     if (c === "*") {
-      if (this.anchors === undefined) throw new Unknown();
       const { name, end } = scanName(text, this.col + 1);
       this.col = end;
-      const target = this.anchors.done.get(name);
-      return { kind: "alias", ...(target !== undefined ? { target } : {}), open: this.anchors.open.has(name) };
+      const alias = aliasOf(this.anchors, name);
+      if (this.alone && alias.kind === "alias" && alias.open) throw new Unknown();
+      return alias;
     }
     const next = text[this.col + 1];
     if (c === "?" && (next === undefined || isBlank(next))) throw new Unknown();
@@ -1081,7 +1269,7 @@ class Flow {
       lines++;
     }
     const text = value.trimEnd();
-    return { kind: "scalar", text, null: lines === 1 && NULL.test(text), blank: false, plain: true };
+    return { kind: "scalar", text, value: text, null: lines === 1 && NULL.test(text), blank: false, plain: true };
   }
 
   /** A quoted scalar, over as many lines as it takes; a document marker in it libyaml refuses. */
@@ -1089,19 +1277,24 @@ class Flow {
     const q = this.ch();
     this.col++;
     let content = "";
+    let value = "";
     for (;;) {
       const text = this.lines[this.line] ?? "";
       if (this.col >= text.length) {
         if (this.line + 1 >= this.lines.length || MARKER.test(this.lines[this.line + 1] ?? "")) throw new Invalid();
         this.line++;
         this.col = 0;
+        while (isBlank(this.lines[this.line]?.[this.col])) this.col++;
         content += " ";
+        if (value.endsWith(ESCAPED_BREAK)) value = value.slice(0, -ESCAPED_BREAK.length);
+        else value += " ";
         continue;
       }
       const ch = text[this.col] ?? "";
       if (q === "'" && ch === "'") {
         if (text[this.col + 1] === "'") {
           content += "'";
+          value += "'";
           this.col += 2;
           continue;
         }
@@ -1110,14 +1303,17 @@ class Flow {
       if (q === '"' && ch === '"') break;
       if (q === '"' && ch === "\\") {
         const length = escapeLength(text, this.col);
-        content += escapeBlank(text.slice(this.col, this.col + length)) ? " " : "x";
+        const sequence = text.slice(this.col, this.col + length);
+        content += escapeBlank(sequence) ? " " : "x";
+        value += escaped(sequence);
         this.col += length;
         continue;
       }
       content += ch;
+      value += ch;
       this.col++;
     }
     this.col++;
-    return { kind: "scalar", text: content, null: false, blank: rustTrim(content) === "", plain: false };
+    return { kind: "scalar", text: content, value, null: false, blank: rustTrim(content) === "", plain: false };
   }
 }
