@@ -5,6 +5,7 @@ import { type Ranking, spendUsageOf, usageOf } from "../../core/routing.js";
 import { freeNow, nothingRead, skipReason, spendText } from "../../lib/route-render.js";
 import type { QuotaSnapshot } from "../../types.js";
 import { QuotaCell } from "../components/QuotaCell.js";
+import { listWindow } from "../fit.js";
 import { color, symbol } from "../theme.js";
 import { textLines, wrappedLines } from "../use-width.js";
 import { GAP, MARK } from "./RouteDetail.js";
@@ -194,29 +195,6 @@ function spendNote(snapshot: QuotaSnapshot | undefined): string {
   return snapshot && skip ? skipReason({ id: "", skip }) : "";
 }
 
-/**
- * The accounts `lines` lines show of `total`, the cursor's among them: from `start` (where the
- * last window began, so that it moves only when the cursor leaves it), less a line for the count
- * above when there are accounts above, and one for the count below when there are some below.
- */
-export function accountWindow(
-  total: number,
-  lines: number,
-  cursor: number | null,
-  start: number,
-): { start: number; end: number } {
-  if (total <= lines) return { start: 0, end: total };
-  const room = (from: number) => lines - (from > 0 ? 1 : 0) - (from + lines - (from > 0 ? 1 : 0) < total ? 1 : 0);
-  let from = Math.max(0, Math.min(start, total - 1));
-  if (cursor !== null) {
-    if (cursor < from) from = cursor;
-    while (cursor >= from + room(from)) from += 1;
-  }
-  // No room left empty at the end while there are accounts above it.
-  while (from > 0 && from - 1 + room(from - 1) >= total) from -= 1;
-  return { start: from, end: Math.min(total, from + room(from)) };
-}
-
 /** A list row's `▸` while the cursor is on it, in a slot of its own either way. */
 function RowMark({ on }: { on: boolean }) {
   return (
@@ -269,7 +247,12 @@ export function AccountRows({
   // Where the window began last time: it moves only as far as the cursor takes it.
   const began = useRef(0);
   const cursor = focused && state.cursor > 0 ? state.cursor - 1 : null;
-  const view = accountWindow(listed.length, lines, cursor, began.current);
+  // A list shows its cursor's row however little room it has. With none for the accounts, which
+  // the form gives them only while no cursor on them can move, they are left out.
+  const view =
+    lines < 1
+      ? { start: began.current, end: began.current, above: 0, below: 0 }
+      : listWindow(listed.length, lines, cursor, began.current);
   began.current = view.start;
   return (
     <>
@@ -278,7 +261,7 @@ export function AccountRows({
           {`[${state.every ? "x" : " "}] every account (*), new ones join`}
         </Text>
       </Line>
-      {view.start > 0 ? <MoreLine arrow="↑" count={view.start} /> : null}
+      {view.above > 0 ? <MoreLine arrow="↑" count={view.above} /> : null}
       {listed.slice(view.start, view.end).map((account, at) => {
         const index = view.start + at;
         const out = excluded.has(account.id);
@@ -315,7 +298,7 @@ export function AccountRows({
           </Line>
         );
       })}
-      {view.end < listed.length ? <MoreLine arrow="↓" count={listed.length - view.end} /> : null}
+      {view.below > 0 ? <MoreLine arrow="↓" count={view.below} /> : null}
     </>
   );
 }
