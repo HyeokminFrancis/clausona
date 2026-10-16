@@ -257,6 +257,45 @@ describe("workspaces and terminals", () => {
     expect(seen).toEqual([]);
   });
 
+  it("renames a workspace and prints only its id and name", async () => {
+    replies["workspace.update"] = {
+      json: { id: "w1", projectId: "p1", name: "Docs · work (Opus 5.5)", worktreePath: "/wt/w1", branch: "fleet/t1" },
+    };
+    const r = await run(["workspaces", "rename", "w1", "--name", "Docs · work (Opus 5.5)"]);
+    expect(r.stderr).toBe("");
+    expect(JSON.parse(r.stdout)).toEqual({ id: "w1", name: "Docs · work (Opus 5.5)" });
+    expect(seen.map((s) => [s.method, s.procedure, s.input])).toEqual([
+      ["POST", "workspace.update", { id: "w1", name: "Docs · work (Opus 5.5)" }],
+    ]);
+  });
+
+  it("passes on the host's error for a workspace it cannot rename", async () => {
+    replies["workspace.update"] = { status: 404, error: "Workspace not found" };
+    const r = await run(["workspaces", "rename", "w9", "--name", "Docs"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toMatch(/workspace\.update failed: Workspace not found/);
+    expect(r.stderr).not.toMatch(/API has changed/);
+  });
+
+  it("reports API drift when the host has no workspace.update", async () => {
+    const r = await run(["workspaces", "rename", "w1", "--name", "Docs"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toMatch(/the Superset host API has changed \(workspace\.update is gone\)/);
+  });
+
+  it("refuses a rename without an id or a name, and calls nothing", async () => {
+    for (const [args, error] of [
+      [["workspaces", "rename", "--name", "Docs"], /workspaces rename takes 1 argument/],
+      [["workspaces", "rename", "w1"], /--name is required/],
+      [["workspaces", "rename", "w1", "--name", "  "], /--name must not be empty/],
+    ] as const) {
+      const r = await run([...args]);
+      expect(r.code).toBe(1);
+      expect(r.stderr).toMatch(error);
+    }
+    expect(seen).toEqual([]);
+  });
+
   describe("deleting a workspace", () => {
     // The host deletes with force, so the helper is the only thing between a delete and a worker's
     // unsaved work. These run real git in a temporary repo with a temporary remote.

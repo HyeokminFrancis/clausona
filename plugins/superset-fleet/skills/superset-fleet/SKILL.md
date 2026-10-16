@@ -48,6 +48,7 @@ Below, `H` means `node <base>/scripts/superset-host.mjs`. `H trust`, `H terminal
 | Projects | `superset projects list --json` | `H projects` |
 | Agent configs | `superset agents list --local --json` | `H agents configs` |
 | New workspace | `superset ws create --local --project <id> --name <name> --branch <branch> --json` | `H workspaces create --project <id> --name <name> --branch <branch>` |
+| Rename workspace | `superset ws update --local <id> --name <name> --json` | `H workspaces rename <id> --name <name>` |
 | Worktree path | `superset ws get --local <id> --json` | `H workspaces list --project <id>` (`worktreePath`) |
 | Start a worker | `superset agents create --local --workspace <id> --agent <config> --prompt "$(cat <brief file>)" --json` | `H agents run --workspace <id> --agent <config> --prompt-file <brief file>` |
 | Hand a task over | `superset agents create --local --workspace <id> --agent <config> --from-terminal <terminal> --json` | `H agents run --workspace <id> --agent <config> --from-terminal <terminal>` |
@@ -90,7 +91,10 @@ When a profile the plan needs has no config:
 For each task: create the workspace, make its worktree trusted for the worker's profile, then
 start the worker. Name the workspace `<short task> · <profile label>`, for example
 `Paths · work (Opus 5.5)`, so the Superset sidebar shows which account runs where. Keep it under 26
-characters: the sidebar cuts longer names.
+characters: the sidebar cuts longer names. The name is set when the workspace is created and does
+not follow the work, so keep it current ("Rename workspace" in the table): when you give a worker a
+new task in its workspace, rename the workspace to that task, and when its task is done, the name
+may say so.
 
 1. **Trust.**
    - **Claude Code profiles:** before starting, run

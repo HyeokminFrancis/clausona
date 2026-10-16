@@ -28,6 +28,7 @@ const USAGE = `usage: superset-host.mjs <command>
   projects
   workspaces list [--project <id>]
   workspaces create --project <id> --name <name> --branch <branch> [--base-branch <branch>] [--skip-branch-prefix]
+  workspaces rename <id> --name <name>
   workspaces delete <id>
   agents configs
   agents add-config --label <label> --profile <profile> [--command <path>] [-- <tool args>...]
@@ -371,6 +372,18 @@ const COMMANDS = {
         },
         { mutation: true },
       ),
+  },
+  // The name is what the Superset sidebar shows. The host's row carries the worktree path and
+  // branch too; only the id and the new name are printed.
+  "workspaces rename": {
+    options: { name: str },
+    required: ["name"],
+    positionals: 1,
+    run: async (host, { name }, [id]) => {
+      if (!name.trim()) throw new CliError("--name must not be empty");
+      const workspace = await call(host, "workspace.update", { id, name }, { mutation: true });
+      return { id: workspace?.id ?? id, name: workspace?.name ?? name };
+    },
   },
   // Stops the workspace's terminals and removes its worktree, after deleteWorkspace's checks.
   "workspaces delete": {
